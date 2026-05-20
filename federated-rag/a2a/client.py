@@ -1,0 +1,169 @@
+"""A2A client — calls the peer cluster agent via A2A protocol."""
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any, AsyncIterator
+
+import httpx
+import structlog
+
+from a2a.models import (
+    AgentCard,
+    Message,
+    Part,
+    PushNotificationConfig,
+    SendTaskRequest,
+    Task,
+    TaskState,
+    TaskStatus,
+    TextPart,
+)
+from config import settings
+
+log = structlog.get_logger(__name__)
+
+
+class A2AClient:
+    """
+    HTTP client for the A2A v1.0 protocol.
+
+    Handles:
+      - AgentCard discovery
+      - tasks/send (streaming SSE)
+      - tasks/get  (polling)
+      - Delegated token injection (RFC 8693) in Authorization header
+    """
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        timeout: float = 60.0,
+    ) -> None:
+        self._base_url = (base_url or str(settings.peer_agent_url or "")).rstrip("/")
+        self._http = httpx.AsyncClient(timeout=timeout)
+
+    # ── AgentCard ─────────────────────────────────────────────────────────────
+
+    async def fetch_agent_card(self) -> AgentCard:
+        url = f"{self._base_url}/.well-known/agent-card.json"
+        resp = await self._http.get(url)
+        resp.raise_for_status()
+        return AgentCard.model_validate(resp.json())
+
+    # ── Task send (streaming) ─────────────────────────────────────────────────
+
+    async def send_task_streaming(
+        self,
+        query: str,
+        delegated_token: str,
+        context_id: str = "",
+        push_notification_url: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """
+        Send a task to the peer agent and stream SSE events.
+
+        Yields dicts with keys: event_type, data (parsed JSON).
+        """
+        task_id = str(uuid.uuid4())
+        message = Message(
+            role="user",
+            parts=[TextPart(text=query)],
+            messageId=str(uuid.uuid4()),
+            taskId=task_id,
+        )
+        push = (
+            PushNotificationConfig(url=push_notification_url)
+            if push_notification_url
+            else None
+        )
+        payload = SendTaskRequest(
+            id=task_id,
+            contextId=context_id,
+            message=message,
+            pushNotification=push,
+        )
+
+        headers = {
+            "Authorization": f"Bearer {delegated_token}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+
+        url = f"{self._base_url}/tasks/send"
+        async with self._http.stream(
+            "POST",
+            url,
+            content=payload.model_dump_json(by_alias=True),
+            headers=headers,
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                if line.startswith("event:"):
+                    event_type = line[len("event:"):].strip()
+                elif line.startswith("data:"):
+                    raw = line[len("data:"):].strip()
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        data = {"raw": raw}
+                    yield {"event_type": event_type if "event_type" in locals() else "message", "data": data}
+
+    # ── Task send (non-streaming) ─────────────────────────────────────────────
+
+    async def send_task(
+        self,
+        query: str,
+        delegated_token: str,
+        context_id: str = "",
+        push_notification_url: str | None = None,
+    ) -> Task:
+        """
+        Send a task and wait for completion (or input-required).
+        Polls until terminal state.
+        """
+        task_id = str(uuid.uuid4())
+        message = Message(
+            role="user",
+            parts=[TextPart(text=query)],
+            messageId=str(uuid.uuid4()),
+            taskId=task_id,
+        )
+        push = (
+            PushNotificationConfig(url=push_notification_url)
+            if push_notification_url
+            else None
+        )
+        payload = SendTaskRequest(
+            id=task_id,
+            contextId=context_id,
+            message=message,
+            pushNotification=push,
+        )
+        headers = {
+            "Authorization": f"Bearer {delegated_token}",
+            "Content-Type": "application/json",
+        }
+        resp = await self._http.post(
+            f"{self._base_url}/tasks/send",
+            content=payload.model_dump_json(by_alias=True),
+            headers=headers,
+        )
+        resp.raise_for_status()
+        return Task.model_validate(resp.json())
+
+    # ── Task get ──────────────────────────────────────────────────────────────
+
+    async def get_task(self, task_id: str, delegated_token: str) -> Task:
+        headers = {"Authorization": f"Bearer {delegated_token}"}
+        resp = await self._http.get(
+            f"{self._base_url}/tasks/{task_id}",
+            headers=headers,
+        )
+        resp.raise_for_status()
+        return Task.model_validate(resp.json())
+
+    async def close(self) -> None:
+        await self._http.aclose()

@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-agent
+  namespace: federated-rag
+  labels:
+    app: rag-agent
+    cluster: cluster-a
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rag-agent
+  template:
+    metadata:
+      labels:
+        app: rag-agent
+      annotations:
+        # Istio sidecar injection
+        sidecar.istio.io/inject: "true"
+        # Langfuse tracing
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: rag-agent
+      containers:
+        - name: agent
+          image: your-registry/federated-rag:latest
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: rag-agent-secrets
+            - configMapRef:
+                name: rag-agent-config
+          env:
+            - name: CLUSTER_ID
+              value: "cluster-a"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-agent
+  namespace: federated-rag
+  annotations:
+    # Cilium Cluster Mesh global service — expose to cluster-b
+    io.cilium/global-service: "true"
+    io.cilium/shared-service: "true"
+spec:
+  selector:
+    app: rag-agent
+  ports:
+    - port: 80
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rag-agent
+  namespace: federated-rag
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-agent-config
+  namespace: federated-rag
+data:
+  CLUSTER_ID: "cluster-a"
+  AGENT_NAME: "RAG Agent - Cluster A"
+  AGENT_URL: "https://agent-a.your-domain.com"
+  PEER_AGENT_URL: "https://agent-b.your-domain.com"
+  PEER_AGENT_CARD_URL: "https://agent-b.your-domain.com/.well-known/agent-card.json"
+  QDRANT_URL: "http://qdrant:6333"
+  QDRANT_COLLECTION: "knowledge_base"
+  NEO4J_URI: "bolt://neo4j:7687"
+  OPENFGA_API_URL: "http://openfga:8080"
+  TEMPORAL_ADDRESS: "temporal-frontend:7233"
+  TEMPORAL_NAMESPACE: "default"
+  TEMPORAL_TASK_QUEUE: "approval-queue"
+  LOG_LEVEL: "info"
+---
+# Secret template — fill with actual values and apply with kubectl
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rag-agent-secrets
+  namespace: federated-rag
+type: Opaque
+stringData:
+  OPENAI_API_KEY: "nvapi-your-nvidia-nim-key"
+  NEO4J_PASSWORD: "your-neo4j-password"
+  OPENFGA_STORE_ID: "your-openfga-store-id"
+  OPENFGA_MODEL_ID: "your-openfga-model-id"
+  AGENT_CLIENT_ID: "agent-cluster-a"
+  AGENT_CLIENT_SECRET: "your-client-secret"
+  SLACK_BOT_TOKEN: "xoxb-your-slack-token"

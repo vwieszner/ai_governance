@@ -1,0 +1,35 @@
+# Neo4j Helm values (chart: neo4j/neo4j)
+# helm repo add neo4j https://helm.neo4j.com/neo4j
+# helm install neo4j neo4j/neo4j -n federated-rag -f neo4j-values.yaml
+
+neo4j:
+  name: "neo4j"
+  password: "your-neo4j-password"   # override via --set or Secret
+  edition: "community"              # use "enterprise" for clustering
+
+volumes:
+  data:
+    mode: defaultStorageClass
+    defaultStorageClass:
+      requests:
+        storage: 100Gi
+
+config:
+  server.memory.heap.initial_size: "2G"
+  server.memory.heap.max_size: "4G"
+  server.memory.pagecache.size: "2G"
+  # Enable APOC (required by neo4j-graphrag)
+  dbms.security.procedures.unrestricted: "apoc.*,gds.*"
+  dbms.security.procedures.allowlist: "apoc.*,gds.*"
+
+apoc_config:
+  apoc.export.file.enabled: "true"
+  apoc.import.file.enabled: "true"
+
+resources:
+  requests:
+    cpu: "1"
+    memory: "6Gi"
+  limits:
+    cpu: "4"
+    memory: "12Gi"

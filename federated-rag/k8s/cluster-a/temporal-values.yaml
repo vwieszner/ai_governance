@@ -1,0 +1,40 @@
+# Temporal Helm values (chart: temporal/temporal)
+# helm repo add temporal https://charts.temporal.io
+# helm install temporal temporal/temporal -n federated-rag -f temporal-values.yaml
+
+server:
+  replicaCount: 1
+
+  config:
+    persistence:
+      defaultStore: default
+      visibilityStore: visibility
+    namespaces:
+      - name: default
+
+  frontend:
+    replicaCount: 1
+  history:
+    replicaCount: 1
+  matching:
+    replicaCount: 1
+  worker:
+    replicaCount: 1
+
+cassandra:
+  enabled: false
+
+postgresql:
+  enabled: true
+  postgresqlPassword: "temporal-password"
+  postgresqlUsername: "temporal"
+  postgresqlDatabase: "temporal"
+
+elasticsearch:
+  enabled: false
+
+grafana:
+  enabled: false
+
+prometheus:
+  enabled: false

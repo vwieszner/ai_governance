@@ -1,0 +1,34 @@
+# Qdrant Helm values (chart: qdrant/qdrant)
+# helm repo add qdrant https://qdrant.github.io/qdrant-helm
+# helm install qdrant qdrant/qdrant -n federated-rag -f qdrant-values.yaml
+
+replicaCount: 3
+
+config:
+  cluster:
+    enabled: true
+    p2p:
+      port: 6335
+    consensus:
+      tick_period_ms: 100
+
+persistence:
+  enabled: true
+  size: 50Gi
+  storageClassName: ""    # use your cluster's default StorageClass
+
+resources:
+  requests:
+    cpu: "1"
+    memory: "2Gi"
+  limits:
+    cpu: "4"
+    memory: "8Gi"
+
+service:
+  type: ClusterIP
+  port: 6333
+
+# Enable REST + gRPC
+apiKey:
+  enabled: false          # set to true and provide secret in production
