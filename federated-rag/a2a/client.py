@@ -98,18 +98,25 @@ class A2AClient:
             headers=headers,
         ) as resp:
             resp.raise_for_status()
+            # FIX M-2: event_type is reset per SSE event (event: + data: pair).
+            # Using a local variable scoped to each event prevents the previous
+            # event's type from leaking into the next data line when the server
+            # sends data: lines without a preceding event: line.
+            current_event_type: str = "message"
             async for line in resp.aiter_lines():
                 if not line:
+                    # Blank line signals end of one SSE event — reset type
+                    current_event_type = "message"
                     continue
                 if line.startswith("event:"):
-                    event_type = line[len("event:"):].strip()
+                    current_event_type = line[len("event:"):].strip()
                 elif line.startswith("data:"):
                     raw = line[len("data:"):].strip()
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
                         data = {"raw": raw}
-                    yield {"event_type": event_type if "event_type" in locals() else "message", "data": data}
+                    yield {"event_type": current_event_type, "data": data}
 
     # ── Task send (non-streaming) ─────────────────────────────────────────────
 

@@ -1,4 +1,9 @@
-"""LangGraph agent state definition."""
+"""LangGraph agent state definition.
+
+FIX C-5: user_token and delegated_token removed from state — they are never
+stored in the graph's serialised snapshot, Langfuse traces, or Temporal history.
+Both are passed via contextvars (see agent/nodes.py).
+"""
 from __future__ import annotations
 
 from enum import Enum
@@ -21,7 +26,7 @@ class AgentState(TypedDict):
     # Input
     query: str
     user_id: str
-    user_token: str                          # raw user JWT
+    # NOTE: user_token is NOT stored here — use _user_token_ctx in nodes.py
     task_id: str                             # A2A task ID
     context_id: str
 
@@ -40,7 +45,7 @@ class AgentState(TypedDict):
     peer_task_id: str | None
     peer_status: str | None                  # A2A task state from peer
     peer_answer: str | None
-    delegated_token: str | None
+    # NOTE: delegated_token is NOT stored here — use _delegated_token_ctx in nodes.py
 
     # Approval workflow
     approval_request_id: str | None

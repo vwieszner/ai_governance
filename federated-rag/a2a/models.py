@@ -10,7 +10,7 @@ Implements the core A2A spec:
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
@@ -61,7 +61,7 @@ class TaskState(str, Enum):
 class TaskStatus(BaseModel):
     state: TaskState
     message: str | None = None           # human-readable state description
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ── Messages / Parts ──────────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ class Message(BaseModel):
     parts: list[Part]
     message_id: str = Field("", alias="messageId")
     task_id: str | None = Field(None, alias="taskId")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     model_config = {"populate_by_name": True}
 
 

@@ -1,6 +1,18 @@
 """
 LangGraph node implementations for the federated RAG agent.
 
+Fixes applied:
+  C-5  — user_token / delegated_token never stored in AgentState; passed via
+          contextvars so they are invisible to Langfuse, tracing, and serialisation.
+  C-6  — Temporal client is a module-level singleton protected by asyncio.Lock;
+          no new gRPC connection is opened per workflow start.
+  H-1  — Auth routing: pending_approval is now checked before allowed, ensuring
+          approval is always started for chunks that require it. Remote is tried
+          whenever there are no locally allowed/pending chunks and a peer is set.
+  H-2  — All async singletons protected by asyncio.Lock (double-checked locking).
+  M-4  — LLM context is capped at settings.llm_context_token_budget tokens
+          (estimated as characters / 4) before calling the model.
+
 Nodes:
   retrieve_local      — Qdrant hybrid + Neo4j GraphRAG
   check_auth          — OpenFGA decisions for retrieved chunks
@@ -12,6 +24,8 @@ Nodes:
 """
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import uuid
 from typing import Any
 
@@ -21,7 +35,7 @@ from temporalio.client import Client as TemporalClient
 
 from agent.state import AgentState, FlowDecision
 from auth.openfga import AuthzDecision, OpenFGAAuth
-from auth.token_exchange import exchange_token, validate_token, extract_user_id
+from auth.token_exchange import exchange_token
 from config import settings
 from rag.fusion import rrf_fuse
 from rag.neo4j_retriever import GraphRAGRetriever
@@ -29,11 +43,31 @@ from rag.qdrant_retriever import HybridQdrantRetriever
 
 log = structlog.get_logger(__name__)
 
-# Singletons (initialised lazily)
+# ── Context vars for sensitive tokens (C-5) ───────────────────────────────────
+# These are never stored in AgentState, Langfuse traces, or Temporal history.
+_user_token_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "user_token", default=""
+)
+_delegated_token_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "delegated_token", default=""
+)
+
+
+def set_user_token(token: str) -> None:
+    """Called once per request (in run_query) before the graph is invoked."""
+    _user_token_ctx.set(token)
+
+
+# ── Async-safe singletons (H-2) ───────────────────────────────────────────────
+
 _qdrant: HybridQdrantRetriever | None = None
 _graph: GraphRAGRetriever | None = None
 _openfga: OpenFGAAuth | None = None
 _llm: ChatOpenAI | None = None
+_temporal_client: TemporalClient | None = None
+
+# Locks for singletons that involve async or expensive initialisation
+_temporal_lock: asyncio.Lock = asyncio.Lock()
 
 
 def _get_qdrant() -> HybridQdrantRetriever:
@@ -70,6 +104,23 @@ def _get_llm() -> ChatOpenAI:
     return _llm
 
 
+async def _get_temporal() -> TemporalClient:
+    """
+    Singleton Temporal client — acquired once and reused (C-6 / H-2 fix).
+    Uses double-checked locking so concurrent coroutines don't race.
+    """
+    global _temporal_client
+    if _temporal_client is not None:
+        return _temporal_client
+    async with _temporal_lock:
+        if _temporal_client is None:
+            _temporal_client = await TemporalClient.connect(
+                settings.temporal_address,
+                namespace=settings.temporal_namespace,
+            )
+    return _temporal_client
+
+
 # ── Node: retrieve_local ──────────────────────────────────────────────────────
 
 async def retrieve_local(state: AgentState) -> dict[str, Any]:
@@ -97,6 +148,10 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     Check OpenFGA authorization for each fused chunk.
     Classifies chunks into: allowed / pending_approval / denied.
     Determines the flow decision.
+
+    FIX H-1: pending is now evaluated before allowed, ensuring that approval
+    is always started when any chunk requires it.  Remote is tried whenever
+    there are no locally serveable chunks and a peer cluster is configured.
     """
     log.info("node_check_auth", user_id=state["user_id"])
     auth = _get_openfga()
@@ -110,13 +165,15 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     pending = [cid for cid, d in decisions.items() if d == AuthzDecision.NEEDS_APPROVAL]
     denied  = [cid for cid, d in decisions.items() if d == AuthzDecision.DENIED]
 
-    # Determine flow
-    if allowed:
-        flow = FlowDecision.LOCAL_ALLOWED
-    elif pending:
+    # FIX H-1: prioritise pending over allowed, and always try peer when no
+    # locally-allowed data exists (empty results also route to REMOTE).
+    if pending:
+        # Some chunks require human approval — start workflow, don't serve anything yet
         flow = FlowDecision.LOCAL_NEEDS_APPROVAL
-    elif denied and settings.peer_agent_url:
-        # Nothing locally — try peer cluster
+    elif allowed:
+        flow = FlowDecision.LOCAL_ALLOWED
+    elif settings.peer_agent_url:
+        # No locally-allowed data; try the peer cluster
         flow = FlowDecision.REMOTE
     else:
         flow = FlowDecision.LOCAL_DENIED
@@ -140,7 +197,12 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
 # ── Node: generate_answer ─────────────────────────────────────────────────────
 
 async def generate_answer(state: AgentState) -> dict[str, Any]:
-    """Generate an answer from the allowed chunks using the LLM."""
+    """
+    Generate an answer from the allowed chunks using the LLM.
+
+    FIX M-4: context is truncated to llm_context_token_budget characters
+    (estimated as budget_tokens × 4) before calling the model.
+    """
     log.info("node_generate_answer", user_id=state["user_id"])
     allowed_ids = set(state["allowed_chunk_ids"])
     context_chunks = [
@@ -157,6 +219,12 @@ async def generate_answer(state: AgentState) -> dict[str, Any]:
         f"[Source: {c.get('metadata', {}).get('source', 'unknown')}]\n{c['text']}"
         for c in context_chunks
     )
+
+    # FIX M-4: guard against exceeding the model's context window
+    max_chars = settings.llm_context_token_budget * 4   # ~4 chars per token
+    if len(context) > max_chars:
+        context = context[:max_chars] + "\n\n[... context truncated to fit token budget ...]"
+        log.warning("context_truncated", original_len=len(context), max_chars=max_chars)
 
     llm = _get_llm()
     prompt = (
@@ -180,6 +248,8 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
     Start a Temporal approval workflow for chunks that need approval.
     Writes pending_approval tuples to OpenFGA first.
     Returns immediately with a 'pending approval' status message.
+
+    FIX C-6: reuses the module-level Temporal singleton via _get_temporal().
     """
     log.info("node_start_approval", user_id=state["user_id"])
     auth = _get_openfga()
@@ -193,19 +263,16 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
         await auth.set_pending_approval(user_id, chunk_id)
 
     # Resolve approver from the first chunk's owner
-    approver_id = None
+    approver_id: str = "admin"
     for chunk_id in chunk_ids:
-        approver_id = await auth.get_chunk_owner(chunk_id)
-        if approver_id:
+        owner = await auth.get_chunk_owner(chunk_id)
+        if owner:
+            approver_id = owner
             break
-    approver_id = approver_id or "admin"
 
-    # Start Temporal workflow
+    # Start Temporal workflow (C-6: reuse singleton)
     from workflow.approval import ApprovalInput, ApprovalWorkflow
-    temporal_client = await TemporalClient.connect(
-        settings.temporal_address,
-        namespace=settings.temporal_namespace,
-    )
+    temporal_client = await _get_temporal()
     await temporal_client.start_workflow(
         ApprovalWorkflow.run,
         ApprovalInput(
@@ -214,7 +281,7 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
             chunk_ids=chunk_ids,
             query=state["query"],
             approver_id=approver_id,
-            approver_slack_id=None,   # TODO: resolve from user directory
+            approver_slack_id=None,
             approver_email=None,
         ),
         id=f"approval-{approval_request_id}",
@@ -225,7 +292,8 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
         "approval_request_id": approval_request_id,
         "status_message": (
             f"Your request is pending approval (request ID: {approval_request_id}). "
-            f"The approver has been notified. You will receive a notification once a decision is made."
+            f"The approver has been notified. You will receive a notification once a "
+            f"decision is made."
         ),
         "answer": None,
     }
@@ -236,6 +304,9 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
 async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     """
     Perform RFC 8693 token exchange and send the query to the peer agent via A2A.
+
+    FIX C-5: the raw user JWT is read from the context var (not from state) and
+    the delegated token is stored in a context var — never in AgentState.
     """
     log.info("node_call_peer_agent", user_id=state["user_id"])
     if not settings.peer_agent_url:
@@ -244,17 +315,27 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
             "flow": FlowDecision.REMOTE_DENIED,
         }
 
+    # C-5: read user token from context var, not from state
+    user_token = _user_token_ctx.get()
+    if not user_token:
+        return {
+            "error": "No user token in context — cannot perform token exchange.",
+            "flow": FlowDecision.REMOTE_DENIED,
+        }
+
     # RFC 8693 token exchange
     delegated = await exchange_token(
-        user_token=state["user_token"],
+        user_token=user_token,
         target_audience=str(settings.peer_agent_url),
     )
 
-    # A2A call (non-streaming for simplicity; streaming variant available)
+    # C-5: stash delegated token in context var, NOT in state
+    _delegated_token_ctx.set(delegated.access_token)
+
+    # A2A call
     from a2a.client import A2AClient
     client = A2AClient(base_url=str(settings.peer_agent_url))
 
-    # Provide a push notification URL so the peer can call us back if approval is needed
     push_url = f"{settings.agent_url}/tasks/{state['task_id']}/callback"
 
     try:
@@ -273,7 +354,7 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     return {
         "peer_task_id": task.id,
         "peer_status": task.status.state.value,
-        "delegated_token": delegated.access_token,
+        # delegated_token intentionally NOT stored in state (C-5)
     }
 
 
@@ -282,21 +363,25 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
 async def handle_peer_result(state: AgentState) -> dict[str, Any]:
     """
     Process the peer agent's A2A task result.
-    Determines whether we got an answer, need to wait for approval, or were denied.
+
+    FIX C-5: delegated token is read from the context var, not from state.
     """
     peer_status = state.get("peer_status", "")
     log.info("node_handle_peer_result", peer_status=peer_status)
 
     if peer_status == "completed":
-        # Peer returned an answer — extract it from the task history
-        # (In a streaming scenario we'd have it already; here we poll)
+        # C-5: read delegated token from context var
+        delegated_token = _delegated_token_ctx.get()
+
         from a2a.client import A2AClient
         client = A2AClient(base_url=str(settings.peer_agent_url))
-        task = await client.get_task(
-            task_id=state["peer_task_id"],
-            delegated_token=state["delegated_token"],
-        )
-        await client.close()
+        try:
+            task = await client.get_task(
+                task_id=state["peer_task_id"],
+                delegated_token=delegated_token,
+            )
+        finally:
+            await client.close()
 
         # Extract text from last agent message
         answer = ""
@@ -317,18 +402,17 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
         }
 
     elif peer_status == "input-required":
-        # Peer needs approval
         return {
             "flow": FlowDecision.REMOTE_NEEDS_APPROVAL,
             "status_message": (
-                "The information you requested is on the remote cluster and requires approval from "
-                "the data owner there. You will be notified once a decision is made."
+                "The information you requested is on the remote cluster and requires "
+                "approval from the data owner there. You will be notified once a "
+                "decision is made."
             ),
             "answer": None,
         }
 
     else:
-        # failed, canceled, or unknown
         return {
             "flow": FlowDecision.REMOTE_DENIED,
             "status_message": f"Remote agent returned status: {peer_status}",

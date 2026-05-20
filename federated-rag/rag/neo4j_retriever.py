@@ -111,14 +111,20 @@ class GraphRAGRetriever:
     # ── Ingestion helpers ─────────────────────────────────────────────────────
 
     async def ensure_indexes(self) -> None:
-        """Create vector + fulltext indexes if they don't exist."""
+        """
+        Create vector + fulltext indexes if they don't exist.
+
+        FIX H-4: reuses the existing driver from _ensure_init() instead of
+        opening a second driver (and leaking it when the method returned without
+        calling driver.close() in the error path).
+        """
         import asyncio
 
         def _run() -> None:
-            driver = neo4j.GraphDatabase.driver(
-                settings.neo4j_uri,
-                auth=(settings.neo4j_user, settings.neo4j_password),
-            )
+            # Reuse the instance driver — no new connection opened here.
+            rag = self._ensure_init()
+            driver = self._driver
+            assert driver is not None, "Driver must be initialised by _ensure_init()"
             with driver.session() as session:
                 # Vector index
                 session.run(
@@ -135,7 +141,6 @@ class GraphRAGRetriever:
                     FOR (c:Chunk) ON EACH [c.text]
                     """
                 )
-            driver.close()
 
         await asyncio.to_thread(_run)
 

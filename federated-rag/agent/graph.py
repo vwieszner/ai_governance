@@ -16,8 +16,14 @@ Flow D — Remote + needs approval (cross-cluster):
 
 Flow E — Local denied (no peer):
   retrieve_local → check_auth → format_response
+
+FIX C-5: user_token is injected via context var (agent.nodes.set_user_token) before
+         the graph runs — it is never stored in AgentState.
+FIX L-4: compiled graph singleton protected by an asyncio.Lock.
 """
 from __future__ import annotations
+
+import asyncio
 
 from langgraph.graph import END, StateGraph
 
@@ -28,6 +34,7 @@ from agent.nodes import (
     generate_answer,
     handle_peer_result,
     retrieve_local,
+    set_user_token,
     start_approval,
 )
 from agent.state import AgentState, FlowDecision
@@ -101,14 +108,18 @@ def build_graph() -> StateGraph:
     return graph
 
 
-# Compiled graph (singleton)
+# FIX L-4: compiled graph singleton protected by asyncio.Lock
 _compiled = None
+_compile_lock: asyncio.Lock = asyncio.Lock()
 
 
-def get_compiled_graph():
+async def get_compiled_graph():
     global _compiled
-    if _compiled is None:
-        _compiled = build_graph().compile()
+    if _compiled is not None:
+        return _compiled
+    async with _compile_lock:
+        if _compiled is None:
+            _compiled = build_graph().compile()
     return _compiled
 
 
@@ -124,13 +135,19 @@ async def run_query(
     """
     Run the agent graph for a single query.
 
+    FIX C-5: user_token is passed to the nodes via a context var, not stored
+    in AgentState. This keeps it out of Langfuse traces and serialised snapshots.
+
     Returns the final AgentState with `answer` and `status_message` populated.
     """
     import uuid
+
+    # C-5: inject token into context var — never goes into the state dict
+    set_user_token(user_token)
+
     initial_state: AgentState = {
         "query": query,
         "user_id": user_id,
-        "user_token": user_token,
         "task_id": task_id or str(uuid.uuid4()),
         "context_id": context_id,
         "flow": None,
@@ -143,7 +160,6 @@ async def run_query(
         "peer_task_id": None,
         "peer_status": None,
         "peer_answer": None,
-        "delegated_token": None,
         "approval_request_id": None,
         "approval_decision": None,
         "answer": None,
@@ -153,6 +169,6 @@ async def run_query(
         "iterations": 0,
     }
 
-    graph = get_compiled_graph()
+    graph = await get_compiled_graph()
     final_state: AgentState = await graph.ainvoke(initial_state)
     return final_state

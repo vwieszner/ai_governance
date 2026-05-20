@@ -20,5 +20,9 @@ COPY . .
 
 EXPOSE 8000
 
+# L-2 FIX: run as non-root to limit blast radius if the container is compromised
+RUN useradd --create-home --shell /bin/bash appuser
+USER appuser
+
 # Default: run the API server
 CMD ["python", "-m", "api.main"]
