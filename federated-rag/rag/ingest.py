@@ -61,33 +61,35 @@ async def ingest_to_neo4j(chunks: list[dict[str, Any]]) -> None:
         settings.neo4j_uri,
         auth=(settings.neo4j_user, settings.neo4j_password),
     )
-    embedder = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        base_url=settings.openai_api_base,
-        api_key=settings.openai_api_key,
-    )
-    llm = OpenAILLM(
-        model_name=settings.llm_model,
-        base_url=settings.openai_api_base,
-        api_key=settings.openai_api_key,
-        model_params={"temperature": 0},
-    )
+    # Q-6: always close the driver, even if ingestion raises an exception.
+    try:
+        embedder = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            base_url=settings.openai_api_base,
+            api_key=settings.openai_api_key,
+        )
+        llm = OpenAILLM(
+            model_name=settings.llm_model,
+            base_url=settings.openai_api_base,
+            api_key=settings.openai_api_key,
+            model_params={"temperature": 0},
+        )
 
-    kg_builder = SimpleKGPipeline(
-        llm=llm,
-        driver=driver,
-        embedder=embedder,
-        from_pdf=False,
-    )
+        kg_builder = SimpleKGPipeline(
+            llm=llm,
+            driver=driver,
+            embedder=embedder,
+            from_pdf=False,
+        )
 
-    for chunk in chunks:
-        try:
-            await kg_builder.run_async(text=chunk["text"])
-            log.info("neo4j_chunk_ingested", chunk_id=chunk["chunk_id"])
-        except Exception as e:
-            log.warning("neo4j_chunk_failed", chunk_id=chunk["chunk_id"], error=str(e))
-
-    driver.close()
+        for chunk in chunks:
+            try:
+                await kg_builder.run_async(text=chunk["text"])
+                log.info("neo4j_chunk_ingested", chunk_id=chunk["chunk_id"])
+            except Exception as e:
+                log.warning("neo4j_chunk_failed", chunk_id=chunk["chunk_id"], error=str(e))
+    finally:
+        driver.close()
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────

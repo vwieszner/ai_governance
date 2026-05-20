@@ -70,6 +70,11 @@ class ApprovalInput:
     originating_task_id: str | None = None
     originating_agent_url: str | None = None
 
+    # Q-7 FIX: snapshot approval_timeout_seconds at workflow-start time so
+    # Temporal replay is deterministic even if the env var changes mid-flight.
+    # The caller (nodes.py) is responsible for populating this from settings.
+    timeout_seconds: int = 86400   # default 24 h; overridden by nodes.py
+
 
 @dataclass
 class ApprovalDecisionSignal:
@@ -124,11 +129,14 @@ class ApprovalWorkflow:
             retry_policy=RETRY_3,
         )
 
-        # Wait for decision signal (up to approval_timeout_seconds)
+        # Q-7 FIX: use inp.timeout_seconds (snapshotted at start) instead of
+        # reading settings.approval_timeout_seconds here.  Temporal replays this
+        # workflow function deterministically — reading live config inside
+        # @workflow.run is non-deterministic if the value changes between runs.
         try:
             await workflow.wait_condition(
                 lambda: self._decision is not None,
-                timeout=timedelta(seconds=settings.approval_timeout_seconds),
+                timeout=timedelta(seconds=inp.timeout_seconds),
             )
         except TemporalTimeoutError:
             await self._handle_timeout(inp)

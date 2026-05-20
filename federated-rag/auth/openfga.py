@@ -15,6 +15,7 @@ Authorization model (write once at startup):
 """
 from __future__ import annotations
 
+import asyncio
 from enum import Enum
 from typing import Any
 
@@ -53,15 +54,23 @@ class OpenFGAAuth:
 
     def __init__(self) -> None:
         self._client: OpenFgaClient | None = None
+        # S-11: lock prevents check-then-set race when multiple coroutines
+        # call _get_client() simultaneously at cold-start.
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def _get_client(self) -> OpenFgaClient:
-        if self._client is None:
-            config = ClientConfiguration(
-                api_url=settings.openfga_api_url,
-                store_id=settings.openfga_store_id,
-                authorization_model_id=settings.openfga_model_id or None,
-            )
-            self._client = OpenFgaClient(config)
+        # Fast path — no lock needed once initialised
+        if self._client is not None:
+            return self._client
+        async with self._lock:
+            # Double-check after acquiring the lock
+            if self._client is None:
+                config = ClientConfiguration(
+                    api_url=settings.openfga_api_url,
+                    store_id=settings.openfga_store_id,
+                    authorization_model_id=settings.openfga_model_id or None,
+                )
+                self._client = OpenFgaClient(config)
         return self._client
 
     # ── Check ─────────────────────────────────────────────────────────────────

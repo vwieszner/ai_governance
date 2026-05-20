@@ -1,6 +1,7 @@
 """Neo4j GraphRAG retriever using the official neo4j-graphrag Python package."""
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import neo4j
@@ -24,40 +25,51 @@ class GraphRAGRetriever:
     def __init__(self) -> None:
         self._driver: neo4j.Driver | None = None
         self._rag: GraphRAG | None = None
+        # R-5: _ensure_init() is called from asyncio.to_thread (thread-pool).
+        # Multiple concurrent calls at cold-start could race on the None check,
+        # creating duplicate driver connections.  threading.Lock serialises them.
+        self._lock: threading.Lock = threading.Lock()
 
     # ── Lazy init ─────────────────────────────────────────────────────────────
 
     def _ensure_init(self) -> GraphRAG:
+        # Fast path — no lock needed once initialised
         if self._rag is not None:
             return self._rag
 
-        self._driver = neo4j.GraphDatabase.driver(
-            settings.neo4j_uri,
-            auth=(settings.neo4j_user, settings.neo4j_password),
-        )
+        with self._lock:
+            # Double-check after acquiring the lock (R-5)
+            if self._rag is not None:
+                return self._rag
 
-        embedder = OpenAIEmbeddings(
-            model="text-embedding-3-small",      # replaced at runtime if NVIDIA endpoint supports embeddings
-            base_url=settings.openai_api_base,
-            api_key=settings.openai_api_key,
-        )
+            self._driver = neo4j.GraphDatabase.driver(
+                settings.neo4j_uri,
+                auth=(settings.neo4j_user, settings.neo4j_password),
+            )
 
-        retriever = HybridRetriever(
-            driver=self._driver,
-            index_name="chunkVector",            # created during ingestion
-            fulltext_index_name="chunkFulltext", # created during ingestion
-            embedder=embedder,
-            return_properties=["text", "chunk_id", "source", "title"],
-        )
+            embedder = OpenAIEmbeddings(
+                model="text-embedding-3-small",      # replaced at runtime if NVIDIA endpoint supports embeddings
+                base_url=settings.openai_api_base,
+                api_key=settings.openai_api_key,
+            )
 
-        llm = OpenAILLM(
-            model_name=settings.llm_model,
-            base_url=settings.openai_api_base,
-            api_key=settings.openai_api_key,
-            model_params={"temperature": 0, "max_tokens": 1024},
-        )
+            retriever = HybridRetriever(
+                driver=self._driver,
+                index_name="chunkVector",            # created during ingestion
+                fulltext_index_name="chunkFulltext", # created during ingestion
+                embedder=embedder,
+                return_properties=["text", "chunk_id", "source", "title"],
+            )
 
-        self._rag = GraphRAG(retriever=retriever, llm=llm)
+            llm = OpenAILLM(
+                model_name=settings.llm_model,
+                base_url=settings.openai_api_base,
+                api_key=settings.openai_api_key,
+                model_params={"temperature": 0, "max_tokens": 1024},
+            )
+
+            self._rag = GraphRAG(retriever=retriever, llm=llm)
+
         return self._rag
 
     # ── Retrieval ─────────────────────────────────────────────────────────────

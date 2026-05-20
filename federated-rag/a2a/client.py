@@ -128,38 +128,42 @@ class A2AClient:
         push_notification_url: str | None = None,
     ) -> Task:
         """
-        Send a task and wait for completion (or input-required).
-        Polls until terminal state.
+        Send a task and return when the peer reaches a terminal state.
+
+        FIX R-6: /tasks/send ALWAYS responds with SSE, never plain JSON.
+        The previous implementation called resp.json() directly on an SSE
+        response body, which would parse "data: {...}" as raw text and raise
+        a JSONDecodeError.  This implementation delegates to send_task_streaming
+        and collects events until a terminal state is reached.
+
+        Terminal states: completed, failed, canceled, input-required.
         """
-        task_id = str(uuid.uuid4())
-        message = Message(
-            role="user",
-            parts=[TextPart(text=query)],
-            messageId=str(uuid.uuid4()),
-            taskId=task_id,
-        )
-        push = (
-            PushNotificationConfig(url=push_notification_url)
-            if push_notification_url
-            else None
-        )
-        payload = SendTaskRequest(
-            id=task_id,
-            contextId=context_id,
-            message=message,
-            pushNotification=push,
-        )
-        headers = {
-            "Authorization": f"Bearer {delegated_token}",
-            "Content-Type": "application/json",
-        }
-        resp = await self._http.post(
-            f"{self._base_url}/tasks/send",
-            content=payload.model_dump_json(by_alias=True),
-            headers=headers,
-        )
-        resp.raise_for_status()
-        return Task.model_validate(resp.json())
+        _TERMINAL_STATES = {"completed", "failed", "canceled", "input-required"}
+
+        # Accumulated task representation — merged from every event's data dict
+        accumulated: dict[str, Any] = {}
+
+        async for event in self.send_task_streaming(
+            query=query,
+            delegated_token=delegated_token,
+            context_id=context_id,
+            push_notification_url=push_notification_url,
+        ):
+            data = event.get("data", {})
+            if isinstance(data, dict):
+                accumulated.update(data)
+                # Stop as soon as we hit a terminal task state
+                state = (data.get("status") or {}).get("state", "")
+                if state in _TERMINAL_STATES:
+                    break
+
+        if not accumulated:
+            raise ValueError(
+                "No task data received from peer agent SSE stream — "
+                "the peer may have closed the connection without sending any events."
+            )
+
+        return Task.model_validate(accumulated)
 
     # ── Task get ──────────────────────────────────────────────────────────────
 

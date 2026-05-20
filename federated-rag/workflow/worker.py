@@ -1,4 +1,10 @@
-"""Temporal worker — runs the approval workflow and its activities."""
+"""Temporal worker — runs the approval workflow and its activities.
+
+FIX R-1: revoke_pending_in_openfga was missing from the activities list.
+Without this registration, the H-6 fix (revoke on denial/timeout) silently
+fails with a NotRegisteredError at runtime, leaving stale pending_approval
+tuples in OpenFGA.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +18,7 @@ from workflow.activities import (
     grant_access_in_openfga,
     notify_approver,
     notify_user_of_decision,
+    revoke_pending_in_openfga,   # FIX R-1
     send_a2a_callback,
 )
 from workflow.approval import ApprovalWorkflow
@@ -32,6 +39,7 @@ async def _run() -> None:
         activities=[
             notify_approver,
             grant_access_in_openfga,
+            revoke_pending_in_openfga,   # FIX R-1: was missing
             notify_user_of_decision,
             send_a2a_callback,
         ],

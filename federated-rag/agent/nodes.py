@@ -12,6 +12,15 @@ Fixes applied:
   H-2  — All async singletons protected by asyncio.Lock (double-checked locking).
   M-4  — LLM context is capped at settings.llm_context_token_budget tokens
           (estimated as characters / 4) before calling the model.
+  Q-5  — original_len saved before context is truncated, so the log entry
+          records the pre-truncation length (not post-truncation + footer length).
+  R-2  — handle_peer_result validates that delegated token is non-empty before
+          calling the peer A2A endpoint.
+  R-4  — start_approval handles WorkflowAlreadyStartedError from Temporal so
+          duplicate workflow starts are treated as idempotent no-ops.
+  S-8  — All four synchronous singletons (_qdrant, _graph, _openfga, _llm) are
+          now async and protected by asyncio.Lock with double-checked locking,
+          matching the pattern already used for the Temporal client.
 
 Nodes:
   retrieve_local      — Qdrant hybrid + Neo4j GraphRAG
@@ -58,7 +67,11 @@ def set_user_token(token: str) -> None:
     _user_token_ctx.set(token)
 
 
-# ── Async-safe singletons (H-2) ───────────────────────────────────────────────
+# ── Async-safe singletons (H-2 + S-8) ────────────────────────────────────────
+#
+# All singletons use double-checked locking with asyncio.Lock so that
+# concurrent coroutines starting at the same time (e.g., two requests at
+# cold-start) do not race and create duplicate heavyweight objects.
 
 _qdrant: HybridQdrantRetriever | None = None
 _graph: GraphRAGRetriever | None = None
@@ -66,41 +79,60 @@ _openfga: OpenFGAAuth | None = None
 _llm: ChatOpenAI | None = None
 _temporal_client: TemporalClient | None = None
 
-# Locks for singletons that involve async or expensive initialisation
+_qdrant_lock: asyncio.Lock = asyncio.Lock()
+_graph_lock: asyncio.Lock = asyncio.Lock()
+_openfga_lock: asyncio.Lock = asyncio.Lock()
+_llm_lock: asyncio.Lock = asyncio.Lock()
 _temporal_lock: asyncio.Lock = asyncio.Lock()
 
 
-def _get_qdrant() -> HybridQdrantRetriever:
+async def _get_qdrant() -> HybridQdrantRetriever:
+    """S-8: async singleton with double-checked locking."""
     global _qdrant
-    if _qdrant is None:
-        _qdrant = HybridQdrantRetriever()
+    if _qdrant is not None:
+        return _qdrant
+    async with _qdrant_lock:
+        if _qdrant is None:
+            _qdrant = HybridQdrantRetriever()
     return _qdrant
 
 
-def _get_graph() -> GraphRAGRetriever:
+async def _get_graph() -> GraphRAGRetriever:
+    """S-8: async singleton with double-checked locking."""
     global _graph
-    if _graph is None:
-        _graph = GraphRAGRetriever()
+    if _graph is not None:
+        return _graph
+    async with _graph_lock:
+        if _graph is None:
+            _graph = GraphRAGRetriever()
     return _graph
 
 
-def _get_openfga() -> OpenFGAAuth:
+async def _get_openfga() -> OpenFGAAuth:
+    """S-8: async singleton with double-checked locking."""
     global _openfga
-    if _openfga is None:
-        _openfga = OpenFGAAuth()
+    if _openfga is not None:
+        return _openfga
+    async with _openfga_lock:
+        if _openfga is None:
+            _openfga = OpenFGAAuth()
     return _openfga
 
 
-def _get_llm() -> ChatOpenAI:
+async def _get_llm() -> ChatOpenAI:
+    """S-8: async singleton with double-checked locking."""
     global _llm
-    if _llm is None:
-        _llm = ChatOpenAI(
-            model=settings.llm_model,
-            openai_api_base=settings.openai_api_base,
-            openai_api_key=settings.openai_api_key,
-            temperature=settings.llm_temperature,
-            max_tokens=settings.llm_max_tokens,
-        )
+    if _llm is not None:
+        return _llm
+    async with _llm_lock:
+        if _llm is None:
+            _llm = ChatOpenAI(
+                model=settings.llm_model,
+                openai_api_base=settings.openai_api_base,
+                openai_api_key=settings.openai_api_key,
+                temperature=settings.llm_temperature,
+                max_tokens=settings.llm_max_tokens,
+            )
     return _llm
 
 
@@ -128,8 +160,8 @@ async def retrieve_local(state: AgentState) -> dict[str, Any]:
     log.info("node_retrieve_local", query=state["query"][:80])
     query = state["query"]
 
-    qdrant_results = await _get_qdrant().retrieve(query)
-    graph_results = await _get_graph().retrieve_context(query)
+    qdrant_results = await (await _get_qdrant()).retrieve(query)
+    graph_results = await (await _get_graph()).retrieve_context(query)
 
     # Fuse with RRF
     fused = rrf_fuse(qdrant_results, graph_results, final_limit=settings.qdrant_final_k)
@@ -154,7 +186,7 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     there are no locally serveable chunks and a peer cluster is configured.
     """
     log.info("node_check_auth", user_id=state["user_id"])
-    auth = _get_openfga()
+    auth = await _get_openfga()
     user_id = state["user_id"]
     fused = state["fused_chunks"]
 
@@ -221,12 +253,15 @@ async def generate_answer(state: AgentState) -> dict[str, Any]:
     )
 
     # FIX M-4: guard against exceeding the model's context window
+    # FIX Q-5: record original_len BEFORE truncation so the log shows the true
+    #          pre-truncation size, not the (already-shortened) post-truncation length.
     max_chars = settings.llm_context_token_budget * 4   # ~4 chars per token
-    if len(context) > max_chars:
+    original_len = len(context)
+    if original_len > max_chars:
         context = context[:max_chars] + "\n\n[... context truncated to fit token budget ...]"
-        log.warning("context_truncated", original_len=len(context), max_chars=max_chars)
+        log.warning("context_truncated", original_len=original_len, max_chars=max_chars)
 
-    llm = _get_llm()
+    llm = await _get_llm()
     prompt = (
         f"You are a helpful assistant. Answer the user's question using ONLY the provided context.\n"
         f"If the context does not contain enough information, say so.\n\n"
@@ -252,7 +287,7 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
     FIX C-6: reuses the module-level Temporal singleton via _get_temporal().
     """
     log.info("node_start_approval", user_id=state["user_id"])
-    auth = _get_openfga()
+    auth = await _get_openfga()
     user_id = state["user_id"]
     chunk_ids = state["pending_chunk_ids"] or state["denied_chunk_ids"]
 
@@ -271,22 +306,33 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
             break
 
     # Start Temporal workflow (C-6: reuse singleton)
+    from temporalio.exceptions import WorkflowAlreadyStartedError
     from workflow.approval import ApprovalInput, ApprovalWorkflow
     temporal_client = await _get_temporal()
-    await temporal_client.start_workflow(
-        ApprovalWorkflow.run,
-        ApprovalInput(
+    try:
+        await temporal_client.start_workflow(
+            ApprovalWorkflow.run,
+            ApprovalInput(
+                approval_request_id=approval_request_id,
+                user_id=user_id,
+                chunk_ids=chunk_ids,
+                query=state["query"],
+                approver_id=approver_id,
+                approver_slack_id=None,
+                approver_email=None,
+                # Q-7: snapshot timeout at start so replay is deterministic
+                timeout_seconds=settings.approval_timeout_seconds,
+            ),
+            id=f"approval-{approval_request_id}",
+            task_queue=settings.temporal_task_queue,
+        )
+    except WorkflowAlreadyStartedError:
+        # R-4: idempotent — a duplicate start (e.g., retry) for the same
+        # request ID is not an error; the existing workflow continues.
+        log.warning(
+            "approval_workflow_already_started",
             approval_request_id=approval_request_id,
-            user_id=user_id,
-            chunk_ids=chunk_ids,
-            query=state["query"],
-            approver_id=approver_id,
-            approver_slack_id=None,
-            approver_email=None,
-        ),
-        id=f"approval-{approval_request_id}",
-        task_queue=settings.temporal_task_queue,
-    )
+        )
 
     return {
         "approval_request_id": approval_request_id,
@@ -371,7 +417,17 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
 
     if peer_status == "completed":
         # C-5: read delegated token from context var
+        # R-2: validate it is non-empty before use — an empty token means the
+        # call_peer_agent node was bypassed or the context var was not set,
+        # which would result in a silent 401 from the peer.
         delegated_token = _delegated_token_ctx.get()
+        if not delegated_token:
+            log.error("handle_peer_result_no_delegated_token")
+            return {
+                "flow": FlowDecision.REMOTE_DENIED,
+                "status_message": "Internal error: missing delegated token for peer fetch.",
+                "answer": None,
+            }
 
         from a2a.client import A2AClient
         client = A2AClient(base_url=str(settings.peer_agent_url))

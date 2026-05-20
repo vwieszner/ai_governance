@@ -3,6 +3,12 @@ RFC 8693 OAuth 2.0 Token Exchange + JWT validation.
 
 FIX C-1: audience is now strictly validated against a configurable list.
 FIX H-5: JWKS cache protected by asyncio.Lock — no thundering herd at TTL boundary.
+FIX S-4: explicit httpx timeout on every outbound HTTP call so a hung IdP does
+         not stall the event loop indefinitely.
+FIX S-5: accepted JWT algorithm list is now read from settings so operators can
+         lock it down to their IdP's actual algorithm (e.g. RS256 only).
+FIX S-9: JWKS / network errors during token validation now raise a distinct
+         exception so the API layer can return 503 instead of 401.
 """
 from __future__ import annotations
 
@@ -19,11 +25,18 @@ from config import settings
 
 log = structlog.get_logger(__name__)
 
+# Timeout for ALL outbound HTTP calls (IdP token endpoint, JWKS fetch)
+_HTTP_TIMEOUT = 10.0
+
 # ── JWKS cache (H-5 fix: protected by lock) ───────────────────────────────────
 _JWKS_CACHE: dict[str, Any] = {}
 _JWKS_CACHE_TTL: float = 3600.0
 _jwks_fetched_at: float = 0.0
 _jwks_lock: asyncio.Lock | None = None   # created lazily (can't instantiate at import time)
+
+
+class AuthServiceUnavailable(Exception):
+    """Raised when the JWKS endpoint or IdP is unreachable (→ 503, not 401)."""
 
 
 def _get_jwks_lock() -> asyncio.Lock:
@@ -49,8 +62,10 @@ async def exchange_token(user_token: str, target_audience: str) -> DelegatedToke
       sub = original user ID
       act = this agent's client ID
       aud = target_audience (the downstream service)
+
+    FIX S-4: timeout=_HTTP_TIMEOUT prevents hung IdP from blocking the event loop.
     """
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         resp = await client.post(
             settings.oidc_token_endpoint,
             data={
@@ -80,7 +95,11 @@ async def exchange_token(user_token: str, target_audience: str) -> DelegatedToke
 
 
 async def _fetch_jwks() -> dict[str, Any]:
-    """Fetch JWKS with double-checked locking to prevent thundering herd (H-5)."""
+    """
+    Fetch JWKS with double-checked locking to prevent thundering herd (H-5).
+    FIX S-4: explicit timeout on the JWKS fetch.
+    FIX S-9: network errors are wrapped in AuthServiceUnavailable.
+    """
     global _jwks_fetched_at, _JWKS_CACHE
 
     now = time.monotonic()
@@ -95,10 +114,16 @@ async def _fetch_jwks() -> dict[str, Any]:
             return _JWKS_CACHE   # another coroutine already refreshed it
 
         log.info("jwks_refresh", uri=settings.oidc_jwks_uri)
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(settings.oidc_jwks_uri, timeout=10.0)
-            resp.raise_for_status()
-            new_cache = resp.json()
+        try:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+                resp = await client.get(settings.oidc_jwks_uri)
+                resp.raise_for_status()
+                new_cache = resp.json()
+        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            # S-9: distinguish network/IdP outage from bad token
+            raise AuthServiceUnavailable(
+                f"Failed to fetch JWKS from {settings.oidc_jwks_uri}: {exc}"
+            ) from exc
 
         # Atomic update — assign both in sequence while holding the lock
         _JWKS_CACHE = new_cache
@@ -115,7 +140,13 @@ async def validate_token(token: str) -> dict[str, Any]:
     AND its own public URL (to accept delegated cross-cluster tokens).
     verify_aud is always True — no bypass.
 
+    FIX S-5: accepted algorithms are read from settings.allowed_jwt_algorithms_list
+    so operators can restrict to their IdP's actual algorithm.
+
+    FIX S-9: JWKS network errors raise AuthServiceUnavailable (caller maps to 503).
+
     Raises JWTError on invalid / expired / wrong-audience tokens.
+    Raises AuthServiceUnavailable when the IdP is unreachable.
     """
     jwks = await _fetch_jwks()
     unverified_header = jwt.get_unverified_header(token)
@@ -137,7 +168,7 @@ async def validate_token(token: str) -> dict[str, Any]:
     claims: dict[str, Any] = jwt.decode(
         token,
         signing_key,
-        algorithms=["RS256", "ES256"],
+        algorithms=settings.allowed_jwt_algorithms_list,   # FIX S-5: configurable
         audience=valid_audiences,
         issuer=settings.oidc_issuer,
         options={"verify_aud": True},   # FIX C-1: ALWAYS validate audience

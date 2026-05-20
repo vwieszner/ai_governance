@@ -19,7 +19,9 @@ class Settings(BaseSettings):
     # Peer cluster
     peer_agent_url: AnyHttpUrl | None = None  # type: ignore[assignment]
     peer_agent_card_url: AnyHttpUrl | None = None  # type: ignore[assignment]
-    # Comma-separated list of allowed peer agent client IDs for callback auth
+    # FIX Q-4: if peer_agent_url is set and this is empty, callback auth is disabled.
+    # Must be set in production whenever peer_agent_url is configured.
+    # Comma-separated list of allowed peer agent OAuth client IDs for callback auth.
     peer_agent_client_ids: str = ""
 
     # LLM — NVIDIA NIM (OpenAI-compatible)
@@ -29,6 +31,7 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.0
     llm_max_tokens: int = 2048
     llm_context_token_budget: int = 6000     # max tokens of context fed to LLM (M-4)
+    max_query_length: int = 4096             # max chars for user query input
 
     # Qdrant
     qdrant_url: str = "http://localhost:6333"
@@ -64,6 +67,9 @@ class Settings(BaseSettings):
     oidc_token_endpoint: str = "https://keycloak.internal/realms/rag/protocol/openid-connect/token"
     agent_client_id: str = Field(default=...)    # REQUIRED
     agent_client_secret: str = Field(default=...) # REQUIRED
+    # FIX S-5: lock to your IdP's actual algorithm. If Keycloak is RS256-only,
+    # change to "RS256" to prevent ES256-keyed token forgery.
+    allowed_jwt_algorithms: str = "RS256,ES256"  # comma-separated
 
     # Approval endpoint — HMAC signing key for approve/deny deep-links (C-2)
     approval_hmac_secret: str = Field(default=...)  # REQUIRED — random 32-byte hex
@@ -88,11 +94,28 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "info"
-    max_request_body_bytes: int = 1_048_576     # 1 MB (M-3)
+    max_request_body_bytes: int = 1_048_576     # 1 MB (M-3 / S-1)
 
     @property
     def peer_agent_client_ids_list(self) -> list[str]:
         return [s.strip() for s in self.peer_agent_client_ids.split(",") if s.strip()]
+
+    @property
+    def allowed_jwt_algorithms_list(self) -> list[str]:
+        return [s.strip() for s in self.allowed_jwt_algorithms.split(",") if s.strip()]
+
+    @model_validator(mode="after")
+    def warn_peer_client_ids(self) -> "Settings":
+        """Warn at startup if a peer URL is configured but no peer client IDs are set."""
+        if self.peer_agent_url and not self.peer_agent_client_ids_list:
+            import warnings
+            warnings.warn(
+                "peer_agent_url is set but peer_agent_client_ids is empty — "
+                "the /tasks/{id}/callback endpoint will reject ALL peer callbacks. "
+                "Set PEER_AGENT_CLIENT_IDS to the peer's OAuth client_id.",
+                stacklevel=2,
+            )
+        return self
 
 
 settings = Settings()

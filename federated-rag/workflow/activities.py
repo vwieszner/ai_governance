@@ -9,6 +9,11 @@ Security fixes:
   H-7  — delegated_token removed from A2ACallbackInput.  The send_a2a_callback
           activity obtains a fresh short-lived token via client-credentials grant
           rather than storing a user-delegated token in Temporal's event history.
+  S-3  — send_a2a_callback validates peer_agent_url against the configured
+          peer_agent_url allowlist before making any HTTP call (SSRF prevention).
+  S-4  — send_a2a_callback POST now carries an explicit httpx timeout.
+  S-10 — inp.query truncated to 500 chars before insertion into Slack blocks
+          to prevent oversized Slack API payloads.
 """
 from __future__ import annotations
 
@@ -111,6 +116,13 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
     approve_url = _approval_url(inp.approval_request_id, "approve")
     deny_url    = _approval_url(inp.approval_request_id, "deny")
 
+    # S-10: truncate query before insertion — Slack text blocks have a 3000-char
+    # limit; cap earlier to avoid confusing truncation mid-word.
+    _MAX_QUERY_DISPLAY = 500
+    display_query = inp.query[:_MAX_QUERY_DISPLAY]
+    if len(inp.query) > _MAX_QUERY_DISPLAY:
+        display_query += "…"
+
     blocks = [
         {
             "type": "section",
@@ -118,7 +130,7 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
                 "type": "mrkdwn",
                 "text": (
                     f"*Access request from user `{inp.user_id}`*\n"
-                    f"Query: _{inp.query}_\n"
+                    f"Query: _{display_query}_\n"
                     f"Chunks requested: `{', '.join(inp.chunk_ids[:5])}`"
                     + (f" (+{len(inp.chunk_ids) - 5} more)" if len(inp.chunk_ids) > 5 else "")
                 ),
@@ -189,6 +201,20 @@ async def notify_user_of_decision(inp: NotifyUserInput) -> None:
     log.info("user_notified", user_id=inp.user_id, message=inp.message)
 
 
+def _is_allowed_peer_url(url: str) -> bool:
+    """
+    S-3: validate that the callback URL belongs to the configured peer agent.
+    Only allow URLs that begin with the configured peer_agent_url origin so
+    Temporal activities cannot be weaponised for SSRF.
+    """
+    allowed = str(settings.peer_agent_url or "").rstrip("/")
+    if not allowed:
+        return False
+    # Normalise to origin comparison — strip trailing path from both sides
+    url_stripped = url.rstrip("/")
+    return url_stripped == allowed or url_stripped.startswith(allowed + "/")
+
+
 @activity.defn
 async def send_a2a_callback(inp: A2ACallbackInput) -> None:
     """
@@ -197,7 +223,21 @@ async def send_a2a_callback(inp: A2ACallbackInput) -> None:
     H-7 FIX: obtains a fresh agent service-account token via client-credentials
     grant instead of using a stored user-delegated token.  This token is short-lived
     and never persisted in Temporal's event history.
+    S-3 FIX: inp.peer_agent_url is validated against the configured allowlist
+    before any HTTP call is made, preventing SSRF.
+    S-4 FIX: explicit httpx timeout on the callback POST.
     """
+    # S-3: SSRF guard — reject URLs not matching the configured peer origin
+    if not _is_allowed_peer_url(inp.peer_agent_url):
+        log.error(
+            "a2a_callback_ssrf_blocked",
+            peer_agent_url=inp.peer_agent_url,
+            allowed=str(settings.peer_agent_url),
+        )
+        raise ValueError(
+            f"Callback URL '{inp.peer_agent_url}' is not in the peer agent allowlist"
+        )
+
     # Get a short-lived service account token for this agent
     agent_token = await _get_service_account_token()
 
@@ -208,7 +248,8 @@ async def send_a2a_callback(inp: A2ACallbackInput) -> None:
             "message": inp.message,
         },
     }
-    async with httpx.AsyncClient() as client:
+    # S-4: explicit timeout so a hung peer cannot stall the Temporal activity
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             f"{inp.peer_agent_url}/tasks/{inp.task_id}/callback",
             json=payload,
