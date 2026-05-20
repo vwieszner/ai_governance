@@ -24,6 +24,8 @@ FIX L-4: compiled graph singleton protected by an asyncio.Lock.
 from __future__ import annotations
 
 import asyncio
+import uuid  # LG-4: moved to module top — was buried inside run_query
+from typing import Any
 
 from langgraph.graph import END, StateGraph
 
@@ -50,9 +52,17 @@ def route_after_auth(state: AgentState) -> str:
         return "start_approval"
     elif flow == FlowDecision.REMOTE:
         return "call_peer_agent"
-    else:
-        # LOCAL_DENIED with no peer configured
+    elif flow == FlowDecision.LOCAL_DENIED:
+        # No peer configured — surface the denial to the user
         return "format_response"
+    else:
+        # LG-2: unknown or None flow is a programming error, not a valid state.
+        # Silently routing to format_response would produce a confusing empty
+        # response; raising here makes the bug immediately visible in tests/logs.
+        raise ValueError(
+            f"route_after_auth reached with unexpected flow value: {flow!r}. "
+            "check_auth must set a valid FlowDecision before this router runs."
+        )
 
 
 def route_after_peer_call(state: AgentState) -> str:
@@ -109,11 +119,12 @@ def build_graph() -> StateGraph:
 
 
 # FIX L-4: compiled graph singleton protected by asyncio.Lock
-_compiled = None
+# PY-3: explicit type annotation so static analysis understands _compiled may be None
+_compiled: Any = None  # CompiledStateGraph | None
 _compile_lock: asyncio.Lock = asyncio.Lock()
 
 
-async def get_compiled_graph():
+async def get_compiled_graph() -> Any:  # -> CompiledStateGraph (PY-2)
     global _compiled
     if _compiled is not None:
         return _compiled
@@ -140,7 +151,7 @@ async def run_query(
 
     Returns the final AgentState with `answer` and `status_message` populated.
     """
-    import uuid
+    # LG-4: uuid is now imported at module top; the local import here is removed
 
     # C-5: inject token into context var — never goes into the state dict
     set_user_token(user_token)

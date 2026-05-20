@@ -56,7 +56,9 @@ class HybridQdrantRetriever:
         await c.create_collection(
             collection_name=settings.qdrant_collection,
             vectors_config={
-                "dense": VectorParams(size=1024, distance=Distance.COSINE),
+                # GQ-6: use settings.qdrant_dense_size so this stays in sync with
+                # the embedding model dimension configured in config.py (default 1024).
+                "dense": VectorParams(size=settings.qdrant_dense_size, distance=Distance.COSINE),
             },
             sparse_vectors_config={
                 "sparse": SparseVectorParams(),
@@ -121,8 +123,13 @@ class HybridQdrantRetriever:
 
         return [
             {
-                "chunk_id": str(point.id),
-                "text": point.payload.get("text", "") if point.payload else "",
+                # MED-1: return the chunk_id from the payload, not str(point.id).
+                # point.id is the Qdrant-internal UUID assigned at upsert time;
+                # the application-level chunk_id (a 16-hex SHA-256 prefix stored
+                # separately in the payload) is what OpenFGA ACL lookups use.
+                # Using str(point.id) would break every authorization decision.
+                "chunk_id": (point.payload or {}).get("chunk_id", str(point.id)),
+                "text": (point.payload or {}).get("text", ""),
                 "metadata": {
                     k: v
                     for k, v in (point.payload or {}).items()

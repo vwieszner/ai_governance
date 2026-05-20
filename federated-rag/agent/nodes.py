@@ -190,7 +190,8 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     is always started when any chunk requires it.  Remote is tried whenever
     there are no locally serveable chunks and a peer cluster is configured.
     """
-    log.info("node_check_auth", user_id=state["user_id"])
+    # NIT-1: user_id is an OIDC sub (may look like an email) — log at DEBUG not INFO
+    log.debug("node_check_auth", user_id=state["user_id"])
     auth = await _get_openfga()
     user_id = state["user_id"]
     fused = state["fused_chunks"]
@@ -204,15 +205,22 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
 
     # FIX H-1: prioritise pending over allowed, and always try peer when no
     # locally-allowed data exists (empty results also route to REMOTE).
+    #
+    # MED-4: REMOTE is correct only when the local retriever found NO results
+    # at all (fused is empty).  When we did find local chunks but they are ALL
+    # denied, the data is local — routing to the peer leaks what the user is
+    # querying and wastes a cross-cluster round-trip the peer will also deny.
+    local_results_exist = bool(fused)
     if pending:
         # Some chunks require human approval — start workflow, don't serve anything yet
         flow = FlowDecision.LOCAL_NEEDS_APPROVAL
     elif allowed:
         flow = FlowDecision.LOCAL_ALLOWED
-    elif settings.peer_agent_url:
-        # No locally-allowed data; try the peer cluster
+    elif not local_results_exist and settings.peer_agent_url:
+        # No local data at all — ask the peer cluster
         flow = FlowDecision.REMOTE
     else:
+        # Local data exists but user is denied for all of it
         flow = FlowDecision.LOCAL_DENIED
 
     log.info(
@@ -507,7 +515,13 @@ async def format_response(state: AgentState) -> dict[str, Any]:
     error = state.get("error")
 
     if error:
-        return {"answer": f"Error: {error}", "status_message": "error"}
+        # LOW-1: never surface raw exception strings (hostnames, ports, stack
+        # frames) to the end user — log internally and return a generic message.
+        log.warning("format_response_error", raw_error=error)
+        return {
+            "answer": "An error occurred while processing your request. Please try again.",
+            "status_message": "error",
+        }
     if not answer:
         answer = status or "I could not find an answer to your query."
 

@@ -30,6 +30,12 @@ log = structlog.get_logger(__name__)
 
 def split_text(text: str, chunk_size: int = 512, overlap: int = 64) -> list[str]:
     """Simple sentence-aware chunker."""
+    # LOW-2: guard against infinite loop — if overlap >= chunk_size the start
+    # pointer would never advance, spinning forever on the first chunk.
+    if overlap >= chunk_size:
+        raise ValueError(
+            f"overlap ({overlap}) must be less than chunk_size ({chunk_size})"
+        )
     words = text.split()
     chunks: list[str] = []
     start = 0
@@ -41,8 +47,8 @@ def split_text(text: str, chunk_size: int = 512, overlap: int = 64) -> list[str]
 
 
 def make_chunk_id(source: str, index: int) -> str:
-    h = hashlib.sha256(f"{source}:{index}".encode()).hexdigest()[:16]
-    return f"{h}"
+    # GQ-9/PY-9: f"{h}" is a no-op f-string — just return h directly
+    return hashlib.sha256(f"{source}:{index}".encode()).hexdigest()[:16]
 
 
 # ── Neo4j KG ingestion ────────────────────────────────────────────────────────
@@ -112,41 +118,46 @@ async def ingest_documents(
     qdrant = HybridQdrantRetriever()
     graph = GraphRAGRetriever()
 
-    await qdrant.ensure_collection()
-    await graph.ensure_indexes()
+    # MED-6: try/finally ensures both clients are closed even if ingestion raises.
+    # Without this, an exception mid-pipeline leaves open HTTP connections and
+    # the Neo4j driver's background thread running indefinitely.
+    try:
+        await qdrant.ensure_collection()
+        await graph.ensure_indexes()
 
-    all_chunks: list[dict[str, Any]] = []
+        all_chunks: list[dict[str, Any]] = []
 
-    for path in paths:
-        log.info("reading_file", path=str(path))
-        text = path.read_text(encoding="utf-8", errors="replace")
-        raw_chunks = split_text(text, chunk_size=chunk_size, overlap=overlap)
+        for path in paths:
+            log.info("reading_file", path=str(path))
+            text = path.read_text(encoding="utf-8", errors="replace")
+            raw_chunks = split_text(text, chunk_size=chunk_size, overlap=overlap)
 
-        for i, chunk_text in enumerate(raw_chunks):
-            chunk_id = make_chunk_id(str(path), i)
-            all_chunks.append(
-                {
-                    "chunk_id": chunk_id,
-                    "text": chunk_text,
-                    "metadata": {
-                        "source": str(path),
-                        "chunk_index": i,
-                        "title": path.stem,
-                    },
-                }
-            )
+            for i, chunk_text in enumerate(raw_chunks):
+                chunk_id = make_chunk_id(str(path), i)
+                all_chunks.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "text": chunk_text,
+                        "metadata": {
+                            "source": str(path),
+                            "chunk_index": i,
+                            "title": path.stem,
+                        },
+                    }
+                )
 
-    log.info("upserting_to_qdrant", count=len(all_chunks))
-    # Batch upserts to Qdrant (100 at a time)
-    batch_size = 100
-    for i in range(0, len(all_chunks), batch_size):
-        await qdrant.upsert_chunks(all_chunks[i : i + batch_size])
+        log.info("upserting_to_qdrant", count=len(all_chunks))
+        # Batch upserts to Qdrant (100 at a time)
+        batch_size = 100
+        for i in range(0, len(all_chunks), batch_size):
+            await qdrant.upsert_chunks(all_chunks[i : i + batch_size])
 
-    log.info("building_knowledge_graph", count=len(all_chunks))
-    await ingest_to_neo4j(all_chunks)
+        log.info("building_knowledge_graph", count=len(all_chunks))
+        await ingest_to_neo4j(all_chunks)
+    finally:
+        await qdrant.close()
+        await graph.close()
 
-    await qdrant.close()
-    await graph.close()
     log.info("ingestion_complete", total_chunks=len(all_chunks))
 
 

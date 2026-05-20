@@ -1,6 +1,7 @@
 """Neo4j GraphRAG retriever using the official neo4j-graphrag Python package."""
 from __future__ import annotations
 
+import asyncio  # PY-7: was imported inside method bodies — moved to module top
 import threading
 from typing import Any
 
@@ -84,8 +85,7 @@ class GraphRAGRetriever:
 
         Returns a list of chunk-like dicts so callers can fuse with Qdrant results.
         """
-        import asyncio
-
+        # PY-7: asyncio imported at module top
         k = top_k or settings.neo4j_top_k
 
         def _run() -> list[dict[str, Any]]:
@@ -111,7 +111,7 @@ class GraphRAGRetriever:
 
     async def generate_answer(self, query: str) -> str:
         """Full GraphRAG answer generation (used for summarisation queries)."""
-        import asyncio
+        # PY-7: asyncio imported at module top
 
         def _run() -> str:
             rag = self._ensure_init()
@@ -130,13 +130,20 @@ class GraphRAGRetriever:
         opening a second driver (and leaking it when the method returned without
         calling driver.close() in the error path).
         """
-        import asyncio
+        # PY-7: asyncio imported at module top
 
         def _run() -> None:
             # Reuse the instance driver — no new connection opened here.
             rag = self._ensure_init()
             driver = self._driver
-            assert driver is not None, "Driver must be initialised by _ensure_init()"
+            # GQ-2: assert is disabled in optimised (-O) builds and gives a poor
+            # error message.  A RuntimeError here is an unrecoverable bug, so we
+            # raise explicitly to get a meaningful message and a proper traceback.
+            if driver is None:
+                raise RuntimeError(
+                    "Neo4j driver is None after _ensure_init() — this is a bug; "
+                    "_ensure_init() must always assign self._driver before returning."
+                )
             with driver.session() as session:
                 # Vector index
                 session.run(

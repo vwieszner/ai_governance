@@ -56,6 +56,12 @@ async def test_flow_a_local_authorized(
     assert len(result["answer"]) > 0
     assert result.get("error") is None
     assert result.get("approval_request_id") is None
+    # TS-4: verify that OpenFGA actually returned some allowed chunks — if it
+    # returned an empty list the graph would route to LOCAL_DENIED, not LOCAL_ALLOWED,
+    # so this assertion catches a broken mock_openfga_allowed fixture.
+    assert len(result.get("allowed_chunk_ids", [])) > 0, (
+        "Flow A should have non-empty allowed_chunk_ids; check mock_openfga_allowed"
+    )
 
     print(f"\n[Flow A] Answer: {result['answer'][:120]}...")
 
@@ -85,7 +91,11 @@ async def test_flow_b_local_needs_approval(
         f"Expected LOCAL_NEEDS_APPROVAL, got {result['flow']}"
     )
     assert result.get("approval_request_id") is not None
-    assert result.get("answer") is None or result["answer"] == ""
+    # TS-5: assert answer is strictly None — "" would be an accidental empty string
+    # produced by a node that should have left the field unset.
+    assert result.get("answer") is None, (
+        f"Flow B answer should be None (approval pending), got: {result.get('answer')!r}"
+    )
 
     # Status message should mention approval
     status = result.get("status_message", "")
@@ -162,7 +172,12 @@ async def test_flow_c_remote_authorized(
     assert result["flow"] == FlowDecision.REMOTE_APPROVED, (
         f"Expected REMOTE_APPROVED, got {result['flow']}"
     )
-    assert result.get("answer") == peer_answer or peer_answer[:30] in (result.get("answer") or "")
+    # TS-3: assert exact equality — the peer answer should be reproduced verbatim;
+    # the `or peer_answer[:30] in ...` fallback masked bugs where the answer was
+    # mangled or truncated by intermediate processing.
+    assert result.get("answer") == peer_answer, (
+        f"Expected exact peer answer.\nGot: {result.get('answer')!r}"
+    )
 
     # Token exchange should have been called with the peer URL as audience
     mock_exchange.assert_called_once()
@@ -221,7 +236,10 @@ async def test_flow_d_remote_needs_approval(
     assert result["flow"] == FlowDecision.REMOTE_NEEDS_APPROVAL, (
         f"Expected REMOTE_NEEDS_APPROVAL, got {result['flow']}"
     )
-    assert result.get("answer") is None or result["answer"] == ""
+    # TS-5 (Flow D): same as Flow B — answer must be strictly None, not ""
+    assert result.get("answer") is None, (
+        f"Flow D answer should be None (remote approval pending), got: {result.get('answer')!r}"
+    )
 
     status = result.get("status_message", "")
     assert "approval" in status.lower() or "remote" in status.lower(), (
@@ -240,34 +258,40 @@ async def test_approval_workflow_approve():
     """After approval signal: OpenFGA viewer tuples written, user notified."""
     from workflow.approval import ApprovalInput, ApprovalWorkflow, ApprovalDecisionSignal
 
-    with patch("workflow.activities.notify_approver", new_callable=AsyncMock), \
-         patch("workflow.activities.grant_access_in_openfga", new_callable=AsyncMock) as mock_grant, \
-         patch("workflow.activities.revoke_pending_in_openfga", new_callable=AsyncMock), \
-         patch("workflow.activities.notify_user_of_decision", new_callable=AsyncMock) as mock_notify, \
-         patch("workflow.activities.send_a2a_callback", new_callable=AsyncMock):
+    # NIT-2 FIX: patch activity names in the *workflow.approval* module namespace,
+    # not in *workflow.activities*.  approval.py binds names at import time via
+    # `from workflow.activities import grant_access_in_openfga`, so patching the
+    # source module after import has no effect on the reference held by the workflow.
+    # Also: fake_execute returns None instead of calling through to the real
+    # (network-bound) activity implementation — the workflow unit test should only
+    # verify orchestration logic, not the activity's side effects.
+    workflow_obj = ApprovalWorkflow()
+    decision_signal = ApprovalDecisionSignal(decision="approved", reason="Looks good", approver_id="bob")
+    await workflow_obj.approval_decision(decision_signal)
 
-        workflow_obj = ApprovalWorkflow()
-        signal = ApprovalDecisionSignal(decision="approved", reason="Looks good", approver_id="bob")
-        await workflow_obj.approval_decision(signal)
+    inp = ApprovalInput(
+        approval_request_id="test-req-001",
+        user_id="alice",
+        chunk_ids=["chunk-001", "chunk-002"],
+        query="What are the salary bands?",
+        approver_id="bob",
+    )
 
-        inp = ApprovalInput(
-            approval_request_id="test-req-001",
-            user_id="alice",
-            chunk_ids=["chunk-001", "chunk-002"],
-            query="What are the salary bands?",
-            approver_id="bob",
-        )
+    with patch("workflow.approval.grant_access_in_openfga", new_callable=AsyncMock), \
+         patch("workflow.approval.notify_user_of_decision", new_callable=AsyncMock), \
+         patch("workflow.approval.notify_approver", new_callable=AsyncMock), \
+         patch("workflow.approval.send_a2a_callback", new_callable=AsyncMock), \
+         patch("temporalio.workflow.execute_activity", new_callable=AsyncMock) as mock_exec:
 
-        with patch("temporalio.workflow.execute_activity", new_callable=AsyncMock) as mock_exec:
-            async def fake_execute(fn, arg, **kwargs):
-                return await fn(arg)
-            mock_exec.side_effect = fake_execute
+        async def fake_execute(fn, arg, **kwargs):
+            # Return None — activities are exercised by their own unit tests
+            return None
+        mock_exec.side_effect = fake_execute
 
-            with patch("temporalio.workflow.wait_condition", new_callable=AsyncMock):
-                result = await workflow_obj._handle_approved(inp, signal)
+        result = await workflow_obj._handle_approved(inp, decision_signal)
 
-        assert result.decision == "approved"
-        print(f"\n[Approval] workflow result: {result}")
+    assert result.decision == "approved"
+    print(f"\n[Approval] workflow result: {result}")
 
 
 @pytest.mark.asyncio

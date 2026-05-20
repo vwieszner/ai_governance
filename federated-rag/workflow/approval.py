@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Optional
+# PY-5: Optional was imported but never used — removed
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -145,7 +145,10 @@ class ApprovalWorkflow:
                 reason="No response from approver within timeout",
             )
 
-        decision = self._decision  # type: ignore[assignment]
+        # TM-1: assert instead of type: ignore — wait_condition guarantees the
+        # signal has been received (self._decision is set), so None is impossible here.
+        assert self._decision is not None, "wait_condition returned but _decision is None"
+        decision = self._decision
 
         if decision.decision == "approved":
             return await self._handle_approved(inp, decision)
@@ -250,4 +253,27 @@ class ApprovalWorkflow:
             ),
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=NO_RETRY,
+        )
+
+        # TM-5: notify the originating agent so its A2A task transitions out of
+        # INPUT_REQUIRED.  Without this callback, the peer agent's task stays
+        # in INPUT_REQUIRED indefinitely — the user can never tell that the
+        # request expired and must re-submit.
+        if inp.originating_agent_url and inp.originating_task_id:
+            await workflow.execute_activity(
+                send_a2a_callback,
+                A2ACallbackInput(
+                    peer_agent_url=inp.originating_agent_url,
+                    task_id=inp.originating_task_id,
+                    decision="denied",
+                    message="Access request timed out — no approver response within the deadline.",
+                ),
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RETRY_3,
+            )
+
+        workflow.logger.warning(
+            "approval_workflow_timed_out",
+            request_id=inp.approval_request_id,
+            user=inp.user_id,
         )

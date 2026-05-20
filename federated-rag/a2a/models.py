@@ -29,8 +29,10 @@ class AgentSkill(BaseModel):
     id: str
     name: str
     description: str
-    input_modes: list[str] = ["text"]
-    output_modes: list[str] = ["text"]
+    # PY-1: use Field(default_factory=...) — bare list literals are shared across
+    # all instances that rely on the default, which can cause silent mutation bugs.
+    input_modes: list[str] = Field(default_factory=lambda: ["text"])
+    output_modes: list[str] = Field(default_factory=lambda: ["text"])
 
 
 class AgentCard(BaseModel):
@@ -41,8 +43,8 @@ class AgentCard(BaseModel):
     version: str = "0.1.0"
     capabilities: AgentCapabilities = Field(default_factory=AgentCapabilities)
     skills: list[AgentSkill] = Field(default_factory=list)
-    default_input_modes: list[str] = Field(["text"], alias="defaultInputModes")
-    default_output_modes: list[str] = Field(["text"], alias="defaultOutputModes")
+    default_input_modes: list[str] = Field(default_factory=lambda: ["text"], alias="defaultInputModes")
+    default_output_modes: list[str] = Field(default_factory=lambda: ["text"], alias="defaultOutputModes")
 
     model_config = {"populate_by_name": True}
 

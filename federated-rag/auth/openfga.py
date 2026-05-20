@@ -103,7 +103,7 @@ class OpenFGAAuth:
         self, user_id: str, chunk_ids: list[str]
     ) -> dict[str, AuthzDecision]:
         """Decide for a list of chunks. Returns {chunk_id: decision}."""
-        import asyncio
+        # PY-6: asyncio is already imported at module top — removed redundant local import
         tasks = [self.decide(user_id, cid) for cid in chunk_ids]
         results = await asyncio.gather(*tasks)
         return dict(zip(chunk_ids, results))
@@ -162,7 +162,13 @@ class OpenFGAAuth:
         log.info("openfga_set_pending", user_id=user_id, chunk_id=chunk_id)
 
     async def revoke_pending_approval(self, user_id: str, chunk_id: str) -> None:
-        """Remove the pending_approval tuple after a decision is made."""
+        """Remove the pending_approval tuple after a decision is made.
+
+        MED-3: OpenFGA returns an error when deleting a tuple that does not exist.
+        This is a valid state during Temporal workflow retries (the activity may
+        have already deleted the tuple on a previous attempt).  We swallow the
+        not-found error to make the operation idempotent.
+        """
         client = await self._get_client()
         body = ClientWriteRequest(
             deletes=[
@@ -173,7 +179,20 @@ class OpenFGAAuth:
                 )
             ]
         )
-        await client.write(body)
+        try:
+            await client.write(body)
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if any(kw in err_str for kw in ("not found", "does not exist", "cannot delete")):
+                # Tuple already absent — idempotent no-op on retry
+                log.warning(
+                    "openfga_revoke_noop",
+                    user_id=user_id,
+                    chunk_id=chunk_id,
+                    reason="tuple not found",
+                )
+            else:
+                raise
 
     async def close(self) -> None:
         if self._client:

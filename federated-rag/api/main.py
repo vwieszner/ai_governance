@@ -59,6 +59,7 @@ from a2a.models import (
     TextPart,
 )
 from agent.graph import run_query
+from agent.state import AgentState
 from auth.token_exchange import (
     AuthServiceUnavailable,
     extract_client_id,
@@ -71,6 +72,13 @@ from workflow.approval import ApprovalDecisionSignal
 log = structlog.get_logger(__name__)
 
 _DOCS_ENABLED = os.getenv("DOCS_ENABLED", "false").lower() == "true"
+
+# PY-8: compile once at module load, not on every request
+_SAFE_ID_CHARS = re.compile(r"[^a-zA-Z0-9\-]")
+
+
+class _BodyTooLargeError(Exception):
+    """Internal sentinel — body limit exceeded; 413 already sent to the ASGI server."""
 
 # ── Request correlation ID (Q-2) ──────────────────────────────────────────────
 # Module-level ContextVar so the request ID is available to structlog processors
@@ -101,7 +109,7 @@ class _CorrelationIdMiddleware:
         _raw_id = headers.get(b"x-request-id", b"").decode("ascii", errors="ignore")
         # M3-1: sanitize to alphanumeric + hyphens, max 64 chars, to prevent
         # header injection via CRLF sequences or oversized values.
-        _SAFE_ID_CHARS = re.compile(r"[^a-zA-Z0-9\-]")
+        # PY-8: _SAFE_ID_CHARS is a module-level constant; not recompiled per request.
         if _raw_id:
             request_id = _SAFE_ID_CHARS.sub("", _raw_id)[:64] or str(uuid.uuid4())
         else:
@@ -168,50 +176,94 @@ class _LimitBodySizeMiddleware:
             if message["type"] == "http.request":
                 total_received += len(message.get("body", b""))
                 if total_received > self.max_bytes:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Request body too large",
-                    )
+                    # GQ-3: HTTPException raised inside a raw ASGI receive() callable
+                    # is NOT caught by FastAPI's exception handlers — they only wrap
+                    # the endpoint coroutine, not the receive channel.  Send the 413
+                    # directly over the ASGI send channel, then raise a private
+                    # sentinel to abort request processing cleanly.
+                    _body = b"Request body too large"
+                    await send({
+                        "type": "http.response.start",
+                        "status": 413,
+                        "headers": [
+                            (b"content-type", b"text/plain; charset=utf-8"),
+                            (b"content-length", str(len(_body)).encode()),
+                        ],
+                    })
+                    await send({
+                        "type": "http.response.body",
+                        "body": _body,
+                        "more_body": False,
+                    })
+                    raise _BodyTooLargeError()
             return message
 
-        await self.app(scope, receive_wrapper, send)
+        try:
+            await self.app(scope, receive_wrapper, send)
+        except _BodyTooLargeError:
+            pass  # 413 already sent above
 
 
 # ── Redis task store (C-3) ────────────────────────────────────────────────────
 
 _redis: aioredis.Redis | None = None
+# HIGH-1: protect the singleton with a lock — same double-checked locking pattern
+# used by all other singletons in this codebase.
+_redis_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def _get_redis() -> aioredis.Redis:
     global _redis
-    if _redis is None:
-        _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+    if _redis is not None:
+        return _redis
+    async with _redis_lock:
+        if _redis is None:
+            _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
     return _redis
 
 
 async def _store_task(task: Task, owner_id: str | None = None) -> None:
-    r = await _get_redis()
-    # Embed the owner_id in the task metadata for ownership verification (S-7)
-    if owner_id is not None:
-        task.metadata["owner_id"] = owner_id
-    await r.setex(
-        f"task:{task.id}",
-        settings.task_ttl_seconds,
-        task.model_dump_json(by_alias=True),
-    )
+    # HIGH-1: wrap Redis operations — surface connectivity failures as 503, not 500
+    try:
+        r = await _get_redis()
+        if owner_id is not None:
+            task.metadata["owner_id"] = owner_id
+        await r.setex(
+            f"task:{task.id}",
+            settings.task_ttl_seconds,
+            task.model_dump_json(by_alias=True),
+        )
+    except Exception as exc:
+        log.error("redis_store_task_failed", task_id=task.id, error=str(exc))
+        raise HTTPException(status_code=503, detail="Task store temporarily unavailable")
 
 
 async def _load_task(task_id: str) -> Task | None:
-    r = await _get_redis()
-    data = await r.get(f"task:{task_id}")
+    try:
+        r = await _get_redis()
+        data = await r.get(f"task:{task_id}")
+    except Exception as exc:
+        log.error("redis_load_task_failed", task_id=task_id, error=str(exc))
+        raise HTTPException(status_code=503, detail="Task store temporarily unavailable")
     if data is None:
         return None
     return Task.model_validate_json(data)
 
 
 async def _store_callback_url(task_id: str, url: str) -> None:
-    r = await _get_redis()
-    await r.setex(f"task_cb:{task_id}", settings.task_ttl_seconds, url)
+    # HIGH-2: this stores the A2A push-notification webhook URL for the *originating*
+    # caller, so that if this agent later acts as the *peer* responding to a cross-
+    # cluster request it knows where to push updates.  The key is read by the
+    # task_callback endpoint logic if/when the peer calls back with a status update.
+    # NOTE: currently _load_callback_url is not implemented — add it when implementing
+    # the full push-notification fanout path.
+    try:
+        r = await _get_redis()
+        await r.setex(f"task_cb:{task_id}", settings.task_ttl_seconds, url)
+    except Exception as exc:
+        # Non-fatal: push notifications are best-effort; the SSE stream is the
+        # primary delivery mechanism.
+        log.warning("redis_store_callback_url_failed", task_id=task_id, error=str(exc))
 
 
 # ── HMAC helpers (C-2) ────────────────────────────────────────────────────────
@@ -239,6 +291,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("temporal_client_connected", address=settings.temporal_address)
     yield
     log.info("shutting_down")
+    # FA-6: close the Redis connection pool so the OS releases sockets cleanly.
+    # Without this, Kubernetes pod termination logs spurious "connection reset" errors.
+    global _redis
+    if _redis is not None:
+        await _redis.aclose()
+        _redis = None
 
 
 app = FastAPI(
@@ -266,6 +324,11 @@ async def get_token_claims(authorization: str = Header(...)) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid Authorization header")
     try:
         claims = await validate_token(token)
+        # LOW-5: reject tokens that lack a `sub` claim — an empty user_id would
+        # propagate into OpenFGA and Redis as an empty string, matching any tuple
+        # with an empty user ID and creating a phantom user in the task store.
+        if not claims.get("sub"):
+            raise HTTPException(status_code=401, detail="Token missing required 'sub' claim")
         return {"claims": claims, "token": token}
     except JWTError:
         # C3-3: do NOT log str(e) — python-jose includes the raw JWT value and
@@ -284,9 +347,13 @@ async def get_token_claims(authorization: str = Header(...)) -> dict[str, Any]:
 
 # ── AgentCard ─────────────────────────────────────────────────────────────────
 
-@app.get("/.well-known/agent-card.json", response_model=None)
-async def agent_card() -> dict[str, Any]:
-    card = AgentCard(
+@app.get(
+    "/.well-known/agent-card.json",
+    response_model=AgentCard,
+    response_model_by_alias=True,  # FA-2: emit camelCase aliases per A2A spec
+)
+async def agent_card() -> AgentCard:
+    return AgentCard(
         name=settings.agent_name,
         description=(
             "Federated RAG agent — hybrid vector + graph retrieval with "
@@ -306,17 +373,23 @@ async def agent_card() -> dict[str, Any]:
             )
         ],
     )
-    return card.model_dump(by_alias=True)
 
 
 # ── tasks/send (SSE streaming) ────────────────────────────────────────────────
 
-@app.post("/tasks/send")
+@app.post(
+    "/tasks/send",
+    response_class=EventSourceResponse,  # FA-1: declare SSE content-type in OpenAPI schema
+)
 async def send_task(
     request: Request,
     auth: dict[str, Any] = Depends(get_token_claims),
 ) -> EventSourceResponse:
-    body = await request.json()
+    # FA-7: wrap JSON parsing so a malformed body returns 422, not 500
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body must be valid JSON")
     req = SendTaskRequest.model_validate(body)
 
     task_id = req.id or str(uuid.uuid4())
@@ -326,8 +399,10 @@ async def send_task(
     # Validate query length before processing (missing input validation fix)
     query = ""
     for part in req.message.parts:
-        if isinstance(part, TextPart) or (isinstance(part, dict) and part.get("type") == "text"):
-            query = part.text if hasattr(part, "text") else part.get("text", "")
+        # GQ-1: after Pydantic validation, parts are always TextPart or DataPart objects.
+        # The isinstance(part, dict) branch is unreachable and was masking type errors.
+        if isinstance(part, TextPart):
+            query = part.text
             break
     # L3-1: reject messages that contain no text part — an empty query passes the
     # length check but produces a useless LLM response.
@@ -361,7 +436,8 @@ async def send_task(
 
         # R-3: wrap run_query in a Task so client disconnect cancels it
         # N3-5: asyncio.create_task() is the preferred API (ensure_future deprecated)
-        run_task: asyncio.Task = asyncio.create_task(
+        # GQ-5: parameterize Task with the return type for static analysis
+        run_task: asyncio.Task[AgentState] = asyncio.create_task(
             run_query(
                 query=query,
                 user_id=user_id,
@@ -417,11 +493,15 @@ async def send_task(
 
 # ── tasks/{task_id} GET ───────────────────────────────────────────────────────
 
-@app.get("/tasks/{task_id}")
+@app.get(
+    "/tasks/{task_id}",
+    response_model=Task,
+    response_model_by_alias=True,  # FA-3: emit camelCase aliases per A2A spec
+)
 async def get_task(
     task_id: str,
     auth: dict[str, Any] = Depends(get_token_claims),
-) -> dict[str, Any]:
+) -> Task:
     task = await _load_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -434,12 +514,12 @@ async def get_task(
     if not owner_id or owner_id != caller_id:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    return task.model_dump(by_alias=True)
+    return task
 
 
 # ── tasks/{task_id}/callback POST (A2A push notification) ─────────────────────
 
-@app.post("/tasks/{task_id}/callback")
+@app.post("/tasks/{task_id}/callback", response_model=dict[str, bool])  # FA-4
 async def task_callback(
     task_id: str,
     request: Request,
@@ -493,7 +573,7 @@ async def handle_approval(
     decision: str = Query(..., pattern="^(approve|deny)$"),
     token: str = Query(..., description="HMAC-SHA256 signature of '{request_id}:{decision}'"),
     reason: str = Query("", description="Optional reason for the decision"),
-    request: Request = None,
+    request: Request,  # FA-5: Request has no default — omitting it causes a 422 on every call
 ) -> JSONResponse:
     """
     FIX C-2: HMAC-signed deep-link — only Slack/email links generated by the
@@ -527,8 +607,10 @@ async def handle_approval(
             detail="Failed to record decision. Please try again.",
         )
 
+    # LOW-3: return a generic acknowledgement — echoing request_id and decision
+    # in the response leaks workflow identifiers to the approver's browser/log.
     return JSONResponse(
-        content={"message": f"Decision '{decision}' recorded for request {request_id}"},
+        content={"message": "Decision recorded. Thank you."},
         status_code=200,
     )
 

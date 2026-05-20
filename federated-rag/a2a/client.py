@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from typing import Any, AsyncIterator
 
@@ -22,6 +23,12 @@ from a2a.models import (
 from config import settings
 
 log = structlog.get_logger(__name__)
+
+# GQ-4: module-level frozenset so it is defined once and is hashable/immutable.
+# Previously defined inside send_task() on every call.
+_TERMINAL_STATES: frozenset[str] = frozenset({
+    "completed", "failed", "canceled", "input-required"
+})
 
 
 class A2AClient:
@@ -98,25 +105,30 @@ class A2AClient:
             headers=headers,
         ) as resp:
             resp.raise_for_status()
-            # FIX M-2: event_type is reset per SSE event (event: + data: pair).
-            # Using a local variable scoped to each event prevents the previous
-            # event's type from leaking into the next data line when the server
-            # sends data: lines without a preceding event: line.
+            # MED-2: buffer data: lines and emit on the blank-line SSE delimiter.
+            # The previous implementation yielded on every data: line, which broke
+            # multi-line SSE payloads (multiple data: lines per event) by emitting
+            # multiple incomplete events instead of one coalesced event.
             current_event_type: str = "message"
+            data_lines: list[str] = []
             async for line in resp.aiter_lines():
                 if not line:
-                    # Blank line signals end of one SSE event — reset type
+                    # Blank line = end of one SSE event
+                    if data_lines:
+                        raw = "\n".join(data_lines)
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            data = {"raw": raw}
+                        yield {"event_type": current_event_type, "data": data}
+                    # Reset for next event
                     current_event_type = "message"
-                    continue
-                if line.startswith("event:"):
+                    data_lines = []
+                elif line.startswith("event:"):
                     current_event_type = line[len("event:"):].strip()
                 elif line.startswith("data:"):
-                    raw = line[len("data:"):].strip()
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        data = {"raw": raw}
-                    yield {"event_type": current_event_type, "data": data}
+                    data_lines.append(line[len("data:"):].strip())
+                # Lines starting with ':' are SSE comments/keepalives — ignored per spec
 
     # ── Task send (non-streaming) ─────────────────────────────────────────────
 
@@ -138,7 +150,14 @@ class A2AClient:
 
         Terminal states: completed, failed, canceled, input-required.
         """
-        _TERMINAL_STATES = {"completed", "failed", "canceled", "input-required"}
+        # GQ-4: _TERMINAL_STATES is now a module-level frozenset
+
+        # HIGH-4: the httpx timeout covers connection + first byte, NOT total stream
+        # duration.  Once streaming starts the async-for loop can run indefinitely
+        # (e.g., peer approval workflow takes hours).  Enforce a wall-clock deadline
+        # so a stuck peer cannot leak this coroutine and its HTTP connection forever.
+        _SSE_STREAM_TIMEOUT = 300.0  # 5 min; Temporal activity deadline fires before this
+        _deadline = time.monotonic() + _SSE_STREAM_TIMEOUT
 
         # Accumulated task representation — merged from every event's data dict
         accumulated: dict[str, Any] = {}
@@ -149,6 +168,11 @@ class A2AClient:
             context_id=context_id,
             push_notification_url=push_notification_url,
         ):
+            if time.monotonic() > _deadline:
+                raise TimeoutError(
+                    f"Peer SSE stream did not reach a terminal state within "
+                    f"{_SSE_STREAM_TIMEOUT:.0f}s — possible stuck workflow on peer"
+                )
             data = event.get("data", {})
             if isinstance(data, dict):
                 # M3-4: merge carefully — history is the latest full snapshot,

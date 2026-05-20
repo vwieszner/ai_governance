@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import hmac as hmac_lib
 from dataclasses import dataclass, field
+from urllib.parse import quote, urlencode
 
 import httpx
 import structlog
@@ -28,6 +29,20 @@ from temporalio import activity
 from config import settings
 
 log = structlog.get_logger(__name__)
+
+# TM-2: module-level OpenFGA singleton so the SDK client (and its connection
+# pool) is created once per Temporal worker process, not once per activity call.
+# Temporal activities are short-lived coroutines sharing one event loop, so a
+# single async client is safe and avoids per-call TCP handshake overhead.
+_openfga_singleton: "OpenFGAAuth | None" = None
+
+
+def _get_openfga() -> "OpenFGAAuth":
+    global _openfga_singleton
+    if _openfga_singleton is None:
+        from auth.openfga import OpenFGAAuth  # noqa: PLC0415 — deferred to avoid circular import at module init
+        _openfga_singleton = OpenFGAAuth()
+    return _openfga_singleton
 
 
 # ── Input dataclasses ─────────────────────────────────────────────────────────
@@ -87,11 +102,11 @@ def _sign_approval(request_id: str, decision: str) -> str:
 
 
 def _approval_url(request_id: str, decision: str) -> str:
+    # MED-5: percent-encode all query-string values to prevent header injection
+    # and ensure URLs remain valid if request_id or decision ever contain special chars.
     tok = _sign_approval(request_id, decision)
-    return (
-        f"{settings.approval_ui_base_url}/approve/{request_id}"
-        f"?decision={decision}&token={tok}"
-    )
+    qs = urlencode({"decision": decision, "token": tok})
+    return f"{settings.approval_ui_base_url}/approve/{quote(request_id)}?{qs}"
 
 
 # ── Activities ────────────────────────────────────────────────────────────────
@@ -99,7 +114,7 @@ def _approval_url(request_id: str, decision: str) -> str:
 @activity.defn
 async def notify_approver(inp: NotifyApproverInput) -> None:
     """Send Slack (or email) message to the approver with HMAC-signed links."""
-    if inp.approver_slack_id and settings.slack_bot_token:
+    if inp.approver_slack_id and settings.slack_bot_token:  # GQ-8: slack_bot_token is now str | None
         await _slack_notify(inp)
     elif inp.approver_email:
         log.info(
@@ -173,12 +188,11 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
 @activity.defn
 async def grant_access_in_openfga(inp: GrantAccessInput) -> None:
     """Write viewer tuples to OpenFGA for each approved chunk and revoke pending."""
-    from auth.openfga import OpenFGAAuth
-    auth = OpenFGAAuth()
+    # TM-2: use module-level singleton — no new client per activity call
+    auth = _get_openfga()
     for chunk_id in inp.chunk_ids:
         await auth.grant_viewer(inp.user_id, chunk_id)
         await auth.revoke_pending_approval(inp.user_id, chunk_id)
-    await auth.close()
     log.info("openfga_access_granted", user_id=inp.user_id, count=len(inp.chunk_ids))
 
 
@@ -188,11 +202,10 @@ async def revoke_pending_in_openfga(inp: RevokeApprovalInput) -> None:
     H-6 FIX: Revoke pending_approval tuples without granting viewer access.
     Called on denial AND timeout so the user can submit a new request later.
     """
-    from auth.openfga import OpenFGAAuth
-    auth = OpenFGAAuth()
+    # TM-2: use module-level singleton — no new client per activity call
+    auth = _get_openfga()
     for chunk_id in inp.chunk_ids:
         await auth.revoke_pending_approval(inp.user_id, chunk_id)
-    await auth.close()
     log.info("openfga_pending_revoked", user_id=inp.user_id, count=len(inp.chunk_ids))
 
 
@@ -257,9 +270,15 @@ async def send_a2a_callback(inp: A2ACallbackInput) -> None:
             headers={"Authorization": f"Bearer {agent_token}"},
         )
         if resp.status_code not in (200, 202):
-            log.error("a2a_callback_failed", status=resp.status_code, body=resp.text)
-        else:
-            log.info("a2a_callback_sent", task_id=inp.task_id, decision=inp.decision)
+            log.error("a2a_callback_failed", status=resp.status_code, body=resp.text[:500])
+            # TM-3: raise so Temporal marks the activity as failed and retries
+            # per the retry policy configured in the workflow.  Silently logging
+            # and returning would make the callback appear successful even when
+            # the peer never received it, defeating Temporal's durability guarantee.
+            raise RuntimeError(
+                f"A2A callback to {inp.peer_agent_url} returned HTTP {resp.status_code}"
+            )
+        log.info("a2a_callback_sent", task_id=inp.task_id, decision=inp.decision)
 
 
 async def _get_service_account_token() -> str:
@@ -281,7 +300,7 @@ async def _get_service_account_token() -> str:
                 "scope": "openid",
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=10.0,
+            # PY-16: timeout already set at the client level above; no need to repeat
         )
         resp.raise_for_status()
         return resp.json()["access_token"]

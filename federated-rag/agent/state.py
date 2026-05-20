@@ -3,6 +3,15 @@
 FIX C-5: user_token and delegated_token removed from state — they are never
 stored in the graph's serialised snapshot, Langfuse traces, or Temporal history.
 Both are passed via contextvars (see agent/nodes.py).
+
+LG-1 NOTE — no Annotated reducers on list fields:
+    This graph is purely sequential; there are no parallel branches.  Adding
+    operator.add reducers would change "replace" semantics to "accumulate"
+    semantics for every state update, which would break nodes like check_auth
+    (its allowed_chunk_ids update would append to the previous run's list rather
+    than replacing it).  If parallel nodes are added in the future, add
+    Annotated[list[...], operator.add] reducers only to fields that are meant
+    to be accumulated across concurrent node executions.
 """
 from __future__ import annotations
 

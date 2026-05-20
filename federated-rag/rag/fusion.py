@@ -56,15 +56,6 @@ def rrf_fuse(
         for cid, score in fused
     ]
 
-
-def deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove duplicate chunk_ids, keeping the first occurrence (highest score)."""
-    seen: set[str] = set()
-    out: list[dict[str, Any]] = []
-    for item in items:
-        cid = item.get("chunk_id", "")
-        if cid and cid in seen:
-            continue
-        seen.add(cid)
-        out.append(item)
-    return out
+# PY-15: deduplicate() was dead code — rrf_fuse() already deduplicates by
+# building a dict keyed on chunk_id, so this function was never called.
+# Removed to avoid confusion about whether callers should call it.

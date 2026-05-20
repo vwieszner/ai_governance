@@ -1,5 +1,5 @@
 """Central configuration — loaded once at startup from environment / .env file."""
-from __future__ import annotations
+from __future__ import annotations  # PY-12: enables plain class name in return annotations
 
 from pydantic import AnyHttpUrl, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -36,7 +36,11 @@ class Settings(BaseSettings):
 
     # Qdrant
     qdrant_url: str = "http://localhost:6333"
-    qdrant_api_key: str = Field(default=...)  # REQUIRED — set QDRANT_API_KEY in .env
+    # NIT-4: empty string is the correct sentinel — qdrant_retriever does `or None`
+    # to convert it to None for unauthenticated local Qdrant instances.
+    # Field(default=...) would force every developer to set the env var even when
+    # running against a local container with no API key configured.
+    qdrant_api_key: str = Field(default="")   # optional — set for managed Qdrant Cloud
     qdrant_collection: str = "knowledge_base"
     qdrant_dense_model: str = "BAAI/bge-m3"   # 1024-dim
     qdrant_sparse_model: str = "Qdrant/bm25"
@@ -80,7 +84,9 @@ class Settings(BaseSettings):
     task_ttl_seconds: int = 86400               # 24 h — tasks expire from Redis
 
     # Notifications
-    slack_bot_token: str = ""
+    # GQ-8: str | None = None is cleaner than str = "" — callers can `if settings.slack_bot_token`
+    # without ambiguity between "not configured" and "configured but empty".
+    slack_bot_token: str | None = None
     slack_approval_channel: str = "#approvals"
     approval_ui_base_url: str = "http://localhost:8000"
 
@@ -106,7 +112,7 @@ class Settings(BaseSettings):
         return [s.strip() for s in self.allowed_jwt_algorithms.split(",") if s.strip()]
 
     @model_validator(mode="after")
-    def warn_peer_client_ids(self) -> "Settings":
+    def warn_peer_client_ids(self) -> Settings:  # PY-12: no forward ref needed; add `from __future__ import annotations` instead
         """Warn at startup if a peer URL is configured but no peer client IDs are set."""
         if self.peer_agent_url and not self.peer_agent_client_ids_list:
             import warnings

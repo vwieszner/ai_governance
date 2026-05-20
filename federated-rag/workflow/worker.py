@@ -8,6 +8,7 @@ tuples in OpenFGA.
 from __future__ import annotations
 
 import asyncio
+import signal
 
 import structlog
 from temporalio.client import Client
@@ -27,6 +28,20 @@ log = structlog.get_logger(__name__)
 
 
 async def _run() -> None:
+    # NIT-3: handle SIGTERM so Kubernetes graceful shutdown stops the worker
+    # cleanly instead of killing it mid-activity.  The shutdown event is set on
+    # the first signal; the Worker context-manager then drains in-flight
+    # activities before returning.
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def _handle_signal() -> None:
+        log.info("temporal_worker_shutdown_signal")
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _handle_signal)
+
     client = await Client.connect(
         settings.temporal_address,
         namespace=settings.temporal_namespace,
@@ -45,7 +60,8 @@ async def _run() -> None:
         ],
     ):
         log.info("temporal_worker_running")
-        await asyncio.Event().wait()   # run forever
+        await shutdown_event.wait()   # run until SIGTERM / SIGINT
+    log.info("temporal_worker_stopped")
 
 
 def run() -> None:

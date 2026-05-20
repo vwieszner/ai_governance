@@ -128,8 +128,10 @@ async def _fetch_jwks() -> dict[str, Any]:
                 resp = await client.get(settings.oidc_jwks_uri)
                 resp.raise_for_status()
                 new_cache = resp.json()
-        except (httpx.HTTPError, httpx.TimeoutException) as exc:
-            # S-9: distinguish network/IdP outage from bad token
+        except httpx.HTTPError as exc:
+            # S-9: distinguish network/IdP outage from bad token.
+            # PY-11: httpx.TimeoutException is a subclass of httpx.HTTPError so
+            # listing both was redundant — HTTPError already catches timeouts.
             raise AuthServiceUnavailable(
                 f"Failed to fetch JWKS from {settings.oidc_jwks_uri}: {exc}"
             ) from exc
@@ -160,10 +162,17 @@ async def validate_token(token: str) -> dict[str, Any]:
     jwks = await _fetch_jwks()
     unverified_header = jwt.get_unverified_header(token)
     kid = unverified_header.get("kid")
+    # MED-7: also check the key's declared `alg` field against the token header so
+    # a key rotation event that leaves multiple keys with the same kid but different
+    # algorithms cannot cause key confusion (e.g., RS256 key used to verify ES256).
+    alg = unverified_header.get("alg")
 
     signing_key = None
     for key_data in jwks.get("keys", []):
-        if not kid or key_data.get("kid") == kid:
+        kid_match = not kid or key_data.get("kid") == kid
+        # key_data["alg"] is optional in JWKS — only enforce when both sides declare it
+        alg_match = not alg or not key_data.get("alg") or key_data.get("alg") == alg
+        if kid_match and alg_match:
             signing_key = jwk.construct(key_data)
             break
 

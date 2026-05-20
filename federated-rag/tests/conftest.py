@@ -139,7 +139,12 @@ def mock_llm():
 
 @pytest.fixture
 def mock_token_validation(alice_claims: dict):
-    with patch("auth.token_exchange.validate_token", new_callable=AsyncMock) as mock:
+    # TS-1: patch the name as it is imported in api.main, not the definition site.
+    # Patching auth.token_exchange.validate_token only replaces the original;
+    # api.main already holds a direct reference to the function from its
+    # `from auth.token_exchange import validate_token` import, so that reference
+    # would never see the mock.  We must patch api.main.validate_token instead.
+    with patch("api.main.validate_token", new_callable=AsyncMock) as mock:
         mock.return_value = alice_claims
         yield mock
 
