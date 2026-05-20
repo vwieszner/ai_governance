@@ -151,9 +151,17 @@ class A2AClient:
         ):
             data = event.get("data", {})
             if isinstance(data, dict):
-                accumulated.update(data)
+                # M3-4: merge carefully — history is the latest full snapshot,
+                # not a delta; replace it entirely. All other fields are updated
+                # normally.  A plain accumulated.update(data) would clobber history
+                # if a later event contains a partial update without the history key.
+                if "history" in data:
+                    accumulated["history"] = data["history"]
+                for key, val in data.items():
+                    if key != "history":
+                        accumulated[key] = val
                 # Stop as soon as we hit a terminal task state
-                state = (data.get("status") or {}).get("state", "")
+                state = (accumulated.get("status") or {}).get("state", "")
                 if state in _TERMINAL_STATES:
                     break
 

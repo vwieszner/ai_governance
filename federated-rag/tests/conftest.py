@@ -7,22 +7,18 @@ Fixes applied:
           classify zero chunks as ALLOWED, routing Flow A to LOCAL_DENIED.
   T-3  — API fixtures use httpx.AsyncClient with ASGITransport for async-safe
           test client instead of starlette's synchronous TestClient.
+  M3-6 — session-scoped event_loop fixture removed (deprecated/removed in
+          pytest-asyncio >= 0.21 / 0.23).  asyncio_mode = "auto" and
+          asyncio_default_fixture_loop_scope = "session" are set in
+          pyproject.toml instead, which is the correct way to share one loop
+          across all async tests.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-# ── Event loop ─────────────────────────────────────────────────────────────────
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 
 # ── Test users ─────────────────────────────────────────────────────────────────

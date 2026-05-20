@@ -154,7 +154,8 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
             ],
         },
     ]
-    async with httpx.AsyncClient() as client:
+    # H3-2: explicit timeout — a hung Slack API must not stall the Temporal activity
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             "https://slack.com/api/chat.postMessage",
             json={
@@ -266,8 +267,11 @@ async def _get_service_account_token() -> str:
     Fetch a short-lived access token for this agent using the client-credentials
     OAuth2 grant.  The token is used only for machine-to-machine callbacks and is
     obtained fresh each time — it is never persisted.
+
+    H3-3: explicit client-level timeout in addition to the per-call timeout so a
+    hung IdP cannot block the Temporal activity through connection-phase delays.
     """
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             settings.oidc_token_endpoint,
             data={

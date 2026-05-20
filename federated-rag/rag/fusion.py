@@ -1,13 +1,17 @@
 """
 Reciprocal Rank Fusion (RRF) for combining Qdrant and GraphRAG results.
 
-FIX M-1: chunk_id key collision — when chunk_id is absent, the fallback key
-was text[:64], causing two different chunks with the same opening text to
-overwrite each other in the scores dict. The fallback now uses a stable hash
-of the full text so collisions are astronomically unlikely.
+FIX M-1:  chunk_id key collision — when chunk_id is absent, the fallback key
+          was text[:64], causing two different chunks with the same opening text
+          to overwrite each other in the scores dict.
+FIX C3-2: Python's built-in hash() uses a per-process random seed (PYTHONHASHSEED)
+          — it is non-deterministic across processes and restarts, and can collide
+          within a process for a large corpus. Replaced with SHA-256 (truncated to
+          16 hex chars) which is both stable and collision-resistant.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 
@@ -37,7 +41,9 @@ def rrf_fuse(
             # avoid collisions between chunks that share an opening sentence.
             chunk_id = item.get("chunk_id")
             if not chunk_id:
-                chunk_id = f"__hash_{hash(item.get('text', ''))}__"
+                # C3-2: SHA-256 (16 hex chars) — stable across processes, collision-resistant
+                digest = hashlib.sha256(item.get("text", "").encode()).hexdigest()[:16]
+                chunk_id = f"__hash_{digest}__"
 
             scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
             if chunk_id not in chunks:

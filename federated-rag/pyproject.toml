@@ -76,6 +76,12 @@ ingest = "rag.ingest:cli"
 line-length = 100
 target-version = "py311"
 
+[tool.pytest.ini_options]
+# M3-6: asyncio_mode = "auto" with session-scoped loop replaces the deprecated
+# session-scoped event_loop fixture (removed in pytest-asyncio >= 0.23).
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+
 [tool.mypy]
 python_version = "3.11"
 strict = true

@@ -1,6 +1,7 @@
 """Hybrid Qdrant retriever: BGE-M3 dense + BM25 sparse with server-side RRF fusion."""
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -29,13 +30,19 @@ class HybridQdrantRetriever:
 
     def __init__(self) -> None:
         self._client: AsyncQdrantClient | None = None
+        # M3-2: lock prevents check-then-set race at cold-start (same pattern as
+        # OpenFGAAuth._lock and the singletons in agent/nodes.py).
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def client(self) -> AsyncQdrantClient:
-        if self._client is None:
-            self._client = AsyncQdrantClient(
-                url=settings.qdrant_url,
-                api_key=settings.qdrant_api_key or None,
-            )
+        if self._client is not None:
+            return self._client
+        async with self._lock:
+            if self._client is None:
+                self._client = AsyncQdrantClient(
+                    url=settings.qdrant_url,
+                    api_key=settings.qdrant_api_key or None,
+                )
         return self._client
 
     # ── Collection bootstrap ──────────────────────────────────────────────────

@@ -31,6 +31,7 @@ import contextvars
 import hashlib
 import hmac as hmac_lib
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -97,10 +98,14 @@ class _CorrelationIdMiddleware:
             return
 
         headers = dict(scope.get("headers", []))
-        request_id = (
-            headers.get(b"x-request-id", b"").decode("ascii", errors="ignore")
-            or str(uuid.uuid4())
-        )
+        _raw_id = headers.get(b"x-request-id", b"").decode("ascii", errors="ignore")
+        # M3-1: sanitize to alphanumeric + hyphens, max 64 chars, to prevent
+        # header injection via CRLF sequences or oversized values.
+        _SAFE_ID_CHARS = re.compile(r"[^a-zA-Z0-9\-]")
+        if _raw_id:
+            request_id = _SAFE_ID_CHARS.sub("", _raw_id)[:64] or str(uuid.uuid4())
+        else:
+            request_id = str(uuid.uuid4())
         _request_id_ctx.set(request_id)
 
         # Inject into structlog's context for this request
@@ -262,8 +267,11 @@ async def get_token_claims(authorization: str = Header(...)) -> dict[str, Any]:
     try:
         claims = await validate_token(token)
         return {"claims": claims, "token": token}
-    except JWTError as e:
-        log.warning("token_validation_failed", error=str(e))
+    except JWTError:
+        # C3-3: do NOT log str(e) — python-jose includes the raw JWT value and
+        # decoded claim payloads in many error messages, which would write user
+        # PII and token material into structured logs / aggregators.
+        log.warning("token_validation_failed")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     except AuthServiceUnavailable as e:
         # S-9: JWKS network errors → 503, not 401
@@ -321,6 +329,10 @@ async def send_task(
         if isinstance(part, TextPart) or (isinstance(part, dict) and part.get("type") == "text"):
             query = part.text if hasattr(part, "text") else part.get("text", "")
             break
+    # L3-1: reject messages that contain no text part — an empty query passes the
+    # length check but produces a useless LLM response.
+    if not query:
+        raise HTTPException(status_code=400, detail="Message must contain at least one text part")
     if len(query) > settings.max_query_length:
         raise HTTPException(
             status_code=400,
@@ -348,7 +360,8 @@ async def send_task(
         }
 
         # R-3: wrap run_query in a Task so client disconnect cancels it
-        run_task: asyncio.Task = asyncio.ensure_future(
+        # N3-5: asyncio.create_task() is the preferred API (ensure_future deprecated)
+        run_task: asyncio.Task = asyncio.create_task(
             run_query(
                 query=query,
                 user_id=user_id,
@@ -413,11 +426,12 @@ async def get_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # S-7: enforce task ownership — users may only read their own tasks
+    # S-7 + H3-5: enforce task ownership — deny-by-default.
+    # If owner_id is absent (e.g., a task stored without an owner) or belongs to
+    # a different user, return 404 to avoid confirming the task exists.
     caller_id = extract_user_id(auth["claims"])
     owner_id = task.metadata.get("owner_id")
-    if owner_id and owner_id != caller_id:
-        # Return 404 rather than 403 to avoid confirming the task exists
+    if not owner_id or owner_id != caller_id:
         raise HTTPException(status_code=404, detail="Task not found")
 
     return task.model_dump(by_alias=True)
@@ -500,7 +514,9 @@ async def handle_approval(
             "approval_decision",
             ApprovalDecisionSignal(
                 decision="approved" if decision == "approve" else "denied",
-                reason=reason,
+                # M3-3: cap reason to 500 chars — approver input is free-text and
+                # could otherwise inject oversized Slack payloads or mrkdwn markup.
+                reason=reason[:500],
             ),
         )
     except Exception as e:

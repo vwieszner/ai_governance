@@ -41,7 +41,9 @@ from typing import Any
 import structlog
 from langchain_openai import ChatOpenAI
 from temporalio.client import Client as TemporalClient
+from temporalio.exceptions import WorkflowAlreadyStartedError
 
+from a2a.client import A2AClient
 from agent.state import AgentState, FlowDecision
 from auth.openfga import AuthzDecision, OpenFGAAuth
 from auth.token_exchange import exchange_token
@@ -49,6 +51,7 @@ from config import settings
 from rag.fusion import rrf_fuse
 from rag.neo4j_retriever import GraphRAGRetriever
 from rag.qdrant_retriever import HybridQdrantRetriever
+from workflow.approval import ApprovalInput, ApprovalWorkflow
 
 log = structlog.get_logger(__name__)
 
@@ -157,7 +160,9 @@ async def _get_temporal() -> TemporalClient:
 
 async def retrieve_local(state: AgentState) -> dict[str, Any]:
     """Run hybrid Qdrant + GraphRAG retrieval (no ACL filter yet)."""
-    log.info("node_retrieve_local", query=state["query"][:80])
+    # L3-2: log query_len only at DEBUG — the query itself may contain PII and
+    # would otherwise appear in OTEL/Langfuse telemetry at INFO level.
+    log.debug("node_retrieve_local", query_len=len(state["query"]))
     query = state["query"]
 
     qdrant_results = await (await _get_qdrant()).retrieve(query)
@@ -289,7 +294,19 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
     log.info("node_start_approval", user_id=state["user_id"])
     auth = await _get_openfga()
     user_id = state["user_id"]
-    chunk_ids = state["pending_chunk_ids"] or state["denied_chunk_ids"]
+
+    # H3-6: only start approval for PENDING chunks, never DENIED ones.
+    # The DENIED state means the user has no relation on those chunks at all —
+    # approving them via this workflow would create phantom access.
+    chunk_ids = state["pending_chunk_ids"]
+    if not chunk_ids:
+        log.error("start_approval_no_pending_chunks", user_id=user_id)
+        return {
+            "approval_request_id": None,
+            "status_message": "Internal error: no chunks require approval.",
+            "answer": None,
+            "error": "no_pending_chunks",
+        }
 
     approval_request_id = str(uuid.uuid4())
 
@@ -306,8 +323,6 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
             break
 
     # Start Temporal workflow (C-6: reuse singleton)
-    from temporalio.exceptions import WorkflowAlreadyStartedError
-    from workflow.approval import ApprovalInput, ApprovalWorkflow
     temporal_client = await _get_temporal()
     try:
         await temporal_client.start_workflow(
@@ -379,7 +394,6 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     _delegated_token_ctx.set(delegated.access_token)
 
     # A2A call
-    from a2a.client import A2AClient
     client = A2AClient(base_url=str(settings.peer_agent_url))
 
     push_url = f"{settings.agent_url}/tasks/{state['task_id']}/callback"
@@ -429,13 +443,21 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
                 "answer": None,
             }
 
-        from a2a.client import A2AClient
         client = A2AClient(base_url=str(settings.peer_agent_url))
         try:
             task = await client.get_task(
                 task_id=state["peer_task_id"],
                 delegated_token=delegated_token,
             )
+        except Exception as e:
+            # H3-4: any HTTP / connection error from the peer is handled here
+            # rather than propagating as an unformatted 500.
+            log.error("peer_get_task_failed", peer_task_id=state.get("peer_task_id"), error=str(e))
+            return {
+                "flow": FlowDecision.REMOTE_DENIED,
+                "status_message": "Failed to retrieve result from peer agent.",
+                "answer": None,
+            }
         finally:
             await client.close()
 

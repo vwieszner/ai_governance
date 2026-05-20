@@ -4,8 +4,9 @@ from __future__ import annotations
 from pydantic import AnyHttpUrl, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Secrets that MUST be set explicitly — no safe defaults.
-_REQUIRED_SECRETS = ("openai_api_key", "neo4j_password", "agent_client_secret")
+# N3-4: _REQUIRED_SECRETS was a dead constant — never read at runtime.
+# Enforcement is handled by Field(default=...) on each secret field, which
+# causes Pydantic to raise ValidationError at startup if the env var is unset.
 
 
 class Settings(BaseSettings):

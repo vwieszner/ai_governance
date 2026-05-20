@@ -82,12 +82,22 @@ async def ingest_to_neo4j(chunks: list[dict[str, Any]]) -> None:
             from_pdf=False,
         )
 
+        # L3-4: count failures so we can surface a total at the end and raise if
+        # every chunk failed (indicates a systemic problem, not transient noise).
+        failed = 0
         for chunk in chunks:
             try:
                 await kg_builder.run_async(text=chunk["text"])
                 log.info("neo4j_chunk_ingested", chunk_id=chunk["chunk_id"])
             except Exception as e:
+                failed += 1
                 log.warning("neo4j_chunk_failed", chunk_id=chunk["chunk_id"], error=str(e))
+
+        log.info("neo4j_ingestion_summary", total=len(chunks), failed=failed)
+        if failed == len(chunks) and chunks:
+            raise RuntimeError(
+                f"Neo4j ingestion failed for all {failed} chunks — check LLM / Neo4j connectivity."
+            )
     finally:
         driver.close()
 

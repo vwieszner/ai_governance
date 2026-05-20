@@ -208,7 +208,9 @@ class ApprovalWorkflow:
             notify_user_of_decision,
             NotifyUserInput(
                 user_id=inp.user_id,
-                message=f"Your access request was denied. Reason: {decision.reason or 'Not specified'}",
+                # M3-3: cap reason defensively here too in case the workflow
+                # receives a signal from a source other than the /approve endpoint.
+                message=f"Your access request was denied. Reason: {(decision.reason or 'Not specified')[:500]}",
                 callback_task_id=inp.originating_task_id,
             ),
             start_to_close_timeout=timedelta(seconds=30),

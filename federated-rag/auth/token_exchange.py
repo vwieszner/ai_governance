@@ -1,14 +1,18 @@
 """
 RFC 8693 OAuth 2.0 Token Exchange + JWT validation.
 
-FIX C-1: audience is now strictly validated against a configurable list.
-FIX H-5: JWKS cache protected by asyncio.Lock — no thundering herd at TTL boundary.
-FIX S-4: explicit httpx timeout on every outbound HTTP call so a hung IdP does
-         not stall the event loop indefinitely.
-FIX S-5: accepted JWT algorithm list is now read from settings so operators can
-         lock it down to their IdP's actual algorithm (e.g. RS256 only).
-FIX S-9: JWKS / network errors during token validation now raise a distinct
-         exception so the API layer can return 503 instead of 401.
+FIX C-1:  audience is now strictly validated against a configurable list.
+FIX C3-1: _jwks_lock instantiated at module level. asyncio.Lock() in Python 3.10+
+          does NOT bind to a running event loop at construction, so module-level
+          instantiation is safe and race-free. Removes the previous lazy
+          _get_jwks_lock() helper, which had a check-then-set race that could
+          silently create duplicate lock objects and bypass thundering-herd protection.
+FIX H-5:  JWKS cache protected by asyncio.Lock — no thundering herd at TTL boundary.
+FIX M3-5: exchange_token validates target_audience against configured peer_agent_url
+          before performing the exchange, preventing misuse with arbitrary audiences.
+FIX S-4:  explicit httpx timeout on every outbound HTTP call.
+FIX S-5:  accepted JWT algorithm list is now read from settings.
+FIX S-9:  JWKS / network errors raise AuthServiceUnavailable (→ 503, not 401).
 """
 from __future__ import annotations
 
@@ -28,22 +32,16 @@ log = structlog.get_logger(__name__)
 # Timeout for ALL outbound HTTP calls (IdP token endpoint, JWKS fetch)
 _HTTP_TIMEOUT = 10.0
 
-# ── JWKS cache (H-5 fix: protected by lock) ───────────────────────────────────
+# ── JWKS cache (H-5 + C3-1 fix: module-level lock, not lazy) ─────────────────
 _JWKS_CACHE: dict[str, Any] = {}
 _JWKS_CACHE_TTL: float = 3600.0
 _jwks_fetched_at: float = 0.0
-_jwks_lock: asyncio.Lock | None = None   # created lazily (can't instantiate at import time)
+# C3-1: instantiate at module level — safe in Python 3.10+ (no loop binding)
+_jwks_lock: asyncio.Lock = asyncio.Lock()
 
 
 class AuthServiceUnavailable(Exception):
     """Raised when the JWKS endpoint or IdP is unreachable (→ 503, not 401)."""
-
-
-def _get_jwks_lock() -> asyncio.Lock:
-    global _jwks_lock
-    if _jwks_lock is None:
-        _jwks_lock = asyncio.Lock()
-    return _jwks_lock
 
 
 @dataclass
@@ -63,8 +61,19 @@ async def exchange_token(user_token: str, target_audience: str) -> DelegatedToke
       act = this agent's client ID
       aud = target_audience (the downstream service)
 
-    FIX S-4: timeout=_HTTP_TIMEOUT prevents hung IdP from blocking the event loop.
+    FIX S-4:  timeout=_HTTP_TIMEOUT prevents hung IdP from blocking the event loop.
+    FIX M3-5: validates target_audience against the configured peer_agent_url so
+              this function cannot be called with an arbitrary audience to obtain
+              a token scoped to an attacker-controlled service.
     """
+    # M3-5: only allow token exchange for the configured peer agent URL
+    _allowed = str(settings.peer_agent_url or "").rstrip("/")
+    _requested = str(target_audience).rstrip("/")
+    if not _allowed or not (_requested == _allowed or _requested.startswith(_allowed + "/")):
+        raise ValueError(
+            f"token exchange audience '{target_audience}' is not in the configured allowlist"
+        )
+
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         resp = await client.post(
             settings.oidc_token_endpoint,
@@ -108,7 +117,7 @@ async def _fetch_jwks() -> dict[str, Any]:
         return _JWKS_CACHE
 
     # Slow path — acquire lock and re-check
-    async with _get_jwks_lock():
+    async with _jwks_lock:
         now = time.monotonic()
         if _JWKS_CACHE and (now - _jwks_fetched_at) < _JWKS_CACHE_TTL:
             return _JWKS_CACHE   # another coroutine already refreshed it
