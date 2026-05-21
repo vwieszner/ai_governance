@@ -5,6 +5,22 @@ import asyncio
 import uuid
 from typing import Any
 
+
+def _to_qdrant_id(chunk_id: str) -> str:
+    """Convert an arbitrary chunk_id string to a stable Qdrant-compatible UUID.
+
+    H-4 FIX: make_chunk_id() returns a 16-char hex prefix of a SHA-256 hash,
+    which is neither a valid UUID nor a uint64.  Qdrant rejects such strings
+    server-side, meaning every ingest call silently drops chunks.
+
+    uuid5(NAMESPACE_OID, chunk_id) produces a deterministic UUID from the same
+    input string so:
+      • upserts are idempotent (same chunk_id → same point ID),
+      • the original chunk_id is still stored in the payload and used by OpenFGA,
+      • no random IDs are generated for chunks that already have a chunk_id.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, chunk_id))
+
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.models import (
     Distance,
@@ -156,7 +172,9 @@ class HybridQdrantRetriever:
             collection_name=settings.qdrant_collection,
             points=[
                 models.PointStruct(
-                    id=chunk.get("chunk_id") or str(uuid.uuid4()),
+                    # H-4: convert to UUID5 so Qdrant accepts the point ID.
+                    # Falls back to a random UUID when chunk_id is absent.
+                    id=_to_qdrant_id(chunk.get("chunk_id") or str(uuid.uuid4())),
                     payload={"text": chunk["text"], "chunk_id": chunk["chunk_id"], **chunk.get("metadata", {})},
                     vector={
                         "dense": models.Document(

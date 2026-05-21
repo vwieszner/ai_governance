@@ -313,13 +313,18 @@ async def test_approval_workflow_deny():
         approver_id="bob",
     )
 
-    with patch("workflow.activities.notify_user_of_decision", new_callable=AsyncMock) as mock_notify, \
-         patch("workflow.activities.grant_access_in_openfga", new_callable=AsyncMock) as mock_grant, \
-         patch("workflow.activities.revoke_pending_in_openfga", new_callable=AsyncMock) as mock_revoke, \
+    # M-6 FIX: patch names in *workflow.approval*, not *workflow.activities*.
+    # approval.py binds these names at import time via `from workflow.activities import X`,
+    # so patching the source module after import has no effect on the reference
+    # held by the workflow.  Also: fake_execute returns None — the deny workflow
+    # unit test should verify orchestration logic only, not activity side effects.
+    with patch("workflow.approval.notify_user_of_decision", new_callable=AsyncMock) as mock_notify, \
+         patch("workflow.approval.grant_access_in_openfga", new_callable=AsyncMock) as mock_grant, \
+         patch("workflow.approval.revoke_pending_in_openfga", new_callable=AsyncMock) as mock_revoke, \
          patch("temporalio.workflow.execute_activity", new_callable=AsyncMock) as mock_exec:
 
         async def fake_execute(fn, arg, **kwargs):
-            return await fn(arg)
+            return None  # don't call through to real (network-bound) activities
         mock_exec.side_effect = fake_execute
 
         result = await workflow_obj._handle_denied(inp, signal)
@@ -359,3 +364,37 @@ async def test_health_endpoint(async_client):
     assert data["status"] == "ok"
     assert "cluster" in data
     print(f"\n[Health] {data}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token exchange audience guard (M-5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_exchange_token_audience_guard_rejects_invalid():
+    """M-5: exchange_token raises ValueError when target_audience is not the configured peer."""
+    from auth.token_exchange import exchange_token
+
+    with patch("config.settings.peer_agent_url", "https://agent-b.internal"):
+        with pytest.raises(ValueError, match="not in the configured allowlist"):
+            await exchange_token(
+                user_token="dummy-token",
+                target_audience="https://evil.attacker.com",
+            )
+    print("\n[M-5] Audience guard correctly rejected disallowed URL")
+
+
+@pytest.mark.asyncio
+async def test_exchange_token_audience_guard_rejects_path_confusion():
+    """M-5 / H-1: a URL with a crafted path cannot bypass origin comparison."""
+    from auth.token_exchange import exchange_token
+
+    # A naive startswith("https://agent-b.internal/") check would be satisfied by
+    # https://agent-b.internal.evil.com — origin comparison (netloc) blocks this.
+    with patch("config.settings.peer_agent_url", "https://agent-b.internal"):
+        with pytest.raises(ValueError, match="not in the configured allowlist"):
+            await exchange_token(
+                user_token="dummy-token",
+                target_audience="https://agent-b.internal.evil.com/api",
+            )
+    print("\n[M-5] Path-confusion audience guard correctly rejected crafted URL")

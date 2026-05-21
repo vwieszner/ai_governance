@@ -197,6 +197,15 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     fused = state["fused_chunks"]
 
     chunk_ids = [c["chunk_id"] for c in fused if c.get("chunk_id")]
+    # L-5: guard against empty chunk_ids — batch_decide with an empty list is a
+    # no-op but makes the logic below cleaner, and avoids a spurious OpenFGA call.
+    if not chunk_ids:
+        return {
+            "flow": FlowDecision.REMOTE if (not fused and settings.peer_agent_url) else FlowDecision.LOCAL_DENIED,
+            "allowed_chunk_ids": [],
+            "pending_chunk_ids": [],
+            "denied_chunk_ids": [],
+        }
     decisions = await auth.batch_decide(user_id, chunk_ids)
 
     allowed = [cid for cid, d in decisions.items() if d == AuthzDecision.ALLOWED]
@@ -306,7 +315,18 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
     # H3-6: only start approval for PENDING chunks, never DENIED ones.
     # The DENIED state means the user has no relation on those chunks at all —
     # approving them via this workflow would create phantom access.
-    chunk_ids = state["pending_chunk_ids"]
+    # L-7: cap the chunk list size to prevent oversized Temporal workflow history
+    # events.  Temporal serialises all activity inputs into its event log; a very
+    # large chunk_ids list can push a single event over the 4 MB gRPC limit.
+    _MAX_APPROVAL_CHUNKS = 50
+    raw_chunk_ids = state["pending_chunk_ids"]
+    chunk_ids = raw_chunk_ids[:_MAX_APPROVAL_CHUNKS]
+    if len(raw_chunk_ids) > _MAX_APPROVAL_CHUNKS:
+        log.warning(
+            "approval_chunk_ids_capped",
+            original=len(raw_chunk_ids),
+            capped=_MAX_APPROVAL_CHUNKS,
+        )
     if not chunk_ids:
         log.error("start_approval_no_pending_chunks", user_id=user_id)
         return {
@@ -359,10 +379,13 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
 
     return {
         "approval_request_id": approval_request_id,
+        # L-6: do not echo the internal approval_request_id in the user-visible
+        # status message.  The ID is an implementation detail; surfacing it lets
+        # users probe for valid IDs and could be used to race the /approve endpoint.
         "status_message": (
-            f"Your request is pending approval (request ID: {approval_request_id}). "
-            f"The approver has been notified. You will receive a notification once a "
-            f"decision is made."
+            "Your request is pending approval. "
+            "The approver has been notified. You will receive a notification once a "
+            "decision is made."
         ),
         "answer": None,
     }

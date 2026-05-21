@@ -261,6 +261,11 @@ async def send_a2a_callback(inp: A2ACallbackInput) -> None:
             "state": "completed" if inp.decision == "approved" else "failed",
             "message": inp.message,
         },
+        # M-1: set final=True so the peer SSE consumer knows this is a terminal
+        # event and can close its stream.  Without this flag the peer's A2AClient
+        # keeps the SSE connection open until the wall-clock deadline (HIGH-4 fix),
+        # consuming a connection slot unnecessarily.
+        "final": True,
     }
     # S-4: explicit timeout so a hung peer cannot stall the Temporal activity
     async with httpx.AsyncClient(timeout=10.0) as client:

@@ -20,6 +20,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -66,10 +67,19 @@ async def exchange_token(user_token: str, target_audience: str) -> DelegatedToke
               this function cannot be called with an arbitrary audience to obtain
               a token scoped to an attacker-controlled service.
     """
-    # M3-5: only allow token exchange for the configured peer agent URL
-    _allowed = str(settings.peer_agent_url or "").rstrip("/")
-    _requested = str(target_audience).rstrip("/")
-    if not _allowed or not (_requested == _allowed or _requested.startswith(_allowed + "/")):
+    # M3-5 / H-1: validate target_audience against the configured peer URL using
+    # origin comparison (scheme + netloc), not string-prefix matching.
+    # A naive startswith() check is defeated by crafted paths like:
+    #   https://peer.internal/api.evil.com  (satisfies startswith("https://peer.internal/"))
+    # Comparing (scheme, netloc) pairs is the correct SSRF guard.
+    _allowed = str(settings.peer_agent_url or "")
+    if not _allowed:
+        raise ValueError(
+            f"token exchange audience '{target_audience}' is not in the configured allowlist"
+        )
+    _a_parsed = urlparse(_allowed)
+    _r_parsed = urlparse(str(target_audience))
+    if not (_a_parsed.scheme == _r_parsed.scheme and _a_parsed.netloc == _r_parsed.netloc):
         raise ValueError(
             f"token exchange audience '{target_audience}' is not in the configured allowlist"
         )

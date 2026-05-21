@@ -24,6 +24,7 @@ from openfga_sdk import (
     ClientConfiguration,
     OpenFgaClient,
 )
+from openfga_sdk.exceptions import ApiException
 from openfga_sdk.client.models import (
     ClientCheckRequest,
     ClientReadRequest,
@@ -181,17 +182,21 @@ class OpenFGAAuth:
         )
         try:
             await client.write(body)
-        except Exception as exc:
-            err_str = str(exc).lower()
-            if any(kw in err_str for kw in ("not found", "does not exist", "cannot delete")):
-                # Tuple already absent — idempotent no-op on retry
+        except ApiException as exc:
+            # M-3: check the HTTP status code, not a string match, so that
+            # DNS failures, connection errors, and 5xx server errors are NOT
+            # swallowed here.  Only HTTP 404 (tuple not found) is a valid
+            # idempotent no-op — the tuple was already deleted on a previous
+            # Temporal retry attempt.
+            if exc.status == 404:
                 log.warning(
                     "openfga_revoke_noop",
                     user_id=user_id,
                     chunk_id=chunk_id,
-                    reason="tuple not found",
+                    reason="tuple not found (404)",
                 )
             else:
+                # 5xx, 400, auth errors, etc. — let Temporal retry the activity
                 raise
 
     async def close(self) -> None:
