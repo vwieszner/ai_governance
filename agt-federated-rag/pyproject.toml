@@ -1,0 +1,102 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agt-federated-rag"
+version = "0.1.0"
+description = "Fully governed federated cross-cluster RAG using Microsoft Agent Governance Toolkit, LangGraph, OpenFGA, and Temporal"
+requires-python = ">=3.11"
+dependencies = [
+    # ── Microsoft Agent Governance Toolkit ───────────────────────────────────
+    # Agent OS: policy engine, capability model, MCP security gateway, audit log
+    "agent-os-kernel>=3.5.0",
+    # AgentMesh: DID-based zero-trust agent identity, IATP encrypted comms,
+    #            trust scoring, A2A/MCP bridges, agent lifecycle management
+    "agentmesh-platform>=3.5.0",
+    # Agent Runtime: execution rings, saga orchestration, kill switch
+    "agentmesh-runtime>=3.5.0",
+    # Agent SRE: SLOs, error budgets, circuit breakers, chaos engineering
+    "agent-sre>=3.5.0",
+    # Agent Compliance: OWASP verification, policy linting, integrity checks
+    "agent-governance-toolkit>=3.5.0",
+    # LangGraph adapter (publishes governed graph with policy middleware)
+    "agentmesh-integrations[langgraph]>=3.5.0",
+
+    # ── Agent framework ───────────────────────────────────────────────────────
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "langchain-community>=0.3.0",
+
+    # ── RAG — vector store ────────────────────────────────────────────────────
+    "qdrant-client>=1.11.0",
+    "fastembed>=0.4.0",
+
+    # ── RAG — knowledge graph ─────────────────────────────────────────────────
+    "neo4j>=5.23.0",
+    "neo4j-graphrag>=1.2.0",
+
+    # ── Auth: user identity (Keycloak OIDC) ──────────────────────────────────
+    # AGT handles agent-to-agent identity; Keycloak handles user login
+    "python-jose[cryptography]>=3.3.0",
+    "httpx>=0.27.0",
+
+    # ── Auth: per-chunk ReBAC (data-level authorization) ─────────────────────
+    # AGT policy engine governs agent *actions*; OpenFGA governs *data access*
+    "openfga-sdk>=0.6.0",
+
+    # ── Approval workflow ─────────────────────────────────────────────────────
+    "temporalio>=1.7.0",
+
+    # ── API server ────────────────────────────────────────────────────────────
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sse-starlette>=2.1.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+
+    # ── Task store ────────────────────────────────────────────────────────────
+    "redis[asyncio]>=5.0.0",
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
+    "python-dotenv>=1.0.0",
+    "structlog>=24.4.0",
+]
+
+[project.optional-dependencies]
+pii = [
+    "presidio-analyzer>=2.2.354",
+    "presidio-anonymizer>=2.2.354",
+    "spacy>=3.7.0",
+]
+observability = [
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp>=1.27.0",
+    "langfuse>=2.15.0",
+]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-httpx>=0.30.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+
+[project.scripts]
+agent   = "api.main:run"
+worker  = "workflow.worker:run"
+ingest  = "rag.ingest:cli"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

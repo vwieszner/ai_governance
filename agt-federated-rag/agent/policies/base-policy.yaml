@@ -1,0 +1,145 @@
+# Base AGT policy — applies to all agent actions.
+# Evaluated by Agent OS PolicyEvaluator before every tool call.
+#
+# OWASP Agentic Top 10 coverage:
+#   ASI-01 Goal Hijacking     — intent classifier blocks unauthorized goal changes
+#   ASI-02 Excessive Caps     — least-privilege defaults; all actions deny-by-default
+#   ASI-03 Identity Abuse     — trust_score gate on every action
+#   ASI-05 Output Handling    — llm.generate validated before returning to caller
+#   ASI-09 Human-Agent Trust  — full audit trail on every evaluated action
+
+name: base-policy
+version: "1.0"
+
+# Default: DENY everything not explicitly allowed.
+# This is the single most important governance decision — opt-in, not opt-out.
+defaults:
+  action: DENY
+
+rules:
+  # ── Identity gate ────────────────────────────────────────────────────────────
+  # Block any action from an agent with a trust score below the configured threshold.
+  # Trust score is maintained by AgentMesh and decays on anomalous behaviour.
+  - name: block-low-trust-agents
+    priority: 1000
+    condition:
+      field: agent_trust_score
+      operator: LT
+      value: 0.6
+    action: DENY
+    reason: "Agent trust score below minimum threshold"
+    audit: true
+
+  # ── Prevent goal hijacking (ASI-01) ──────────────────────────────────────────
+  # Block any action that tries to override the agent's configured goal/system prompt.
+  - name: block-goal-override
+    priority: 900
+    condition:
+      field: action
+      operator: IN
+      value:
+        - system_prompt.override
+        - goal.replace
+        - instruction.inject
+    action: DENY
+    reason: "Goal hijacking attempt detected"
+    audit: true
+    alert: true
+
+  # ── Block dangerous tool categories (ASI-02, ASI-04) ─────────────────────────
+  - name: block-code-execution
+    priority: 800
+    condition:
+      field: tool_category
+      operator: IN
+      value: [shell_exec, code_eval, subprocess, os_command]
+    action: DENY
+    reason: "Unrestricted code execution not permitted"
+    audit: true
+
+  - name: block-filesystem-writes
+    priority: 800
+    condition:
+      field: tool_category
+      operator: IN
+      value: [file_write, file_delete, file_move]
+    action: DENY
+    reason: "Filesystem writes not permitted for RAG agent"
+    audit: true
+
+  # ── Rate limiting ─────────────────────────────────────────────────────────────
+  # Prevent runaway agents from hammering downstream services.
+  - name: rate-limit-llm-calls
+    priority: 700
+    condition:
+      field: action
+      operator: EQ
+      value: llm.generate
+    rate_limit:
+      max_calls: 60
+      window_seconds: 60
+    action: DENY
+    reason: "LLM call rate limit exceeded (60 req/min)"
+    audit: true
+
+  - name: rate-limit-peer-calls
+    priority: 700
+    condition:
+      field: action
+      operator: EQ
+      value: peer.send_message
+    rate_limit:
+      max_calls: 10
+      window_seconds: 60
+    action: DENY
+    reason: "Peer call rate limit exceeded"
+    audit: true
+
+  # ── Allow known safe actions ───────────────────────────────────────────────
+  - name: allow-rag-retrieve
+    priority: 100
+    condition:
+      field: action
+      operator: EQ
+      value: rag.retrieve
+    action: ALLOW
+
+  - name: allow-auth-check
+    priority: 100
+    condition:
+      field: action
+      operator: EQ
+      value: auth.check_permission
+    action: ALLOW
+
+  - name: allow-llm-generate
+    priority: 100
+    condition:
+      field: action
+      operator: EQ
+      value: llm.generate
+    action: ALLOW
+
+  - name: allow-approval-start
+    priority: 100
+    condition:
+      field: action
+      operator: EQ
+      value: approval.start_workflow
+    action: ALLOW
+
+  - name: allow-peer-send
+    priority: 100
+    condition:
+      field: action
+      operator: EQ
+      value: peer.send_message
+    action: ALLOW
+
+  - name: allow-format-response
+    priority: 100
+    condition:
+      field: action
+      operator: EQ
+      value: agent.format_response
+    action: ALLOW

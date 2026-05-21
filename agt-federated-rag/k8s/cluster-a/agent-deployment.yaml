@@ -1,0 +1,366 @@
+# AGT Federated RAG Agent — Cluster A
+# Deployment + Service
+#
+# All sensitive values come from the "agt-rag-secrets" Kubernetes Secret.
+# Create the secret before applying this manifest:
+#
+#   kubectl create secret generic agt-rag-secrets \
+#     --from-env-file=.env \
+#     -n agt-federated-rag
+#
+# AGT policies are mounted from the "agt-policy-configmap" ConfigMap.
+# Apply that ConfigMap (k8s/cluster-a/agt-policy-configmap.yaml) first.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agt-rag-agent
+  namespace: agt-federated-rag
+  labels:
+    app: agt-rag-agent
+    cluster: cluster-a
+    version: "1.0.0"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: agt-rag-agent
+  template:
+    metadata:
+      labels:
+        app: agt-rag-agent
+        cluster: cluster-a
+      annotations:
+        sidecar.istio.io/inject: "true"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: agt-rag-agent
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: agent
+          image: your-registry/agt-federated-rag:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 3
+          env:
+            # ── Cluster identity ──────────────────────────────────────────────
+            - name: CLUSTER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: CLUSTER_ID
+                  optional: false
+            - name: AGENT_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: AGENT_NAME
+                  optional: false
+            - name: AGENT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: AGENT_URL
+                  optional: false
+            # ── Peer cluster ──────────────────────────────────────────────────
+            - name: PEER_AGENT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: PEER_AGENT_URL
+                  optional: true
+            - name: PEER_AGENT_DID
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: PEER_AGENT_DID
+                  optional: true
+            # ── LLM ──────────────────────────────────────────────────────────
+            - name: OPENAI_API_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: OPENAI_API_BASE
+                  optional: false
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: OPENAI_API_KEY
+                  optional: false
+            - name: LLM_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: LLM_MODEL
+                  optional: false
+            # ── Qdrant ───────────────────────────────────────────────────────
+            - name: QDRANT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: QDRANT_URL
+                  optional: false
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: QDRANT_API_KEY
+                  optional: true
+            - name: QDRANT_COLLECTION
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: QDRANT_COLLECTION
+                  optional: false
+            # ── Neo4j ─────────────────────────────────────────────────────────
+            - name: NEO4J_URI
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: NEO4J_URI
+                  optional: false
+            - name: NEO4J_USER
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: NEO4J_USER
+                  optional: false
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: NEO4J_PASSWORD
+                  optional: false
+            # ── OpenFGA ───────────────────────────────────────────────────────
+            - name: OPENFGA_API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: OPENFGA_API_URL
+                  optional: false
+            - name: OPENFGA_STORE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: OPENFGA_STORE_ID
+                  optional: false
+            - name: OPENFGA_MODEL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: OPENFGA_MODEL_ID
+                  optional: false
+            # ── Temporal ──────────────────────────────────────────────────────
+            - name: TEMPORAL_ADDRESS
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: TEMPORAL_ADDRESS
+                  optional: false
+            - name: TEMPORAL_NAMESPACE
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: TEMPORAL_NAMESPACE
+                  optional: false
+            - name: TEMPORAL_TASK_QUEUE
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: TEMPORAL_TASK_QUEUE
+                  optional: false
+            # ── OIDC / JWT ────────────────────────────────────────────────────
+            - name: OIDC_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: OIDC_ISSUER
+                  optional: false
+            - name: OIDC_JWKS_URI
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: OIDC_JWKS_URI
+                  optional: false
+            - name: AGENT_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: AGENT_CLIENT_ID
+                  optional: false
+            - name: AGENT_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: AGENT_CLIENT_SECRET
+                  optional: false
+            # ── AgentMesh ─────────────────────────────────────────────────────
+            - name: AGENT_DID_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: AGENT_DID_SEED
+                  optional: false
+            - name: AGENT_MESH_REGISTRY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: AGENT_MESH_REGISTRY_URL
+                  optional: false
+            - name: AGENT_TRUST_THRESHOLD
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: AGENT_TRUST_THRESHOLD
+                  optional: false
+            # ── AGT Policy Engine ─────────────────────────────────────────────
+            - name: POLICY_DIR
+              value: "/app/agent/policies"   # mounted from ConfigMap below
+            - name: POLICY_AUDIT_ONLY
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: POLICY_AUDIT_ONLY
+                  optional: true
+            # ── AGT Agent SRE ─────────────────────────────────────────────────
+            - name: SRE_ENABLED
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: SRE_ENABLED
+                  optional: false
+            - name: SRE_SLO_LATENCY_P99_MS
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: SRE_SLO_LATENCY_P99_MS
+                  optional: false
+            - name: SRE_ERROR_BUDGET_PERCENT
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: SRE_ERROR_BUDGET_PERCENT
+                  optional: false
+            # ── Approval HMAC ─────────────────────────────────────────────────
+            - name: APPROVAL_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: APPROVAL_HMAC_SECRET
+                  optional: false
+            # ── Redis ─────────────────────────────────────────────────────────
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: REDIS_URL
+                  optional: false
+            # ── Notifications ─────────────────────────────────────────────────
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: SLACK_BOT_TOKEN
+                  optional: true
+            - name: SLACK_APPROVAL_CHANNEL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: SLACK_APPROVAL_CHANNEL
+                  optional: true
+            - name: APPROVAL_UI_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: APPROVAL_UI_BASE_URL
+                  optional: false
+            # ── Server ────────────────────────────────────────────────────────
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8000"
+            - name: LOG_LEVEL
+              valueFrom:
+                secretKeyRef:
+                  name: agt-rag-secrets
+                  key: LOG_LEVEL
+                  optional: true
+          volumeMounts:
+            - name: agt-policies
+              mountPath: /app/agent/policies
+              readOnly: true
+            # tmpfs for any ephemeral writes (readOnlyRootFilesystem=true)
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: agt-policies
+          configMap:
+            name: agt-policy-configmap
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agt-rag-agent
+  namespace: agt-federated-rag
+  labels:
+    app: agt-rag-agent
+    cluster: cluster-a
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agt-rag-agent
+  namespace: agt-federated-rag
+  labels:
+    app: agt-rag-agent
+    cluster: cluster-a
+  annotations:
+    # Expose as a Cilium global service for cross-cluster reachability
+    io.cilium/global-service: "true"
+    io.cilium/shared-service: "true"
+spec:
+  type: ClusterIP
+  selector:
+    app: agt-rag-agent
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

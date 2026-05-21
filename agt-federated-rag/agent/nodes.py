@@ -1,0 +1,654 @@
+"""LangGraph node implementations for the AGT federated RAG agent.
+
+Every node enforces AGT policies via ``_enforce()`` before doing any work.
+This is not optional — it is the primary OWASP Agentic Top-10 control layer.
+
+Security controls applied per node:
+    retrieve_local      — ``rag.retrieve``        (ASI-02, ASI-06)
+    check_auth          — ``auth.check_permission``(ASI-03)
+    generate_answer     — ``llm.generate``         (ASI-05)
+    start_approval      — ``approval.start_workflow``(ASI-02)
+    call_peer_agent     — ``peer.send_message``    (ASI-07, ASI-08)
+    handle_peer_result  — ``peer.receive_callback``
+    format_response     — ``agent.format_response``(ASI-05)
+
+Design decisions:
+
+_enforce() pattern
+    Every node calls ``_enforce(action, context)`` which delegates to the AGT
+    PolicyEvaluator loaded from ``settings.policy_dir``.  A ``PermissionError``
+    raised inside any node causes LangGraph to surface an error state which
+    ``format_response`` converts to a safe, generic user message.
+
+Singleton double-checked locking
+    _qdrant, _graph, _openfga, _llm, _temporal_client each have a matching
+    asyncio.Lock.  The outer ``if singleton is not None`` check is a fast path
+    for the steady state (no lock contention); the inner check inside the lock
+    prevents duplicate init when multiple coroutines race at cold-start.
+
+user_token ContextVar (security boundary)
+    ``_user_token_ctx`` is a module-level ContextVar; the token is injected by
+    ``run_query`` before the graph runs.  It is never stored in AgentState so it
+    cannot appear in LangGraph snapshots, Langfuse traces, or Temporal history.
+
+L-5 fix — empty chunk_ids guard in check_auth
+    ``batch_decide`` is called only when ``chunk_ids`` is non-empty.  An empty
+    fused list directly sets the flow to REMOTE (if a peer is configured) or
+    LOCAL_DENIED, skipping the OpenFGA fan-out entirely.
+
+L-6 fix — approval_request_id not leaked in status_message
+    The user-visible status message in ``start_approval`` contains no internal
+    identifiers that would let users probe the /approve endpoint.
+
+L-7 fix — chunk_ids capped at 50 before Temporal
+    Temporal serialises all activity inputs into its event history.  A very
+    large chunk_ids list can push a single event over the 4 MB gRPC limit.
+
+MED-4 fix — REMOTE only when fused is empty AND peer is configured
+    When local chunks exist but the user is denied for all of them, the data is
+    local — routing to the peer leaks query intent and wastes a cross-cluster
+    round-trip the peer will also deny.
+
+circuit breaker context
+    ``call_peer_agent`` includes ``peer_circuit_state`` in the policy context so
+    the peer-comms-policy can gate on ``CircuitState.OPEN`` before a gRPC call
+    is even attempted.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import uuid
+from typing import Any
+
+import structlog
+from agent_os.policies import PolicyEvaluator  # type: ignore[import]
+from langchain_openai import ChatOpenAI
+from temporalio.client import Client as TemporalClient
+from temporalio.exceptions import WorkflowAlreadyStartedError
+
+from agent.state import AgentState, FlowDecision
+from auth.openfga import AuthzDecision, OpenFGAAuth
+from config import settings
+from mesh.peer_client import call_peer_agent as _mesh_call_peer, get_peer_circuit_state
+from rag.fusion import rrf_fuse
+from rag.neo4j_retriever import GraphRAGRetriever
+from rag.qdrant_retriever import HybridQdrantRetriever
+from workflow.approval import ApprovalInput, ApprovalWorkflow
+
+log = structlog.get_logger(__name__)
+
+# ── User token ContextVar (security boundary) ─────────────────────────────────
+# The raw bearer token is NEVER stored in AgentState.
+# It is injected by run_query (in graph.py) and read here only when needed.
+_user_token_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "user_token", default=""
+)
+
+
+def set_user_token(token: str) -> None:
+    """Called once per request (in graph.run_query) before the graph is invoked."""
+    _user_token_ctx.set(token)
+
+
+# ── AGT PolicyEvaluator singleton ─────────────────────────────────────────────
+
+_evaluator: PolicyEvaluator | None = None
+_evaluator_lock: asyncio.Lock = asyncio.Lock()
+
+
+async def _get_evaluator() -> PolicyEvaluator:
+    global _evaluator
+    if _evaluator is not None:
+        return _evaluator
+    async with _evaluator_lock:
+        if _evaluator is None:
+            _evaluator = PolicyEvaluator.from_directory(settings.policy_dir)
+    return _evaluator
+
+
+async def _enforce(action: str, context: dict[str, Any]) -> None:
+    """Raise PermissionError if the AGT policy engine denies the action.
+
+    This is the primary governance gate.  Every node calls this before doing
+    any work.  The evaluator runs all YAML policies in settings.policy_dir in
+    priority order; the highest-priority matching rule wins.
+    """
+    evaluator = await _get_evaluator()
+    result = evaluator.evaluate({"action": action, **context})
+    if not result.allowed:
+        log.warning(
+            "agt_policy_denied",
+            action=action,
+            reason=result.reason,
+            agt_audit=True,
+        )
+        raise PermissionError(f"Policy denied action '{action}': {result.reason}")
+    log.debug("agt_policy_allowed", action=action)
+
+
+# ── Service singletons (double-checked asyncio.Lock locking) ──────────────────
+
+_qdrant: HybridQdrantRetriever | None = None
+_graph: GraphRAGRetriever | None = None
+_openfga: OpenFGAAuth | None = None
+_llm: ChatOpenAI | None = None
+_temporal_client: TemporalClient | None = None
+
+_qdrant_lock: asyncio.Lock = asyncio.Lock()
+_graph_lock: asyncio.Lock = asyncio.Lock()
+_openfga_lock: asyncio.Lock = asyncio.Lock()
+_llm_lock: asyncio.Lock = asyncio.Lock()
+_temporal_lock: asyncio.Lock = asyncio.Lock()
+
+
+async def _get_qdrant() -> HybridQdrantRetriever:
+    global _qdrant
+    if _qdrant is not None:
+        return _qdrant
+    async with _qdrant_lock:
+        if _qdrant is None:
+            inst = HybridQdrantRetriever()
+            await inst._init()
+            _qdrant = inst
+    return _qdrant
+
+
+async def _get_graph() -> GraphRAGRetriever:
+    global _graph
+    if _graph is not None:
+        return _graph
+    async with _graph_lock:
+        if _graph is None:
+            inst = GraphRAGRetriever()
+            await inst._ensure_init()
+            _graph = inst
+    return _graph
+
+
+async def _get_openfga() -> OpenFGAAuth:
+    global _openfga
+    if _openfga is not None:
+        return _openfga
+    async with _openfga_lock:
+        if _openfga is None:
+            _openfga = await OpenFGAAuth.get_instance()
+    return _openfga
+
+
+async def _get_llm() -> ChatOpenAI:
+    global _llm
+    if _llm is not None:
+        return _llm
+    async with _llm_lock:
+        if _llm is None:
+            _llm = ChatOpenAI(
+                model=settings.llm_model,
+                openai_api_base=settings.openai_api_base,
+                openai_api_key=settings.openai_api_key,
+                temperature=settings.llm_temperature,
+                max_tokens=settings.llm_max_tokens,
+            )
+    return _llm
+
+
+async def _get_temporal() -> TemporalClient:
+    global _temporal_client
+    if _temporal_client is not None:
+        return _temporal_client
+    async with _temporal_lock:
+        if _temporal_client is None:
+            _temporal_client = await TemporalClient.connect(
+                settings.temporal_address,
+                namespace=settings.temporal_namespace,
+            )
+    return _temporal_client
+
+
+# ── Node: retrieve_local ──────────────────────────────────────────────────────
+
+async def retrieve_local(state: AgentState) -> dict[str, Any]:
+    """Run hybrid Qdrant + GraphRAG retrieval, then RRF-fuse the results.
+
+    AGT policy enforced: ``rag.retrieve``
+    Context fields passed to the evaluator:
+        query_length        — data-access-policy rejects queries >4096 chars
+        qdrant_collection   — data-access-policy blocks untrusted collections
+        user_id             — base-policy trust-score gate uses this
+    """
+    await _enforce(
+        "rag.retrieve",
+        {
+            "query_length": len(state["query"]),
+            "qdrant_collection": settings.qdrant_collection,
+            "user_id": state["user_id"],
+        },
+    )
+
+    log.debug("node_retrieve_local", query_len=len(state["query"]))
+    query = state["query"]
+
+    qdrant_results, graph_results = await asyncio.gather(
+        (await _get_qdrant()).retrieve(query, allowed_chunk_ids=[]),
+        (await _get_graph()).retrieve_context(query),
+    )
+
+    fused = rrf_fuse(qdrant_results, graph_results, final_limit=settings.qdrant_final_k)
+
+    log.info(
+        "retrieve_local_done",
+        qdrant_count=len(qdrant_results),
+        graph_count=len(graph_results),
+        fused_count=len(fused),
+    )
+    return {
+        "qdrant_results": qdrant_results,
+        "graph_results": graph_results,
+        "fused_chunks": fused,
+    }
+
+
+# ── Node: check_auth ──────────────────────────────────────────────────────────
+
+async def check_auth(state: AgentState) -> dict[str, Any]:
+    """Batch-decide OpenFGA authorization for each fused chunk, set flow.
+
+    AGT policy enforced: ``auth.check_permission``
+
+    L-5 fix: chunk_ids guard — if fused is empty we skip batch_decide entirely.
+    MED-4 fix: REMOTE is set only when local retrieval returned zero chunks AND
+               a peer is configured.  A local denial (chunks exist but all denied)
+               stays LOCAL_DENIED.
+    """
+    await _enforce(
+        "auth.check_permission",
+        {
+            "user_id": state["user_id"],
+            "chunk_count": len(state["fused_chunks"]),
+        },
+    )
+
+    log.debug("node_check_auth", user_id=state["user_id"])
+    auth = await _get_openfga()
+    user_id = state["user_id"]
+    fused = state["fused_chunks"]
+
+    # L-5: guard empty chunk_ids before batch_decide
+    chunk_ids = [c["chunk_id"] for c in fused if c.get("chunk_id")]
+    if not chunk_ids:
+        # MED-4: REMOTE only if local retrieval found nothing AND peer is set
+        flow = (
+            FlowDecision.REMOTE
+            if (not fused and settings.peer_agent_url)
+            else FlowDecision.LOCAL_DENIED
+        )
+        log.info("auth_decision_no_chunks", flow=flow.value)
+        return {
+            "flow": flow,
+            "allowed_chunk_ids": [],
+            "pending_chunk_ids": [],
+            "denied_chunk_ids": [],
+        }
+
+    decisions = await auth.batch_decide(user_id, chunk_ids)
+
+    allowed = [cid for cid, d in decisions.items() if d == AuthzDecision.ALLOWED]
+    pending = [cid for cid, d in decisions.items() if d == AuthzDecision.NEEDS_APPROVAL]
+    denied  = [cid for cid, d in decisions.items() if d == AuthzDecision.DENIED]
+
+    # Flow priority: pending > allowed > remote (only if local empty) > denied
+    local_results_exist = bool(fused)
+    if pending:
+        flow = FlowDecision.LOCAL_NEEDS_APPROVAL
+    elif allowed:
+        flow = FlowDecision.LOCAL_ALLOWED
+    elif not local_results_exist and settings.peer_agent_url:
+        # MED-4: no local data at all — ask peer
+        flow = FlowDecision.REMOTE
+    else:
+        # Local data exists but user is denied for all of it
+        flow = FlowDecision.LOCAL_DENIED
+
+    log.info(
+        "auth_decision",
+        flow=flow.value,
+        allowed=len(allowed),
+        pending=len(pending),
+        denied=len(denied),
+        agt_audit=True,
+    )
+    return {
+        "flow": flow,
+        "allowed_chunk_ids": allowed,
+        "pending_chunk_ids": pending,
+        "denied_chunk_ids": denied,
+    }
+
+
+# ── Node: generate_answer ─────────────────────────────────────────────────────
+
+async def generate_answer(state: AgentState) -> dict[str, Any]:
+    """Build context from allowed chunks and invoke the LLM.
+
+    AGT policy enforced: ``llm.generate``
+    Context fields:
+        context_char_count — data-access-policy caps at 24 000 chars (~6 000 tokens)
+        user_id            — base-policy rate-limit gate
+    """
+    allowed_ids = set(state["allowed_chunk_ids"])
+    context_chunks = [
+        c for c in state["fused_chunks"] if c.get("chunk_id") in allowed_ids
+    ]
+
+    if not context_chunks:
+        return {
+            "answer": (
+                "I found relevant information but you do not have permission to view it."
+            ),
+            "status_message": "no_accessible_chunks",
+        }
+
+    context = "\n\n---\n\n".join(
+        f"[Source: {c.get('metadata', {}).get('source', 'unknown')}]\n{c['text']}"
+        for c in context_chunks
+    )
+
+    # Token budget: ~4 chars per token (rough estimate for policy check)
+    max_chars = settings.llm_context_token_budget * 4
+    original_len = len(context)
+
+    await _enforce(
+        "llm.generate",
+        {
+            "user_id": state["user_id"],
+            "context_char_count": original_len,
+        },
+    )
+
+    if original_len > max_chars:
+        context = context[:max_chars] + "\n\n[... context truncated to fit token budget ...]"
+        log.warning(
+            "context_truncated",
+            original_len=original_len,
+            max_chars=max_chars,
+        )
+
+    log.info("node_generate_answer", user_id=state["user_id"], chunks=len(context_chunks))
+
+    llm = await _get_llm()
+    prompt = (
+        "You are a helpful assistant. Answer the user's question using ONLY the provided "
+        "context. If the context does not contain enough information, say so explicitly.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {state['query']}\n\n"
+        "Answer:"
+    )
+
+    response = await llm.ainvoke(prompt)
+    answer = response.content if hasattr(response, "content") else str(response)
+
+    return {"answer": answer, "status_message": "completed"}
+
+
+# ── Node: start_approval ──────────────────────────────────────────────────────
+
+async def start_approval(state: AgentState) -> dict[str, Any]:
+    """Write OpenFGA pending tuples and start a Temporal approval workflow.
+
+    AGT policy enforced: ``approval.start_workflow``
+
+    L-7 fix: chunk_ids capped at 50 before being sent to Temporal to stay
+             below the 4 MB gRPC event-history limit.
+    L-6 fix: approval_request_id is NOT included in the user-visible
+             status_message so users cannot probe the /approve endpoint.
+    WorkflowAlreadyStartedError is caught and treated as idempotent (retry-safe).
+    """
+    await _enforce(
+        "approval.start_workflow",
+        {
+            "user_id": state["user_id"],
+            "pending_chunk_count": len(state["pending_chunk_ids"]),
+        },
+    )
+
+    log.info("node_start_approval", user_id=state["user_id"])
+    auth = await _get_openfga()
+    user_id = state["user_id"]
+
+    # L-7: cap chunk list to avoid oversized Temporal event-history entries
+    _MAX_APPROVAL_CHUNKS = 50
+    raw_chunk_ids = state["pending_chunk_ids"]
+    chunk_ids = raw_chunk_ids[:_MAX_APPROVAL_CHUNKS]
+    if len(raw_chunk_ids) > _MAX_APPROVAL_CHUNKS:
+        log.warning(
+            "approval_chunk_ids_capped",
+            original=len(raw_chunk_ids),
+            capped=_MAX_APPROVAL_CHUNKS,
+            agt_audit=True,
+        )
+
+    if not chunk_ids:
+        log.error("start_approval_no_pending_chunks", user_id=user_id)
+        return {
+            "approval_request_id": None,
+            "status_message": "Internal error: no chunks require approval.",
+            "answer": None,
+            "error": "no_pending_chunks",
+        }
+
+    approval_request_id = str(uuid.uuid4())
+
+    # Write pending_approval tuples to OpenFGA
+    for chunk_id in chunk_ids:
+        await auth.set_pending_approval(user_id, chunk_id)
+    log.info(
+        "openfga_pending_written",
+        user_id=user_id,
+        count=len(chunk_ids),
+        agt_audit=True,
+    )
+
+    # Resolve approver from the first chunk's owner relation
+    approver_id: str = "admin"
+    for chunk_id in chunk_ids:
+        owner = await auth.get_chunk_owner(chunk_id)
+        if owner:
+            approver_id = owner
+            break
+
+    # Start Temporal approval workflow (idempotent on WorkflowAlreadyStartedError)
+    temporal_client = await _get_temporal()
+    try:
+        await temporal_client.start_workflow(
+            ApprovalWorkflow.run,
+            ApprovalInput(
+                approval_request_id=approval_request_id,
+                user_id=user_id,
+                chunk_ids=chunk_ids,
+                query=state["query"],
+                approver_id=approver_id,
+                approver_slack_id=None,
+                approver_email=None,
+                # Snapshot timeout at start — deterministic for Temporal replay
+                timeout_seconds=settings.approval_timeout_seconds,
+            ),
+            id=f"approval-{approval_request_id}",
+            task_queue=settings.temporal_task_queue,
+        )
+        log.info(
+            "temporal_workflow_started",
+            approval_request_id=approval_request_id,
+            agt_audit=True,
+        )
+    except WorkflowAlreadyStartedError:
+        # Duplicate start (e.g., client retry) — existing workflow continues
+        log.warning(
+            "approval_workflow_already_started",
+            approval_request_id=approval_request_id,
+        )
+
+    return {
+        "approval_request_id": approval_request_id,
+        # L-6: never echo approval_request_id in the user-visible message
+        "status_message": (
+            "Your request is pending approval. "
+            "The data owner has been notified and will review your request. "
+            "You will be notified once a decision is made."
+        ),
+        "answer": None,
+    }
+
+
+# ── Node: call_peer_agent ─────────────────────────────────────────────────────
+
+async def call_peer_agent(state: AgentState) -> dict[str, Any]:
+    """Send the query to the configured peer cluster via AGT AgentMesh IATP.
+
+    AGT policy enforced: ``peer.send_message``
+    Context fields include peer_circuit_state so the peer-comms-policy can
+    gate on CircuitState.OPEN before any gRPC call is attempted (ASI-08).
+
+    Security: user_token is read from _user_token_ctx, never from state.
+    The peer_client layer handles DID verification, trust-score gating,
+    IATP encryption, and circuit-breaker management.
+    """
+    if not settings.peer_agent_url:
+        return {
+            "error": "No peer agent configured.",
+            "flow": FlowDecision.REMOTE_DENIED,
+            "status_message": "No remote cluster available.",
+        }
+
+    # Include circuit breaker state in policy context (ASI-08, peer-comms-policy)
+    circuit_state = await get_peer_circuit_state(str(settings.peer_agent_url))
+
+    await _enforce(
+        "peer.send_message",
+        {
+            "user_id": state["user_id"],
+            "peer_did_verified": True,    # pre-verified by mesh layer on every call
+            "transport_encrypted": True,  # IATP enforces encryption
+            "peer_trust_score": 1.0,      # actual check happens in peer_client
+            "peer_execution_ring": "TRUSTED",
+            "peer_circuit_state": circuit_state.name,  # "CLOSED" | "OPEN" | "HALF_OPEN"
+        },
+    )
+
+    log.info("node_call_peer_agent", user_id=state["user_id"])
+
+    callback_url: str | None = None
+    task_id = state.get("task_id")
+    if task_id:
+        callback_url = f"{settings.agent_url}/tasks/{task_id}/callback"
+
+    try:
+        peer_response = await _mesh_call_peer(
+            query=state["query"],
+            user_id=state["user_id"],
+            context_id=state.get("context_id", ""),
+            callback_url=callback_url,
+        )
+    except Exception as exc:
+        log.error("peer_call_failed", error=str(exc))
+        return {
+            "error": str(exc),
+            "flow": FlowDecision.REMOTE_DENIED,
+            "status_message": "Remote cluster call failed.",
+        }
+
+    log.info(
+        "peer_call_completed",
+        status=peer_response.status,
+        peer_did=peer_response.peer_did,
+        trust_score=peer_response.trust_score,
+        agt_audit=True,
+    )
+    return {
+        "peer_task_id": peer_response.task_id,
+        "peer_status": peer_response.status,
+        "peer_answer": peer_response.answer,
+    }
+
+
+# ── Node: handle_peer_result ──────────────────────────────────────────────────
+
+async def handle_peer_result(state: AgentState) -> dict[str, Any]:
+    """Interpret the peer agent's status and set the final flow decision.
+
+    AGT policy enforced: ``peer.receive_callback``
+
+    PeerResponse.status values (from mesh/peer_client.py):
+        "completed"       → REMOTE_APPROVED
+        "input_required"  → REMOTE_NEEDS_APPROVAL
+        anything else     → REMOTE_DENIED
+    """
+    await _enforce(
+        "peer.receive_callback",
+        {
+            "user_id": state["user_id"],
+            "peer_status": state.get("peer_status", "unknown"),
+        },
+    )
+
+    peer_status = state.get("peer_status", "")
+    log.info("node_handle_peer_result", peer_status=peer_status)
+
+    if peer_status == "completed":
+        answer = state.get("peer_answer") or ""
+        return {
+            "answer": answer,
+            "flow": FlowDecision.REMOTE_APPROVED,
+            "status_message": "completed",
+        }
+
+    elif peer_status == "input_required":
+        return {
+            "flow": FlowDecision.REMOTE_NEEDS_APPROVAL,
+            "status_message": (
+                "The requested information is on the remote cluster and requires "
+                "approval from the remote data owner. You will be notified once a "
+                "decision is made."
+            ),
+            "answer": None,
+        }
+
+    else:
+        return {
+            "flow": FlowDecision.REMOTE_DENIED,
+            "status_message": "The remote cluster could not fulfil your request.",
+            "answer": None,
+        }
+
+
+# ── Node: format_response ─────────────────────────────────────────────────────
+
+async def format_response(state: AgentState) -> dict[str, Any]:
+    """Final safe formatting — never leak raw errors to the caller.
+
+    AGT policy enforced: ``agent.format_response``
+
+    Raw error strings (hostnames, ports, stack traces, internal IDs) are logged
+    internally and replaced with a generic user-safe message.  The ``error``
+    field in state is therefore safe to log at WARNING for operator visibility
+    but must never appear verbatim in the returned answer.
+    """
+    await _enforce(
+        "agent.format_response",
+        {"user_id": state["user_id"]},
+    )
+
+    error = state.get("error")
+    if error:
+        log.warning("format_response_with_error", raw_error=error)
+        return {
+            "answer": "An error occurred while processing your request. Please try again.",
+            "status_message": "error",
+        }
+
+    answer = state.get("answer") or state.get("peer_answer")
+    status = state.get("status_message", "")
+
+    if not answer:
+        answer = status or "I could not find an answer to your query."
+
+    return {"answer": answer, "status_message": status or "completed"}

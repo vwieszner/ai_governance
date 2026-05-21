@@ -1,0 +1,34 @@
+# AGT Policy ConfigMap — Cluster A
+#
+# Contains the three AGT Agent OS policy files mounted into the agent container
+# at /app/agent/policies/.  The actual policy YAML is baked into the container
+# image at build time from agent/policies/ in the repository.  These ConfigMap
+# entries serve as a Kubernetes-native reference and can be used to override
+# policies at deploy time without rebuilding the image.
+#
+# To apply:
+#   kubectl apply -f k8s/cluster-a/agt-policy-configmap.yaml -n agt-federated-rag
+#
+# The Deployment mounts this ConfigMap at /app/agent/policies via a volume:
+#   volumes:
+#     - name: agt-policies
+#       configMap:
+#         name: agt-policy-configmap
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agt-policy-configmap
+  namespace: agt-federated-rag
+  labels:
+    app: agt-rag-agent
+    component: policy
+data:
+  base-policy.yaml: |
+    # see agent/policies/base-policy.yaml in the repository — baked in at build time
+
+  data-access-policy.yaml: |
+    # see agent/policies/data-access-policy.yaml in the repository — baked in at build time
+
+  peer-comms-policy.yaml: |
+    # see agent/policies/peer-comms-policy.yaml in the repository — baked in at build time

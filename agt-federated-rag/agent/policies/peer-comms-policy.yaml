@@ -1,0 +1,88 @@
+# Peer communications policy — governs all cross-cluster agent-to-agent messages.
+#
+# OWASP coverage:
+#   ASI-03 Identity Abuse         — DID verification + trust score gate
+#   ASI-07 Insecure Comms         — IATP encryption enforcement
+#   ASI-08 Cascading Failures     — circuit breaker state check before sending
+#   ASI-10 Rogue Agents           — ring isolation; peer must be in TRUSTED ring
+
+name: peer-comms-policy
+version: "1.0"
+
+defaults:
+  action: DENY   # All peer comms denied unless explicitly permitted below.
+
+rules:
+  # ── Require verified DID identity on every peer message (ASI-03, ASI-07) ──
+  - name: require-peer-did-verified
+    priority: 1000
+    condition:
+      field: peer_did_verified
+      operator: EQ
+      value: false
+    action: DENY
+    reason: "Peer agent DID could not be verified — message rejected"
+    audit: true
+    alert: true
+
+  # ── Require IATP encryption (ASI-07) ─────────────────────────────────────
+  - name: require-iatp-encryption
+    priority: 1000
+    condition:
+      field: transport_encrypted
+      operator: EQ
+      value: false
+    action: DENY
+    reason: "Unencrypted peer message rejected — IATP required"
+    audit: true
+    alert: true
+
+  # ── Trust score gate on peer agent (ASI-03) ───────────────────────────────
+  - name: block-low-trust-peer
+    priority: 900
+    condition:
+      field: peer_trust_score
+      operator: LT
+      value: 0.6
+    action: DENY
+    reason: "Peer agent trust score below threshold"
+    audit: true
+
+  # ── Peer must be in TRUSTED execution ring (ASI-10) ───────────────────────
+  - name: require-trusted-ring
+    priority: 900
+    condition:
+      field: peer_execution_ring
+      operator: NOT_IN
+      value: [TRUSTED, PRIVILEGED]
+    action: DENY
+    reason: "Peer is not in a trusted execution ring"
+    audit: true
+
+  # ── Circuit breaker: block peer calls when breaker is OPEN (ASI-08) ───────
+  - name: block-when-circuit-open
+    priority: 950
+    condition:
+      field: peer_circuit_state
+      operator: EQ
+      value: OPEN
+    action: DENY
+    reason: "Peer circuit breaker is OPEN — cascading failure prevention"
+    audit: true
+
+  # ── Allow verified, encrypted, trusted peer messages ─────────────────────
+  - name: allow-verified-peer-message
+    priority: 100
+    condition:
+      field: action
+      operator: EQ
+      value: peer.send_message
+    action: ALLOW
+
+  - name: allow-peer-callback
+    priority: 100
+    condition:
+      field: action
+      operator: EQ
+      value: peer.receive_callback
+    action: ALLOW

@@ -1,0 +1,86 @@
+# Data access policy — governs what data the agent is permitted to retrieve
+# and forward to the LLM context.
+#
+# OWASP coverage:
+#   ASI-02 Excessive Capabilities — chunk count cap, query length guard
+#   ASI-05 Insecure Output        — PII / sensitive pattern blocking in LLM output
+#   ASI-06 Memory Poisoning       — block retrieval from untrusted sources
+
+name: data-access-policy
+version: "1.0"
+
+defaults:
+  action: ALLOW   # data access inherits ALLOW at this layer; chunk-level auth
+                  # is enforced by OpenFGA (ReBAC) — a separate, deeper control.
+
+rules:
+  # ── Query input validation ────────────────────────────────────────────────
+  - name: reject-oversized-query
+    priority: 900
+    condition:
+      field: query_length
+      operator: GT
+      value: 4096
+    action: DENY
+    reason: "Query exceeds maximum allowed length (4096 chars)"
+    audit: true
+
+  - name: reject-empty-query
+    priority: 900
+    condition:
+      field: query_length
+      operator: LT
+      value: 1
+    action: DENY
+    reason: "Empty query rejected"
+
+  # ── Retrieval limits (ASI-02: least privilege) ────────────────────────────
+  - name: cap-chunk-retrieval
+    priority: 800
+    condition:
+      field: requested_chunk_count
+      operator: GT
+      value: 50
+    action: DENY
+    reason: "Chunk retrieval cap exceeded (max 50 per query)"
+    audit: true
+
+  # ── Block retrieval from untrusted collections (ASI-06) ───────────────────
+  # Only the configured collection is trusted. Any attempt to query a different
+  # collection is a potential memory poisoning vector.
+  - name: block-untrusted-collection
+    priority: 850
+    condition:
+      field: qdrant_collection
+      operator: NOT_IN
+      value: ["knowledge_base"]   # extend with additional trusted collections
+    action: DENY
+    reason: "Retrieval from untrusted Qdrant collection blocked"
+    audit: true
+    alert: true
+
+  # ── LLM context size guard ────────────────────────────────────────────────
+  - name: cap-llm-context
+    priority: 700
+    condition:
+      field: context_char_count
+      operator: GT
+      value: 24000    # ~6000 tokens × 4 chars/token
+    action: DENY
+    reason: "LLM context exceeds token budget — truncation required before call"
+    audit: true
+
+  # ── Block sensitive patterns in outbound LLM responses (ASI-05) ──────────
+  # These patterns in the *response* indicate potential data exfiltration or
+  # prompt injection output.  The PII presidio check (optional extra) provides
+  # deeper coverage when installed.
+  - name: block-credential-leak-in-output
+    priority: 950
+    condition:
+      field: llm_output
+      operator: REGEX_MATCH
+      value: "(PRIVATE KEY|BEGIN RSA|sk-[A-Za-z0-9]{32,}|xoxb-[A-Za-z0-9-]+)"
+    action: DENY
+    reason: "Potential credential or API key detected in LLM output"
+    audit: true
+    alert: true

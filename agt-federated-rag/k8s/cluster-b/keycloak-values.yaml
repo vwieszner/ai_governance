@@ -1,0 +1,45 @@
+# Keycloak Helm values — Cluster B (AGT Federated RAG)
+# Chart: bitnami/keycloak
+#
+# helm repo add bitnami https://charts.bitnami.com/bitnami
+# helm install keycloak bitnami/keycloak \
+#   -n agt-federated-rag \
+#   -f k8s/cluster-b/keycloak-values.yaml \
+#   --set auth.adminPassword="<strong-secret>" \
+#   --set postgresql.auth.password="<db-secret>"
+
+auth:
+  adminUser: admin
+  adminPassword: "change-me-in-production"   # override via --set or external Secret
+
+production: true
+proxy: edge   # behind Istio ingress gateway
+
+replicaCount: 2
+
+postgresql:
+  enabled: true
+  auth:
+    username: keycloak
+    password: "keycloak-db-password"         # override via --set
+    database: keycloak
+
+extraEnvVars:
+  - name: KC_FEATURES
+    value: "token-exchange,admin-fine-grained-authz"
+
+ingress:
+  enabled: true
+  hostname: keycloak-b.your-domain.com
+  tls: true
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
