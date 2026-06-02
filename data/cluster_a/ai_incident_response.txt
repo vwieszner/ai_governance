@@ -1,0 +1,16 @@
+AI Model Incident Response Procedure (AIOPS-003)
+
+Severity 1 (discriminatory outputs, financial harm, safety risk):
+- Page on-call AI governance lead within 15 minutes
+- Suspend model within 1 hour
+- Notify CISO and Legal within 2 hours
+- Incident report within 24 hours
+- Post-mortem within 5 business days
+
+Severity 2 (accuracy degradation >5% from baseline, unexpected behaviour):
+- Notify model owner and team lead within 4 hours
+- Remediation plan within 24 hours
+- Resolution within 5 business days
+
+All incidents logged in the AI Incident Register (internal.wiki/ai-incident-register).
+Root cause must be documented. Patterns reviewed quarterly by AI Governance Board.

@@ -116,6 +116,41 @@ class HybridQdrantRetriever:
                 ]
             )
 
+        # Relevance gate: a dense query whose top similarity is below the
+        # threshold means the corpus has no on-topic chunk. We use the dense
+        # cosine score (not the fused RRF score, which is a small reciprocal-rank
+        # value with no absolute meaning) to decide relevance. Chunks that clear
+        # the threshold form an allow-set; the hybrid RRF query is then restricted
+        # to those chunks so an off-topic document can never enter the result set
+        # (which would otherwise block an authorized answer or suppress
+        # cross-cluster routing to the peer that actually owns the data).
+        dense_results = await c.query_points(
+            collection_name=settings.qdrant_collection,
+            query=models.Document(text=query, model=settings.qdrant_dense_model),
+            using="dense",
+            limit=top_k,
+            query_filter=acl_filter,
+            with_payload=["chunk_id"],
+        )
+        relevant_ids = [
+            (p.payload or {}).get("chunk_id")
+            for p in dense_results.points
+            if p.score >= settings.qdrant_score_threshold
+            and (p.payload or {}).get("chunk_id")
+        ]
+        # No locally-relevant chunk → return nothing so check_auth routes to the peer.
+        if not relevant_ids:
+            return []
+
+        # Restrict the hybrid query to the relevant chunks (intersected with any
+        # caller-supplied ACL filter).
+        relevance_filter = Filter(
+            must=[FieldCondition(key="chunk_id", match=MatchAny(any=relevant_ids))]
+        )
+        prefetch_filter = relevance_filter
+        if acl_filter is not None:
+            prefetch_filter = Filter(must=[*acl_filter.must, *relevance_filter.must])
+
         results = await c.query_points(
             collection_name=settings.qdrant_collection,
             prefetch=[
@@ -123,13 +158,13 @@ class HybridQdrantRetriever:
                     query=models.Document(text=query, model=settings.qdrant_dense_model),
                     using="dense",
                     limit=top_k,
-                    filter=acl_filter,
+                    filter=prefetch_filter,
                 ),
                 models.Prefetch(
                     query=models.Document(text=query, model=settings.qdrant_sparse_model),
                     using="sparse",
                     limit=top_k,
-                    filter=acl_filter,
+                    filter=prefetch_filter,
                 ),
             ],
             query=models.FusionQuery(fusion=models.Fusion.RRF),

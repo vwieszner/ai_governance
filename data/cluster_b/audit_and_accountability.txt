@@ -1,0 +1,15 @@
+AI Audit and Accountability Requirements (AUD-004, AIGOV-005)
+
+Audit log requirements:
+- Capture: inputs, outputs, decision context, timestamp, user/system ID
+- Retention: minimum 6 months for high-risk systems, 10 years for regulated sectors
+- Protection: write-once (WORM) storage, tamper-evident
+- Access: CISO approval required; access logged
+
+Role accountability under EU AI Act:
+- AI Provider: builds and deploys the model. Responsible for conformity assessment, technical documentation, post-market monitoring.
+- AI Deployer: uses the model in a specific context. Responsible for fundamental rights impact assessment, human oversight implementation, incident reporting.
+- AI User: end person affected. Has rights to explanation, human review, and redress.
+
+Fundamental Rights Impact Assessment required for deployers of high-risk AI before deployment.
+Results must be communicated to the AI provider and documented in the deployment register.

@@ -1,0 +1,21 @@
+GDPR and Automated Decision-Making (GDPR-003)
+
+Article 22 rights for individuals:
+- Right not to be subject to solely automated decisions with significant effects (credit, employment, health)
+- Right to human review of automated decisions
+- Right to explanation: meaningful information about logic, significance, and consequences
+- Right to contest the decision
+
+Obligations for AI systems making Article 22 decisions:
+1. Disclose that a decision is automated (before processing)
+2. Provide clear explanation of key factors and their weight
+3. Implement human review process with genuine reconsideration
+4. Document the logic in a form understandable to non-technical staff
+
+Training data obligations:
+- Data minimisation: collect only data necessary for the specified purpose
+- Purpose limitation: do not repurpose training data for other models without consent
+- Data subject rights apply to personal data used in training
+
+Consult DPO (dpo@example.com) before any new AI processing involving personal data.
+Run Data Protection Impact Assessment (DPIA) for high-risk AI processing.

@@ -1,88 +1,77 @@
 # Peer communications policy — governs all cross-cluster agent-to-agent messages.
+# Evaluated by the Agent OS PolicyEvaluator (agent_os.policies).
 #
 # OWASP coverage:
-#   ASI-03 Identity Abuse         — DID verification + trust score gate
-#   ASI-07 Insecure Comms         — IATP encryption enforcement
-#   ASI-08 Cascading Failures     — circuit breaker state check before sending
-#   ASI-10 Rogue Agents           — ring isolation; peer must be in TRUSTED ring
-
-name: peer-comms-policy
+#   ASI-03 Identity Abuse      — DID verification + trust-score gate
+#   ASI-07 Insecure Comms      — IATP encryption enforcement
+#   ASI-08 Cascading Failures  — circuit-breaker state check before sending
+#   ASI-10 Rogue Agents        — ring isolation; peer must be in a trusted ring
 version: "1.0"
+name: peer-comms-policy
+description: Governs cross-cluster peer messaging (peer.send_message / peer.receive_callback).
 
+# All peer communication is denied unless an allow rule below matches.
 defaults:
-  action: DENY   # All peer comms denied unless explicitly permitted below.
+  action: deny
 
 rules:
-  # ── Require verified DID identity on every peer message (ASI-03, ASI-07) ──
+  # ── Require a verified peer DID on every peer message (ASI-03, ASI-07) ────
   - name: require-peer-did-verified
     priority: 1000
     condition:
       field: peer_did_verified
-      operator: EQ
+      operator: eq
       value: false
-    action: DENY
-    reason: "Peer agent DID could not be verified — message rejected"
-    audit: true
-    alert: true
+    action: deny
+    message: "Peer agent DID could not be verified — message rejected"
 
-  # ── Require IATP encryption (ASI-07) ─────────────────────────────────────
+  # ── Require IATP transport encryption (ASI-07) ───────────────────────────
   - name: require-iatp-encryption
     priority: 1000
     condition:
       field: transport_encrypted
-      operator: EQ
+      operator: eq
       value: false
-    action: DENY
-    reason: "Unencrypted peer message rejected — IATP required"
-    audit: true
-    alert: true
+    action: deny
+    message: "Unencrypted peer message rejected — IATP encryption required"
 
-  # ── Trust score gate on peer agent (ASI-03) ───────────────────────────────
-  - name: block-low-trust-peer
-    priority: 900
-    condition:
-      field: peer_trust_score
-      operator: LT
-      value: 0.6
-    action: DENY
-    reason: "Peer agent trust score below threshold"
-    audit: true
-
-  # ── Peer must be in TRUSTED execution ring (ASI-10) ───────────────────────
-  - name: require-trusted-ring
-    priority: 900
-    condition:
-      field: peer_execution_ring
-      operator: NOT_IN
-      value: [TRUSTED, PRIVILEGED]
-    action: DENY
-    reason: "Peer is not in a trusted execution ring"
-    audit: true
-
-  # ── Circuit breaker: block peer calls when breaker is OPEN (ASI-08) ───────
+  # ── Circuit breaker: block peer calls when the breaker is OPEN (ASI-08) ──
   - name: block-when-circuit-open
     priority: 950
     condition:
       field: peer_circuit_state
-      operator: EQ
+      operator: eq
       value: OPEN
-    action: DENY
-    reason: "Peer circuit breaker is OPEN — cascading failure prevention"
-    audit: true
+    action: deny
+    message: "Peer circuit breaker is OPEN — cascading-failure prevention"
+
+  # ── Trust-score gate on the peer agent (ASI-03) ──────────────────────────
+  - name: block-low-trust-peer
+    priority: 900
+    condition:
+      field: peer_trust_score
+      operator: lt
+      value: 0.6
+    action: deny
+    message: "Peer agent trust score below threshold"
+
+  # ── Peer must be in a trusted execution ring (ASI-10) ────────────────────
+  - name: require-trusted-ring
+    priority: 900
+    condition:
+      field: peer_execution_ring
+      operator: not_in
+      value: [TRUSTED, PRIVILEGED]
+    action: deny
+    message: "Peer is not in a trusted execution ring"
 
   # ── Allow verified, encrypted, trusted peer messages ─────────────────────
-  - name: allow-verified-peer-message
+  - name: allow-peer-send-message
     priority: 100
-    condition:
-      field: action
-      operator: EQ
-      value: peer.send_message
-    action: ALLOW
+    condition: {field: action, operator: eq, value: peer.send_message}
+    action: allow
 
-  - name: allow-peer-callback
+  - name: allow-peer-receive-callback
     priority: 100
-    condition:
-      field: action
-      operator: EQ
-      value: peer.receive_callback
-    action: ALLOW
+    condition: {field: action, operator: eq, value: peer.receive_callback}
+    action: allow

@@ -135,6 +135,8 @@ async def _get_llm() -> ChatOpenAI:
                 openai_api_key=settings.openai_api_key,
                 temperature=settings.llm_temperature,
                 max_tokens=settings.llm_max_tokens,
+                timeout=settings.llm_timeout_seconds,
+                max_retries=settings.llm_max_retries,
             )
     return _llm
 
@@ -240,8 +242,19 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         denied=len(denied),
     )
 
+    # Finding #6: drop the *text* of denied chunks from state so unauthorised
+    # content is not carried in the AgentState snapshot / Langfuse traces / OTEL
+    # spans. generate_answer needs allowed-chunk text and start_approval needs
+    # pending-chunk IDs — nothing downstream needs denied-chunk content, and the
+    # raw qdrant/graph result lists are no longer used after fusion.
+    serveable_ids = set(allowed) | set(pending)
+    pruned_chunks = [c for c in fused if c.get("chunk_id") in serveable_ids]
+
     return {
         "flow": flow,
+        "fused_chunks": pruned_chunks,
+        "qdrant_results": [],
+        "graph_results": [],
         "allowed_chunk_ids": allowed,
         "pending_chunk_ids": pending,
         "denied_chunk_ids": denied,
@@ -415,10 +428,11 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
             "flow": FlowDecision.REMOTE_DENIED,
         }
 
-    # RFC 8693 token exchange
+    # RFC 8693 token exchange — audience is the peer's OAuth client_id (Keycloak
+    # resolves audiences by client_id, not URL), validated against the allowlist.
     delegated = await exchange_token(
         user_token=user_token,
-        target_audience=str(settings.peer_agent_url),
+        target_audience=settings.peer_agent_audience,
     )
 
     # C-5: stash delegated token in context var, NOT in state
@@ -442,9 +456,26 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     finally:
         await client.close()
 
+    # Extract the answer from the task we ALREADY received (send_task accumulates
+    # the full task including history before returning). This avoids a second
+    # get_task() round-trip in handle_peer_result, which would require the
+    # delegated token to survive across LangGraph nodes — ContextVars do NOT
+    # propagate across node boundaries, so that second fetch was failing with
+    # "missing delegated token". The answer is in scope here; pass it via state.
+    peer_answer = ""
+    for msg in reversed(task.history or []):
+        if msg.role == "agent":
+            for part in msg.parts:
+                if hasattr(part, "text") and part.text:
+                    peer_answer = part.text
+                    break
+            if peer_answer:
+                break
+
     return {
         "peer_task_id": task.id,
         "peer_status": task.status.state.value,
+        "peer_answer": peer_answer,
         # delegated_token intentionally NOT stored in state (C-5)
     }
 
@@ -455,54 +486,23 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
     """
     Process the peer agent's A2A task result.
 
-    FIX C-5: delegated token is read from the context var, not from state.
+    The answer was already captured by call_peer_agent (from the SSE task it
+    received) and passed via state["peer_answer"]. We do NOT re-fetch from the
+    peer here: that required the delegated token to survive across LangGraph
+    nodes, but ContextVars do not propagate across node boundaries.
     """
     peer_status = state.get("peer_status", "")
     log.info("node_handle_peer_result", peer_status=peer_status)
 
     if peer_status == "completed":
-        # C-5: read delegated token from context var
-        # R-2: validate it is non-empty before use — an empty token means the
-        # call_peer_agent node was bypassed or the context var was not set,
-        # which would result in a silent 401 from the peer.
-        delegated_token = _delegated_token_ctx.get()
-        if not delegated_token:
-            log.error("handle_peer_result_no_delegated_token")
+        answer = state.get("peer_answer") or ""
+        if not answer:
+            log.warning("handle_peer_result_empty_answer", peer_task_id=state.get("peer_task_id"))
             return {
                 "flow": FlowDecision.REMOTE_DENIED,
-                "status_message": "Internal error: missing delegated token for peer fetch.",
+                "status_message": "Peer agent completed but returned no answer.",
                 "answer": None,
             }
-
-        client = A2AClient(base_url=str(settings.peer_agent_url))
-        try:
-            task = await client.get_task(
-                task_id=state["peer_task_id"],
-                delegated_token=delegated_token,
-            )
-        except Exception as e:
-            # H3-4: any HTTP / connection error from the peer is handled here
-            # rather than propagating as an unformatted 500.
-            log.error("peer_get_task_failed", peer_task_id=state.get("peer_task_id"), error=str(e))
-            return {
-                "flow": FlowDecision.REMOTE_DENIED,
-                "status_message": "Failed to retrieve result from peer agent.",
-                "answer": None,
-            }
-        finally:
-            await client.close()
-
-        # Extract text from last agent message
-        answer = ""
-        for msg in reversed(task.history or []):
-            if msg.role == "agent":
-                for part in msg.parts:
-                    if hasattr(part, "text"):
-                        answer = part.text
-                        break
-                if answer:
-                    break
-
         return {
             "peer_answer": answer,
             "answer": answer,

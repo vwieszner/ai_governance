@@ -1,0 +1,11 @@
+AI Model Monitoring Standards (AIOPS-006)
+
+All production models monitored for:
+1. Data drift: Population Stability Index (PSI). Alert threshold: 0.2. Action: retrain within 30 days.
+2. Concept drift: Weekly evaluation against holdout set. Alert if accuracy drops >5%. Action: retrain within 14 days.
+3. Prediction distribution shift: Daily histogram comparison. Alert if KL divergence >0.1.
+4. Latency and throughput: P99 latency alert if 2x baseline. Throughput alert if <80% of SLA.
+
+Monitoring dashboards in Grafana (monitoring.internal). Alerts go to model owner Slack channel.
+Monthly performance reports sent to AI Governance Board.
+Annual model refresh mandatory for all production models.

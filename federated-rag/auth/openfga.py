@@ -27,10 +27,12 @@ from openfga_sdk import (
 from openfga_sdk.exceptions import ApiException
 from openfga_sdk.client.models import (
     ClientCheckRequest,
-    ClientReadRequest,
-    ClientTupleKey,
     ClientWriteRequest,
 )
+# openfga-sdk 0.9.x: ClientTupleKey was renamed ClientTuple (same user/relation/object args).
+from openfga_sdk.client.models import ClientTuple as ClientTupleKey
+# openfga-sdk 0.9.x: client.read() takes a ReadRequestTupleKey (ClientReadRequest removed).
+from openfga_sdk.models.read_request_tuple_key import ReadRequestTupleKey
 
 from config import settings
 
@@ -66,10 +68,23 @@ class OpenFGAAuth:
         async with self._lock:
             # Double-check after acquiring the lock
             if self._client is None:
+                # The OpenFGA server runs with preshared-key auth, so authenticate
+                # every call with the configured Bearer token. Without credentials
+                # the server returns 401 (Bearer token missing).
+                credentials = None
+                if settings.openfga_api_token:
+                    from openfga_sdk.credentials import CredentialConfiguration, Credentials
+                    credentials = Credentials(
+                        method="api_token",
+                        configuration=CredentialConfiguration(
+                            api_token=settings.openfga_api_token
+                        ),
+                    )
                 config = ClientConfiguration(
                     api_url=settings.openfga_api_url,
                     store_id=settings.openfga_store_id,
                     authorization_model_id=settings.openfga_model_id or None,
+                    credentials=credentials,
                 )
                 self._client = OpenFgaClient(config)
         return self._client
@@ -119,9 +134,11 @@ class OpenFGAAuth:
     async def get_chunk_owner(self, chunk_id: str) -> str | None:
         """Return the user ID of the owner of a chunk, if any."""
         client = await self._get_client()
-        body = ClientReadRequest(
-            object=f"chunk:{chunk_id}",
+        # openfga-sdk 0.9.x: read() takes a ReadRequestTupleKey (user=None queries all).
+        body = ReadRequestTupleKey(
+            user=None,
             relation="owner",
+            object=f"chunk:{chunk_id}",
         )
         resp = await client.read(body)
         tuples = resp.tuples or []
@@ -148,7 +165,15 @@ class OpenFGAAuth:
         log.info("openfga_grant_viewer", user_id=user_id, chunk_id=chunk_id)
 
     async def set_pending_approval(self, user_id: str, chunk_id: str) -> None:
-        """Mark that a user's access to a chunk is pending approval."""
+        """Mark that a user's access to a chunk is pending approval.
+
+        Idempotent: OpenFGA returns HTTP 400 when writing a tuple that already
+        exists.  That happens whenever the chunk was pre-seeded as pending (setup
+        seeds alice→pending_approval on the hr_compensation / q4 chunks) or when
+        start_approval is retried for the same request.  Re-asserting an existing
+        pending tuple is a no-op, so we swallow *only* the "already exists" case
+        and let every other 400 (malformed tuple, etc.) propagate.
+        """
         client = await self._get_client()
         body = ClientWriteRequest(
             writes=[
@@ -159,7 +184,21 @@ class OpenFGAAuth:
                 )
             ]
         )
-        await client.write(body)
+        try:
+            await client.write(body)
+        except ApiException as exc:
+            # Only swallow the "tuple already exists" 400 — match on the message
+            # body, not the bare status, so genuine validation errors still raise.
+            detail = (getattr(exc, "body", "") or str(exc)).lower()
+            if exc.status == 400 and "already exist" in detail:
+                log.warning(
+                    "openfga_set_pending_noop",
+                    user_id=user_id,
+                    chunk_id=chunk_id,
+                    reason="tuple already exists (400)",
+                )
+                return
+            raise
         log.info("openfga_set_pending", user_id=user_id, chunk_id=chunk_id)
 
     async def revoke_pending_approval(self, user_id: str, chunk_id: str) -> None:

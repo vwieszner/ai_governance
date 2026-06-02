@@ -28,6 +28,10 @@ Entry points
 """
 from __future__ import annotations
 
+# OS trust store for TLS before any SSL context is created.
+import truststore
+truststore.inject_into_ssl()
+
 import asyncio
 import signal
 
@@ -58,7 +62,13 @@ async def _run() -> None:
         shutdown_event.set()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, _handle_signal)
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            # Windows' ProactorEventLoop doesn't support add_signal_handler.
+            # Graceful SIGTERM draining is a prod/k8s concern; locally we just
+            # run until the process is killed.  Don't let this crash the worker.
+            log.warning("signal_handler_unsupported", signal=sig.name)
 
     client = await Client.connect(
         settings.temporal_address,

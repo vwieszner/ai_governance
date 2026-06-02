@@ -1,6 +1,56 @@
+# ── Python ──────────────────────────────────────────────────────────────────
 *.pyc
 __pycache__/
-.env
 *.egg-info/
 .venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Secrets / env files — NEVER commit (only *.example templates are tracked) ──
+.env
+*.env
+.env.*
+*.env.prod
+*.env.local
+ui/.env.demo
+ui/.env.prod
+ui/.env.local
+# Un-ignore the example templates so they STAY tracked
+!*.env.example
+!**/.env.example
+
+# AgentMesh DID identity — contains the agent's Ed25519 PRIVATE key
+agent_identity_*.json
+**/agent_identity_*.json
+
+# ── Backend / UI process logs (launch_all.ps1 writes to logs/) ────────────────
+logs/
+_cluster-*.out
+_cluster-*.err
+_A_*.out
+_A_*.err
+_B_*.out
+_B_*.err
+_ui.out
+_ui.err
+_setup.txt
+*.log
+
+# ── Scratch / working files (not part of the deliverable) ─────────────────────
+.user_subs.txt
+.openfga_ids.txt
+_repro_*.py
+**/_repro_*.py
+
+# ── Node / Vite (UI) ──────────────────────────────────────────────────────────
+node_modules/
+ui/node_modules/
+ui/dist/
+ui/.vite/
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+.idea/
+*.swp

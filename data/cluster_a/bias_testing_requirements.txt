@@ -1,0 +1,15 @@
+Bias and Fairness Testing Requirements (AIETHICS-004)
+
+Mandatory tests before any production deployment:
+- Demographic parity: prediction rates equal across protected groups
+- Equalized odds: equal true positive and false positive rates across groups
+- Counterfactual fairness: outcomes unchanged when protected attributes changed
+
+Protected attributes: gender, age, ethnicity, disability status, religion, national origin.
+
+Approved tools: IBM AI Fairness 360, Microsoft Fairlearn, Aequitas.
+Threshold: <2% disparity for high-risk models (credit, hiring, healthcare).
+<5% disparity for lower-risk models.
+
+Test data must include representative samples from all demographic groups.
+Results must be reviewed by an independent assessor before sign-off.

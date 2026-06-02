@@ -63,25 +63,22 @@ async def exchange_token(user_token: str, target_audience: str) -> DelegatedToke
       aud = target_audience (the downstream service)
 
     FIX S-4:  timeout=_HTTP_TIMEOUT prevents hung IdP from blocking the event loop.
-    FIX M3-5: validates target_audience against the configured peer_agent_url so
-              this function cannot be called with an arbitrary audience to obtain
-              a token scoped to an attacker-controlled service.
+    FIX M3-5: validates target_audience against the configured peer audience
+              allowlist so this function cannot be called with an arbitrary
+              audience to obtain a token scoped to an attacker-controlled service.
     """
-    # M3-5 / H-1: validate target_audience against the configured peer URL using
-    # origin comparison (scheme + netloc), not string-prefix matching.
-    # A naive startswith() check is defeated by crafted paths like:
-    #   https://peer.internal/api.evil.com  (satisfies startswith("https://peer.internal/"))
-    # Comparing (scheme, netloc) pairs is the correct SSRF guard.
-    _allowed = str(settings.peer_agent_url or "")
+    # M3-5 / H-1: the OAuth audience for RFC 8693 is the peer's CLIENT_ID (which is
+    # what Keycloak can resolve), not a URL. Validate the requested audience
+    # against the configured allowlist (settings.peer_agent_audience) with an exact
+    # match — no substring/prefix matching that could be bypassed.
+    _allowed = {a.strip() for a in (settings.peer_agent_audience or "").split(",") if a.strip()}
     if not _allowed:
         raise ValueError(
-            f"token exchange audience '{target_audience}' is not in the configured allowlist"
+            "token exchange requested but no peer_agent_audience is configured"
         )
-    _a_parsed = urlparse(_allowed)
-    _r_parsed = urlparse(str(target_audience))
-    if not (_a_parsed.scheme == _r_parsed.scheme and _a_parsed.netloc == _r_parsed.netloc):
+    if str(target_audience) not in _allowed:
         raise ValueError(
-            f"token exchange audience '{target_audience}' is not in the configured allowlist"
+            f"token exchange audience '{target_audience}' is not in the configured allowlist {_allowed}"
         )
 
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
@@ -190,17 +187,35 @@ async def validate_token(token: str) -> dict[str, Any]:
         raise JWTError("No matching signing key found in JWKS")
 
     # Accept tokens whose audience is this agent's client ID OR this agent's URL
-    # (delegated tokens from the peer cluster use the agent URL as audience)
+    # (delegated tokens from the peer cluster use the agent URL as audience).
     valid_audiences = [settings.agent_client_id, str(settings.agent_url)]
 
+    # SECURITY NOTE — audience IS verified, see the explicit check below.
+    # We set verify_aud=False ONLY because python-jose's audience= argument takes a
+    # single string and cannot express "accept ANY of several audiences" (this agent
+    # accepts both its client_id and its public URL for delegated cross-cluster
+    # tokens). Signature, exp, iat and iss are still fully verified by jose (its
+    # defaults are all True). The manual allowlist check immediately below is
+    # deny-by-default and STRICTER than jose's matcher: it rejects any token whose
+    # aud contains none of the accepted values (FIX C-1). The previous
+    # audience=[list] form was a latent bug — jose raised "audience must be a
+    # string or None" and rejected every token.
     claims: dict[str, Any] = jwt.decode(
         token,
         signing_key,
         algorithms=settings.allowed_jwt_algorithms_list,   # FIX S-5: configurable
-        audience=valid_audiences,
         issuer=settings.oidc_issuer,
-        options={"verify_aud": True},   # FIX C-1: ALWAYS validate audience
+        options={"verify_aud": False},   # aud verified manually below (multi-aud support)
     )
+
+    token_aud = claims.get("aud", [])
+    if isinstance(token_aud, str):
+        token_aud = [token_aud]
+    if not any(a in valid_audiences for a in token_aud):
+        raise JWTError(
+            f"Invalid audience: token aud {token_aud!r} matches none of "
+            f"the accepted audiences {valid_audiences!r}"
+        )
     return claims
 
 

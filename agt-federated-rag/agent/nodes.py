@@ -70,6 +70,7 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from agent.state import AgentState, FlowDecision
 from auth.openfga import AuthzDecision, OpenFGAAuth
 from config import settings
+from mesh.agent_identity import verify_peer_identity
 from mesh.peer_client import call_peer_agent as _mesh_call_peer, get_peer_circuit_state
 from rag.fusion import rrf_fuse
 from rag.neo4j_retriever import GraphRAGRetriever
@@ -103,7 +104,12 @@ async def _get_evaluator() -> PolicyEvaluator:
         return _evaluator
     async with _evaluator_lock:
         if _evaluator is None:
-            _evaluator = PolicyEvaluator.from_directory(settings.policy_dir)
+            # Real agent_os API: construct, then load every *.yaml policy
+            # document from the policy directory.
+            ev = PolicyEvaluator()
+            ev.load_policies(settings.policy_dir)
+            _evaluator = ev
+            log.info("agt_policy_evaluator_loaded", policy_dir=settings.policy_dir)
     return _evaluator
 
 
@@ -188,6 +194,8 @@ async def _get_llm() -> ChatOpenAI:
                 openai_api_key=settings.openai_api_key,
                 temperature=settings.llm_temperature,
                 max_tokens=settings.llm_max_tokens,
+                timeout=settings.llm_timeout_seconds,
+                max_retries=settings.llm_max_retries,
             )
     return _llm
 
@@ -317,8 +325,20 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         denied=len(denied),
         agt_audit=True,
     )
+
+    # Finding #6: drop the *text* of denied chunks from state so unauthorised
+    # content is not carried in the AgentState snapshot / Langfuse traces / OTEL
+    # spans. generate_answer needs allowed-chunk text and start_approval needs
+    # pending-chunk IDs — nothing downstream needs denied-chunk content, and the
+    # raw qdrant/graph result lists are no longer used after fusion.
+    serveable_ids = set(allowed) | set(pending)
+    pruned_chunks = [c for c in fused if c.get("chunk_id") in serveable_ids]
+
     return {
         "flow": flow,
+        "fused_chunks": pruned_chunks,
+        "qdrant_results": [],
+        "graph_results": [],
         "allowed_chunk_ids": allowed,
         "pending_chunk_ids": pending,
         "denied_chunk_ids": denied,
@@ -522,13 +542,26 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     # Include circuit breaker state in policy context (ASI-08, peer-comms-policy)
     circuit_state = await get_peer_circuit_state(str(settings.peer_agent_url))
 
+    # Finding #4: feed the policy engine the REAL verification results, not
+    # hardcoded "all verified" constants. With the old hardcoded values the
+    # peer-comms-policy DENY rules on peer_did_verified / peer_trust_score
+    # could never fire — the policy layer was decorative.
+    peer_did = settings.peer_agent_did or ""
+    if peer_did:
+        peer_verified, peer_trust = await verify_peer_identity(peer_did)
+    else:
+        peer_verified, peer_trust = False, 0.0
+
     await _enforce(
         "peer.send_message",
         {
             "user_id": state["user_id"],
-            "peer_did_verified": True,    # pre-verified by mesh layer on every call
-            "transport_encrypted": True,  # IATP enforces encryption
-            "peer_trust_score": 1.0,      # actual check happens in peer_client
+            "peer_did_verified": peer_verified,   # real registry verification result
+            # transport_encrypted is structurally true: peer_client builds the
+            # AgentMeshClient with require_encryption=True, which raises if the
+            # IATP channel cannot be encrypted.
+            "transport_encrypted": True,
+            "peer_trust_score": peer_trust,       # real registry trust score
             "peer_execution_ring": "TRUSTED",
             "peer_circuit_state": circuit_state.name,  # "CLOSED" | "OPEN" | "HALF_OPEN"
         },

@@ -49,7 +49,6 @@ import uuid
 from typing import Any
 
 import structlog
-from agentmesh_integrations.langgraph import GovernanceMiddleware  # type: ignore[import]
 from langgraph.graph import END, StateGraph
 
 from agent.nodes import (
@@ -63,6 +62,7 @@ from agent.nodes import (
     start_approval,
 )
 from agent.state import AgentState, FlowDecision
+from mesh.agent_identity import govern_action
 
 log = structlog.get_logger(__name__)
 
@@ -163,16 +163,8 @@ async def _get_compiled_graph() -> Any:
         return _compiled
     async with _compile_lock:
         if _compiled is None:
-            raw = _build_graph().compile()
-            # Wrap with AGT GovernanceMiddleware — applies Agent OS policy
-            # enforcement, audit logging, and AgentMesh trust integration on
-            # every graph invocation.
-            _compiled = GovernanceMiddleware(
-                graph=raw,
-                policy_dir=None,      # inherits from PolicyEvaluator singleton
-                audit_all=True,
-            )
-            log.info("agent_graph_compiled_with_governance_middleware")
+            _compiled = _build_graph().compile()
+            log.info("agent_graph_compiled")
     return _compiled
 
 
@@ -225,6 +217,18 @@ async def run_query(
     }
 
     log.info("agent_graph_invoked", user_id=user_id, task_id=initial_state["task_id"])
+
+    # AGT governance gate — every graph invocation is checked by the AgentMesh
+    # governance engine (AgentMeshClient.execute_with_governance) and recorded in
+    # its audit log. A denial (e.g. agent trust score below threshold — the AGT
+    # kill-switch) rejects the invocation before any node runs.
+    gov = await govern_action(
+        "agent.graph.invoke",
+        {"user_id": user_id, "task_id": initial_state["task_id"]},
+    )
+    if not gov.allowed:
+        log.warning("agent_graph_invocation_denied", user_id=user_id, decision=gov.decision)
+        raise PermissionError(f"Graph invocation denied by governance: {gov.decision}")
 
     graph = await _get_compiled_graph()
     final_state: AgentState = await graph.ainvoke(initial_state)

@@ -1,130 +1,350 @@
 """
-AGT AgentMesh — DID-based zero-trust agent identity.
+AgentMesh identity — DID-based zero-trust agent identity, built on the
+Microsoft Agent Governance Toolkit (``agentmesh-platform``).
 
-Replaces the RFC 8693 OIDC token exchange from federated-rag.
-Instead of obtaining user-delegated tokens from Keycloak for cross-agent calls,
-each agent has a cryptographic DID (Decentralized Identifier) with Ed25519 +
-quantum-safe ML-DSA-65 credentials managed by AgentMesh.
+Real toolkit APIs used here:
+  - ``agentmesh.AgentIdentity``   — this agent's DID + Ed25519 credentials;
+                                    ``sign()`` / ``verify_signature()`` / JWK export.
+  - ``agentmesh.TrustBridge``     — peer trust verification (IATP handshake,
+                                    registry-backed trust scoring).
+  - ``agentmesh.AgentMeshClient`` — governed action execution.
+  - ``agentmesh.TrustTracker``    — trust-event recording (reward / penalty).
+  - ``agentmesh.lifecycle.LifecycleManager`` — credential rotation.
 
 Identity flow:
-  1. On first start, generate a DID from the configured seed (deterministic).
-  2. Register the DID with the AgentMesh registry (shared between clusters).
-  3. When calling a peer agent, sign the outbound message with this DID.
-  4. The peer verifies the signature against the registry before processing.
-
-Trust scoring:
-  AgentMesh maintains a trust score (0–1000) per agent based on observed
-  behaviour.  Anomalies (rate spikes, policy violations, unexpected payloads)
-  decay the score.  Our base-policy.yaml requires score >= 0.6 (600/1000).
+  1. On first use, ``AgentIdentity.create()`` generates this agent's DID and
+     Ed25519 keypair (deterministic name derived from the cluster id).
+  2. Outbound messages are signed with the agent's private key
+     (``sign_outbound_message``); the signature is embedded in an ``_agentmesh``
+     envelope.
+  3. Inbound peer messages are verified (``verify_signed_message``) against the
+     peer's PUBLIC key — which is taken from trusted configuration
+     (``peer_agent_public_jwk``), never from the message body.
+  4. Peer identities are additionally checked against the AgentMesh registry via
+     ``TrustBridge.verify_peer`` (trust score gate).
 """
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from typing import Any
 
 import structlog
-from agentmesh import AgentMesh, AgentIdentity  # type: ignore[import]
-from agentmesh.lifecycle import LifecycleManager  # type: ignore[import]
-from agentmesh.trust import TrustScore  # type: ignore[import]
+from agentmesh import (
+    AgentIdentity,
+    AgentMeshClient,
+    GovernanceResult,
+    TrustBridge,
+    TrustTracker,
+)
+from agentmesh.exceptions import AgentMeshError
+from agentmesh.lifecycle import LifecycleManager
 
 from config import settings
 
 log = structlog.get_logger(__name__)
 
-# ── Module-level singleton (double-checked locking) ──────────────────────────
-_mesh: AgentMesh | None = None
+# Stable agent id / DID name derived from the cluster — deterministic across
+# restarts so the DID name is predictable for peer configuration.
+_AGENT_ID: str = f"rag-agent-{settings.cluster_id}"
+
+# Trust scores in the toolkit are integers on a 0–1000 scale; settings express
+# the threshold as a 0.0–1.0 float. Convert at the boundary.
+_TRUST_SCALE = 1000.0
+
+# ── Module-level singletons (double-checked locking) ──────────────────────────
 _identity: AgentIdentity | None = None
-_mesh_lock: asyncio.Lock = asyncio.Lock()
+_mesh_client: AgentMeshClient | None = None
+_trust_bridge: TrustBridge | None = None
+_trust_tracker: TrustTracker | None = None
+_lock: asyncio.Lock = asyncio.Lock()
 
 
-async def get_mesh() -> AgentMesh:
-    """Return (or initialise) the AgentMesh singleton."""
-    global _mesh, _identity
-    if _mesh is not None:
-        return _mesh
-    async with _mesh_lock:
-        if _mesh is None:
-            log.info("agentmesh_initialising", agent_name=settings.agent_name)
-            _mesh = AgentMesh(
-                agent_id=settings.agent_name,
-                registry_url=settings.agent_mesh_registry_url,
-                # Ed25519 + ML-DSA-65 credentials derived from the seed.
-                # Using a deterministic seed means the DID is stable across
-                # restarts and pod replacements.
-                did_seed=bytes.fromhex(settings.agent_did_seed),
-                trust_threshold=settings.agent_trust_threshold,
-            )
-            _identity = await _mesh.create_or_load_identity()
-            log.info(
-                "agentmesh_ready",
-                did=_identity.did,
-                trust_score=_identity.trust_score,
-            )
-    return _mesh
+def _canonical_bytes(payload: dict[str, Any]) -> bytes:
+    """Deterministic byte serialisation of a message for signing / verifying.
+
+    The ``_agentmesh`` envelope is excluded so that the signer and the verifier
+    operate over byte-identical input.
+    """
+    body = {k: v for k, v in payload.items() if k != "_agentmesh"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+
+def _load_or_create_identity() -> AgentIdentity:
+    """Load the persisted AgentMesh identity, or create and persist a new one.
+
+    The identity (DID + Ed25519 keypair) MUST be stable across restarts and pod
+    replacements, otherwise peers would have a stale public key configured. When
+    ``agent_identity_path`` is set, the identity is persisted as a JWKS file
+    (private key included) and reloaded on subsequent starts.
+    """
+    path = settings.agent_identity_path
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                jwks = json.load(fh)
+            identity = AgentIdentity.from_jwks(jwks)
+            log.info("agentmesh_identity_loaded", did=str(identity.did), path=path)
+            return identity
+        except Exception as exc:  # noqa: BLE001 — corrupt file → fall back to create
+            log.error("agentmesh_identity_load_failed", path=path, error=str(exc))
+
+    identity = AgentIdentity.create(
+        name=_AGENT_ID,
+        sponsor=settings.agent_sponsor_email,
+        capabilities=["rag.query", "a2a.federate"],
+        organization=settings.cluster_id,
+        description=f"Federated RAG agent for {settings.cluster_id}",
+    )
+    log.info("agentmesh_identity_created", did=str(identity.did))
+
+    if path:
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(identity.to_jwks(include_private=True), fh)
+            # Private key on disk — restrict to owner-only (effective on POSIX).
+            os.chmod(path, 0o600)
+            log.info("agentmesh_identity_persisted", path=path)
+        except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+            log.error("agentmesh_identity_persist_failed", path=path, error=str(exc))
+    elif settings.peer_agent_url:
+        log.warning("agentmesh_identity_ephemeral_no_persistence_path")
+    return identity
 
 
 async def get_identity() -> AgentIdentity:
-    """Return this agent's DID identity."""
-    await get_mesh()
-    assert _identity is not None
+    """Return (loading/creating once) this agent's AgentMesh DID identity."""
+    global _identity
+    if _identity is not None:
+        return _identity
+    async with _lock:
+        if _identity is None:
+            _identity = _load_or_create_identity()
+            log.info("agentmesh_identity_ready", did=str(_identity.did))
     return _identity
 
 
 async def get_did() -> str:
-    """Return this agent's DID string (e.g. did:mesh:cluster-a-rag-xxxx)."""
+    """Return this agent's DID string (e.g. ``did:mesh:...``)."""
     identity = await get_identity()
-    return identity.did
+    return str(identity.did)
 
 
-async def verify_peer_identity(peer_did: str) -> tuple[bool, float]:
+async def get_public_jwk() -> dict[str, Any]:
+    """Return this agent's PUBLIC key as a JWK.
+
+    Published by the /identity endpoint so a peer operator can copy it into
+    their ``PEER_AGENT_PUBLIC_JWK`` configuration for callback verification.
     """
-    Verify a peer agent's DID against the AgentMesh registry.
+    identity = await get_identity()
+    return identity.to_jwk(include_private=False)
 
-    Returns (verified: bool, trust_score: float 0.0–1.0).
-    Called before processing any inbound peer message (peer-comms-policy.yaml).
-    """
-    mesh = await get_mesh()
-    try:
-        score: TrustScore = await mesh.verify_identity(peer_did)
-        normalised = score.value / 1000.0   # convert 0–1000 to 0.0–1.0
-        log.info("peer_identity_verified", peer_did=peer_did, trust_score=normalised)
-        return True, normalised
-    except Exception as exc:
-        log.warning("peer_identity_verification_failed", peer_did=peer_did, error=str(exc))
-        return False, 0.0
 
+async def get_mesh() -> AgentMeshClient:
+    """Return (creating once) the AgentMesh governed-execution client."""
+    global _mesh_client
+    if _mesh_client is not None:
+        return _mesh_client
+    async with _lock:
+        if _mesh_client is None:
+            _mesh_client = AgentMeshClient(
+                agent_id=_AGENT_ID,
+                capabilities=["rag.query", "a2a.federate"],
+            )
+            log.info("agentmesh_client_ready", agent_id=_AGENT_ID)
+    return _mesh_client
+
+
+async def _get_trust_bridge() -> TrustBridge:
+    """Return (creating once) the TrustBridge for peer verification."""
+    global _trust_bridge
+    if _trust_bridge is not None:
+        return _trust_bridge
+    did = await get_did()
+    async with _lock:
+        if _trust_bridge is None:
+            _trust_bridge = TrustBridge(agent_did=did)
+    return _trust_bridge
+
+
+async def _get_trust_tracker() -> TrustTracker:
+    global _trust_tracker
+    if _trust_tracker is not None:
+        return _trust_tracker
+    async with _lock:
+        if _trust_tracker is None:
+            _trust_tracker = TrustTracker()
+    return _trust_tracker
+
+
+# ── Message signing / verification ────────────────────────────────────────────
 
 async def sign_outbound_message(payload: dict[str, Any]) -> dict[str, Any]:
     """
     Sign an outbound message with this agent's DID credentials.
 
-    The signature is embedded in the payload under the '_agentmesh' key.
-    The peer's AgentMesh verifies this before evaluating the message.
+    Returns a new dict with an ``_agentmesh`` envelope holding the sender DID
+    and the Ed25519 signature over the canonical message bytes. The peer verifies
+    this with verify_signed_message() before processing.
+    """
+    identity = await get_identity()
+    signature = identity.sign(_canonical_bytes(payload))
+    signed = dict(payload)
+    signed["_agentmesh"] = {
+        "sender_did": str(identity.did),
+        "signature": signature,
+        "alg": "EdDSA",
+    }
+    return signed
+
+
+async def verify_signed_message(payload: dict[str, Any]) -> tuple[bool, str | None]:
+    """
+    Cryptographically verify an inbound AgentMesh-signed message.
+
+    SECURITY (review finding #1) — this is NOT verify_peer_identity().
+    The Ed25519 signature in the ``_agentmesh`` envelope is verified against the
+    peer's PUBLIC key, and that key is taken from trusted configuration
+    (``settings.peer_agent_public_jwk``) — NEVER from the message body. A forged
+    message that merely names a real DID, or that ships its own public key, is
+    rejected. The verified signer DID must also equal the configured peer DID.
+
+    Returns (verified, sender_did). Callers MUST fail closed on a False result.
+    """
+    block = payload.get("_agentmesh")
+    if not isinstance(block, dict):
+        log.warning("inbound_message_missing_agentmesh_block")
+        return False, None
+    sender_did = block.get("sender_did")
+    signature = block.get("signature")
+    if not sender_did or not signature:
+        log.warning("inbound_message_incomplete_envelope")
+        return False, None
+
+    # Resolve the peer's PUBLIC key from trusted config — not from the message.
+    if not settings.peer_agent_public_jwk:
+        log.error("verify_signed_message_no_peer_jwk_configured")
+        return False, None
+    try:
+        peer_jwk = json.loads(settings.peer_agent_public_jwk)
+        peer_identity = AgentIdentity.from_jwk(peer_jwk)
+    except Exception as exc:  # noqa: BLE001 — bad/missing config must fail closed
+        log.warning("verify_signed_message_bad_peer_jwk", error=str(exc))
+        return False, None
+
+    # The configured peer key must belong to the DID claimed in the envelope,
+    # and (if a peer DID is configured) to the expected peer.
+    if str(peer_identity.did) != sender_did:
+        log.warning(
+            "verify_signed_message_did_mismatch",
+            claimed=sender_did,
+            configured_key_did=str(peer_identity.did),
+        )
+        return False, None
+    if settings.peer_agent_did and sender_did != settings.peer_agent_did:
+        log.warning("verify_signed_message_unexpected_peer", claimed=sender_did)
+        return False, None
+
+    try:
+        verified = peer_identity.verify_signature(_canonical_bytes(payload), signature)
+    except Exception as exc:  # noqa: BLE001 — any verify error → fail closed
+        log.warning("verify_signed_message_verify_error", error=str(exc))
+        return False, None
+    if not verified:
+        log.warning("verify_signed_message_signature_invalid", sender_did=sender_did)
+        return False, None
+    return True, sender_did
+
+
+# ── Peer trust verification ───────────────────────────────────────────────────
+
+async def verify_peer_identity(peer_did: str) -> tuple[bool, float]:
+    """
+    Verify a peer agent's DID against the AgentMesh registry via TrustBridge.
+
+    Returns (verified, trust_score) where trust_score is normalised to 0.0–1.0.
+    Fails closed — any registry / handshake error returns (False, 0.0).
+    """
+    threshold_int = int(settings.agent_trust_threshold * _TRUST_SCALE)
+    try:
+        bridge = await _get_trust_bridge()
+        result = await asyncio.to_thread(
+            bridge.verify_peer,
+            peer_did,
+            protocol="iatp",
+            required_trust_score=threshold_int,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail closed on any error
+        log.warning("peer_identity_verification_failed", peer_did=peer_did, error=str(exc))
+        return False, 0.0
+    verified = bool(getattr(result, "verified", False))
+    raw_score = getattr(result, "trust_score", 0) or 0
+    score = float(raw_score) / _TRUST_SCALE
+    log.info("peer_identity_verified", peer_did=peer_did, verified=verified, trust_score=score)
+    return verified, score
+
+
+# ── Governed action execution ─────────────────────────────────────────────────
+
+async def govern_action(action: str, context: dict[str, Any]) -> GovernanceResult:
+    """
+    Run an action through the AgentMesh governance engine.
+
+    Returns a GovernanceResult; callers inspect ``.allowed`` and fail closed.
     """
     mesh = await get_mesh()
-    return await mesh.sign_message(payload)
+    return await asyncio.to_thread(mesh.execute_with_governance, action, context)
 
+
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 async def rotate_credentials() -> None:
     """
-    Rotate this agent's Ed25519 + ML-DSA-65 credentials.
+    Rotate this agent's Ed25519 credentials via the AgentMesh LifecycleManager.
 
-    Should be called periodically (e.g. via a scheduled Kubernetes CronJob).
-    AgentMesh updates the registry and invalidates the old credentials gracefully.
+    Intended to be called periodically (e.g. a Kubernetes CronJob). Best-effort:
+    a rotation failure is logged, not raised, so a transient registry outage does
+    not crash the scheduled job.
     """
-    mesh = await get_mesh()
-    lifecycle = LifecycleManager(mesh)
-    await lifecycle.rotate_credentials()
-    log.info("agentmesh_credentials_rotated")
+    try:
+        manager = LifecycleManager()
+        await asyncio.to_thread(manager.rotate_credentials, _AGENT_ID)
+        log.info("agentmesh_credentials_rotated", agent_id=_AGENT_ID)
+    except AgentMeshError as exc:
+        log.error("agentmesh_credential_rotation_failed", error=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        log.error("agentmesh_credential_rotation_unexpected_error", error=str(exc))
 
 
 async def report_trust_event(peer_did: str, event_type: str, details: dict[str, Any]) -> None:
     """
-    Report a trust-relevant event about a peer agent to the AgentMesh registry.
-
-    AgentMesh uses these events to update the peer's trust score.
-    Examples: unexpected_payload, policy_violation, timeout, anomalous_rate.
+    Record a trust-relevant interaction with a peer in the AgentMesh
+    TrustTracker. Failures (penalties) decay the peer's trust score.
     """
-    mesh = await get_mesh()
-    await mesh.report_event(peer_did=peer_did, event_type=event_type, details=details)
-    log.info("trust_event_reported", peer_did=peer_did, event_type=event_type)
+    # Negative event types are recorded as failed interactions (penalty).
+    success = event_type not in {
+        "iatp_error",
+        "call_failure",
+        "policy_violation",
+        "timeout",
+        "unexpected_payload",
+        "anomalous_rate",
+    }
+    try:
+        tracker = await _get_trust_tracker()
+        await asyncio.to_thread(
+            tracker.record_interaction,
+            _AGENT_ID,
+            peer_did,
+            event_type,
+            success,
+        )
+        log.info("trust_event_reported", peer_did=peer_did, event_type=event_type, success=success)
+    except Exception as exc:  # noqa: BLE001 — telemetry must not break the caller
+        log.warning("trust_event_report_failed", peer_did=peer_did, error=str(exc))

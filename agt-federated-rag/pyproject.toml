@@ -20,8 +20,6 @@ dependencies = [
     "agent-sre>=3.5.0",
     # Agent Compliance: OWASP verification, policy linting, integrity checks
     "agent-governance-toolkit>=3.5.0",
-    # LangGraph adapter (publishes governed graph with policy middleware)
-    "agentmesh-integrations[langgraph]>=3.5.0",
 
     # ── Agent framework ───────────────────────────────────────────────────────
     "langgraph>=0.2.0",

@@ -24,10 +24,16 @@ Security notes:
 """
 from __future__ import annotations
 
+# Use the OS trust store for TLS BEFORE any SSL context is created (the bundled
+# certifi CA does not include the NVIDIA endpoint's issuer on this host).
+import truststore
+truststore.inject_into_ssl()
+
 import asyncio
 import hashlib
 import hmac as hmac_lib
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -35,17 +41,19 @@ from typing import Any, AsyncIterator
 import redis.asyncio as aioredis
 import structlog
 import uvicorn
-from agent_sre import SREMiddleware  # type: ignore[import]
 from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from jose import JWTError
 from sse_starlette.sse import EventSourceResponse
 from temporalio.client import Client as TemporalClient
 
 import agent.graph as agent_graph
+import agent.nodes as agent_nodes
 import mesh.agent_identity as agent_identity
 from auth.token_validator import AuthServiceUnavailable, validate_token
 from config import settings
+from sre import SREMiddleware
 from workflow.approval import ApprovalDecisionSignal
 
 log = structlog.get_logger(__name__)
@@ -261,18 +269,45 @@ async def _update_task(task_id: str, updates: dict[str, Any]) -> None:
         raise HTTPException(status_code=503, detail="Task store temporarily unavailable")
 
 
+# ── Rate limiting (Finding #7) ────────────────────────────────────────────────
+
+async def _check_rate_limit(subject: str) -> None:
+    """
+    Finding #7: fixed-window per-subject rate limit for the expensive /query
+    endpoint. Backed by Redis (INCR + EXPIRE). Fails OPEN on a Redis error —
+    availability is preferred over hard-blocking when the limiter is degraded.
+    """
+    try:
+        r = await _get_redis()
+        window = int(time.time()) // 60
+        key = f"ratelimit:{subject}:{window}"
+        count = await r.incr(key)
+        if count == 1:
+            await r.expire(key, 120)
+    except Exception as exc:
+        log.warning("rate_limit_check_failed", subject=subject, error=str(exc))
+        return
+    if count > settings.rate_limit_per_minute:
+        log.warning("rate_limit_exceeded", subject=subject, count=count)
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please slow down.")
+
+
 # ── HMAC helpers ──────────────────────────────────────────────────────────────
 
-def _sign_approval(request_id: str, decision: str) -> str:
-    """Generate an HMAC-SHA256 hex digest for an approval deep-link."""
+def _sign_approval(request_id: str, decision: str, exp: int) -> str:
+    """Generate an HMAC-SHA256 hex digest for an approval deep-link.
+
+    Finding #2: the expiry timestamp is part of the signed message so a leaked
+    deep-link cannot be replayed indefinitely after it expires.
+    """
     key = settings.approval_hmac_secret.encode()
-    msg = f"{request_id}:{decision}".encode()
+    msg = f"{request_id}:{decision}:{exp}".encode()
     return hmac_lib.new(key, msg, hashlib.sha256).hexdigest()
 
 
-def _verify_approval_token(request_id: str, decision: str, token: str) -> bool:
+def _verify_approval_token(request_id: str, decision: str, exp: int, token: str) -> bool:
     """Timing-safe HMAC verification for approval deep-links."""
-    expected = _sign_approval(request_id, decision)
+    expected = _sign_approval(request_id, decision, exp)
     return hmac_lib.compare_digest(expected, token)
 
 
@@ -372,13 +407,14 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
-# AGT SRE middleware — request-level SLO tracking.
-# Must be added before body-size and correlation-ID middlewares so it wraps
-# the full request lifecycle including downstream middleware latency.
-app.add_middleware(
-    SREMiddleware,
-    slo_latency_p99_ms=settings.sre_slo_latency_p99_ms,
-)
+# AGT SRE middleware — request-level SLO tracking via agent_sre.
+# Added before body-size and correlation-ID middlewares so it wraps the full
+# request lifecycle including downstream middleware latency.
+if settings.sre_enabled:
+    app.add_middleware(
+        SREMiddleware,
+        slo_latency_p99_ms=settings.sre_slo_latency_p99_ms,
+    )
 
 # Correlation ID middleware — inject X-Request-ID into every request/response.
 # Added before body-size so every response (including 413) carries the header.
@@ -386,6 +422,18 @@ app.add_middleware(_CorrelationIdMiddleware)
 
 # Body-size middleware — pure ASGI; never buffers SSE response payloads.
 app.add_middleware(_LimitBodySizeMiddleware, max_bytes=settings.max_request_body_bytes)
+
+# CORS — outermost layer so preflight OPTIONS is handled before body-size checks.
+# allow_origins is read from settings.cors_origins (default: localhost dev server).
+# Override via CORS_ORIGINS env var — comma-separated list of allowed origins:
+#   CORS_ORIGINS=https://rag.example.com,https://admin.example.com
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Request-ID"],
+)
 
 
 # ── GET /health ───────────────────────────────────────────────────────────────
@@ -421,15 +469,17 @@ async def agent_card() -> JSONResponse:
 # ── GET /identity ─────────────────────────────────────────────────────────────
 
 @app.get("/identity")
-async def identity() -> dict[str, str]:
-    """Return this agent's AgentMesh DID.
+async def identity() -> dict[str, Any]:
+    """Return this agent's AgentMesh DID and public-key JWK.
 
-    Peer operators use this endpoint to retrieve the DID and set it as
-    PEER_AGENT_DID in their deployment configuration so AgentMesh can verify
-    inbound messages from this agent.
+    Peer operators retrieve both values at setup time and set them as
+    PEER_AGENT_DID and PEER_AGENT_PUBLIC_JWK in their deployment configuration,
+    so the peer can verify the Ed25519 signature on this agent's callbacks
+    (verify_signed_message). Only the PUBLIC key is exposed here.
     """
     did = await agent_identity.get_did()
-    return {"did": did, "cluster": settings.cluster_id}
+    public_jwk = await agent_identity.get_public_jwk()
+    return {"did": did, "cluster": settings.cluster_id, "public_key_jwk": public_jwk}
 
 
 # ── POST /query ───────────────────────────────────────────────────────────────
@@ -459,6 +509,9 @@ async def query(
     user_id: str = claims.get("sub", "")
     task_id = str(uuid.uuid4())
     context_id = str(uuid.uuid4())
+
+    # Finding #7: per-subject rate limit before expensive retrieval + LLM work.
+    await _check_rate_limit(user_id)
 
     # Parse and validate request body
     try:
@@ -548,12 +601,15 @@ async def task_callback(
 ) -> JSONResponse:
     """Peer agent callback — receives status updates from the federated peer.
 
-    Authentication: The inbound message must carry an '_agentmesh' signature
-    block.  We extract the sender's DID from that block and verify it against
-    the AgentMesh registry.  If trust score is below the threshold the callback
-    is rejected with 403.
+    Authentication (Finding #1): the inbound message must carry an `_agentmesh`
+    signature block whose signature verifies *against the payload* via
+    verify_signed_message().  A DID is public (served by /identity), so a DID
+    lookup alone is not authentication — the cryptographic signature check is
+    what proves the message came from the peer's private key.
 
-    Only the configured PEER_AGENT_DID is accepted as a valid sender.
+    After signature verification: the registry trust score must clear the
+    threshold, the verified signer must equal the configured PEER_AGENT_DID,
+    and the AGT policy engine must allow `peer.receive_callback` (Finding #5).
     """
     _validate_safe_id(task_id, "task_id")
 
@@ -563,15 +619,36 @@ async def task_callback(
     except Exception:
         raise HTTPException(status_code=422, detail="Request body must be valid JSON")
 
-    # Extract sender DID from AgentMesh signature block
-    agentmesh_block = payload.get("_agentmesh", {})
-    sender_did: str = agentmesh_block.get("sender_did", "")
+    # ── Finding #1: cryptographically verify the AgentMesh signature ─────────
+    # The previous implementation trusted `_agentmesh.sender_did` straight from
+    # the request body and only looked it up in the registry — an authentication
+    # bypass, since any unauthenticated caller who knows the (public) peer DID
+    # could forge a callback.  verify_signed_message() verifies the signature in
+    # the `_agentmesh` block against the payload and fails closed otherwise.
+    sig_verified, signed_sender_did = await agent_identity.verify_signed_message(payload)
+    if not sig_verified or not signed_sender_did:
+        log.warning("callback_signature_invalid", task_id=task_id)
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing AgentMesh message signature",
+        )
 
-    if not sender_did:
-        log.warning("callback_missing_sender_did", task_id=task_id)
-        raise HTTPException(status_code=401, detail="Missing AgentMesh identity block")
+    # The DID asserted in the block must match the cryptographically-verified
+    # signer; a mismatch means the body was altered after signing.
+    claimed_did = ""
+    if isinstance(payload.get("_agentmesh"), dict):
+        claimed_did = payload["_agentmesh"].get("sender_did", "")
+    if claimed_did and claimed_did != signed_sender_did:
+        log.warning(
+            "callback_did_mismatch",
+            task_id=task_id,
+            claimed_did=claimed_did,
+            signed_did=signed_sender_did,
+        )
+        raise HTTPException(status_code=403, detail="Sender DID does not match message signature")
+    sender_did = signed_sender_did
 
-    # Verify peer DID against AgentMesh registry
+    # Registry trust-score gate (defence in depth, on the verified signer)
     verified, trust_score = await agent_identity.verify_peer_identity(sender_did)
     if not verified or trust_score < settings.agent_trust_threshold:
         log.warning(
@@ -582,7 +659,7 @@ async def task_callback(
         )
         raise HTTPException(status_code=403, detail="Peer identity verification failed")
 
-    # Optionally enforce that the sender DID matches the configured peer
+    # The verified signer must be the configured peer.
     if settings.peer_agent_did and sender_did != settings.peer_agent_did:
         log.warning(
             "callback_unexpected_peer_did",
@@ -591,6 +668,26 @@ async def task_callback(
             expected_did=settings.peer_agent_did,
         )
         raise HTTPException(status_code=403, detail="Sender DID does not match configured peer")
+
+    # ── Finding #5: enforce the AGT policy engine on the inbound callback ────
+    # peer.receive_callback was previously enforced only inside the LangGraph
+    # node, never on this HTTP entry point. A PermissionError is mapped to
+    # HTTP 403 by permission_error_handler. The verification values below are
+    # the REAL results of the checks performed above in this same function
+    # (signature verified, registry trust score, configured-peer match) — not
+    # hardcoded optimistic constants (cf. Finding #4).
+    await agent_nodes._enforce(
+        "peer.receive_callback",
+        {
+            "task_id": task_id,
+            "sender_did": sender_did,
+            "peer_did_verified": True,        # signature + registry verified above
+            "transport_encrypted": True,      # callbacks traverse the mesh / Istio mTLS
+            "peer_trust_score": trust_score,  # real registry trust score
+            "peer_execution_ring": "TRUSTED",
+            "peer_circuit_state": "CLOSED",   # no outbound circuit breaker on inbound
+        },
+    )
 
     # Extract and validate status update
     status = payload.get("status", {})
@@ -619,7 +716,8 @@ async def task_callback(
 async def handle_approval(
     request_id: str,
     decision: str = Query(..., pattern="^(approve|deny)$"),
-    token: str = Query(..., description="HMAC-SHA256 of '{request_id}:{decision}'"),
+    exp: int = Query(..., description="Unix expiry timestamp — link rejected after this time"),
+    token: str = Query(..., description="HMAC-SHA256 of '{request_id}:{decision}:{exp}'"),
     reason: str = Query("", description="Optional free-text reason"),
     request: Request = None,  # type: ignore[assignment]
 ) -> JSONResponse:
@@ -633,7 +731,12 @@ async def handle_approval(
     """
     _validate_safe_id(request_id, "request_id")
 
-    if not _verify_approval_token(request_id, decision, token):
+    # Finding #2: reject expired links before any work. The expiry is part of
+    # the HMAC-signed message, so a caller cannot extend it by editing the query.
+    if exp < int(time.time()):
+        log.warning("approval_link_expired", request_id=request_id)
+        raise HTTPException(status_code=401, detail="Approval link has expired")
+    if not _verify_approval_token(request_id, decision, exp, token):
         log.warning("approval_hmac_invalid")
         raise HTTPException(status_code=401, detail="Invalid or expired approval token")
 
@@ -647,6 +750,10 @@ async def handle_approval(
             ApprovalDecisionSignal(
                 decision="approved" if decision == "approve" else "denied",
                 reason=reason[:500],   # cap free-text (M3-3)
+                # Finding #8: record the decision channel so the workflow audit
+                # log is not blank. Full human attribution requires an
+                # authenticated approval UI (see SECURITY_REVIEW.md).
+                approver_id="approval-deeplink",
             ),
         )
     except Exception as exc:

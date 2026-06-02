@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac as hmac_lib
+import time
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode
 
@@ -94,18 +95,26 @@ class A2ACallbackInput:
 
 # ── HMAC helper (C-2) ─────────────────────────────────────────────────────────
 
-def _sign_approval(request_id: str, decision: str) -> str:
-    """HMAC-SHA256 hex digest used to authenticate approval deep-links."""
+def _sign_approval(request_id: str, decision: str, exp: int) -> str:
+    """HMAC-SHA256 hex digest used to authenticate approval deep-links.
+
+    Finding #2: the expiry timestamp is part of the signed message so a leaked
+    deep-link cannot be replayed indefinitely after it expires.
+    """
     key = settings.approval_hmac_secret.encode()
-    msg = f"{request_id}:{decision}".encode()
+    msg = f"{request_id}:{decision}:{exp}".encode()
     return hmac_lib.new(key, msg, hashlib.sha256).hexdigest()
 
 
 def _approval_url(request_id: str, decision: str) -> str:
     # MED-5: percent-encode all query-string values to prevent header injection
     # and ensure URLs remain valid if request_id or decision ever contain special chars.
-    tok = _sign_approval(request_id, decision)
-    qs = urlencode({"decision": decision, "token": tok})
+    # Finding #2: bind a short-lived expiry (the approval workflow timeout) into
+    # the signed token so the link stops working once the request can no longer
+    # be acted on.
+    exp = int(time.time()) + settings.approval_timeout_seconds
+    tok = _sign_approval(request_id, decision, exp)
+    qs = urlencode({"decision": decision, "exp": exp, "token": tok})
     return f"{settings.approval_ui_base_url}/approve/{quote(request_id)}?{qs}"
 
 

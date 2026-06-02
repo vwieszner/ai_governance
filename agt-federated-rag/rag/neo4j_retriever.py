@@ -42,13 +42,19 @@ class GraphRAGRetriever:
         self._embed_model: Any = None
         self._init_lock = threading.Lock()
         self._initialised = False
+        # When the Neo4j vector index doesn't exist yet (e.g. only Qdrant was
+        # ingested), VectorRetriever can't be constructed (it eagerly probes the
+        # index in __init__ and raises "No index with name ... found").  We cache
+        # this so retrieve_context degrades gracefully to Qdrant-only retrieval
+        # instead of crashing the query — and we don't re-probe on every request.
+        self._graph_unavailable = False
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
     def _sync_init(self) -> None:
         """Synchronous driver + model setup; called once inside a thread executor."""
         with self._init_lock:
-            if self._initialised:
+            if self._initialised or self._graph_unavailable:
                 return
             log.info(
                 "neo4j.init",
@@ -71,6 +77,18 @@ class GraphRAGRetriever:
                 auth=(settings.neo4j_user, settings.neo4j_password),
             )
 
+            # Proactively verify the vector index exists before constructing the
+            # VectorRetriever — its __init__ probes the index and raises if it's
+            # absent (which would otherwise crash the whole query).
+            if not self._vector_index_exists(neo4j, "chunk_embedding"):
+                log.warning(
+                    "neo4j.index_unavailable",
+                    index="chunk_embedding",
+                    detail="Neo4j vector index not found — degrading to Qdrant-only retrieval",
+                )
+                self._graph_unavailable = True
+                return
+
             # Wrap fastembed in the neo4j-graphrag BaseEmbedder interface.
             embed_model = TextEmbedding(model_name=settings.qdrant_dense_model)
 
@@ -81,14 +99,44 @@ class GraphRAGRetriever:
                 def embed_query(self, text: str) -> list[float]:
                     return list(self._model.embed([text]))[0].tolist()
 
-            self._retriever = VectorRetriever(
-                driver=self._driver,
-                index_name="chunk_embedding",   # must match the Neo4j vector index name
-                embedder=_FastEmbedWrapper(embed_model),
-                return_properties=["chunk_id", "text", "metadata"],
-            )
+            try:
+                self._retriever = VectorRetriever(
+                    driver=self._driver,
+                    index_name="chunk_embedding",   # must match the Neo4j vector index name
+                    embedder=_FastEmbedWrapper(embed_model),
+                    return_properties=["chunk_id", "text", "metadata"],
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade rather than crash the query
+                log.warning(
+                    "neo4j.retriever_init_failed",
+                    error=str(exc),
+                    detail="VectorRetriever construction failed — degrading to Qdrant-only retrieval",
+                )
+                self._graph_unavailable = True
+                return
+
             self._initialised = True
             log.info("neo4j.ready")
+
+    def _vector_index_exists(self, neo4j_mod: Any, index_name: str) -> bool:
+        """Return True iff a vector index with the given name exists in Neo4j.
+
+        Any error talking to Neo4j is treated as "not available" so retrieval
+        degrades gracefully rather than raising.
+        """
+        if self._driver is None:
+            return False
+        try:
+            records, _, _ = self._driver.execute_query(
+                "SHOW VECTOR INDEXES YIELD name WHERE name = $name RETURN name",
+                {"name": index_name},
+                database_=None,
+                routing_=neo4j_mod.RoutingControl.READ,
+            )
+            return len(records) > 0
+        except Exception as exc:  # noqa: BLE001 — Neo4j down/unreachable → unavailable
+            log.warning("neo4j.index_probe_failed", index=index_name, error=str(exc))
+            return False
 
     async def _ensure_init(self) -> None:
         """Async wrapper — runs synchronous init in a thread-pool executor."""
@@ -107,6 +155,10 @@ class GraphRAGRetriever:
             Score is the cosine similarity reported by the Neo4j vector index.
         """
         await self._ensure_init()
+        if self._graph_unavailable or self._retriever is None:
+            # Graph index unavailable — degrade to empty graph results so the
+            # caller can still fuse Qdrant results (logged once in _sync_init).
+            return []
         log.debug("neo4j.retrieve", top_k=settings.neo4j_top_k)
 
         loop = asyncio.get_event_loop()

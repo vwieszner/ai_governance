@@ -1,0 +1,9 @@
+AI Model Deployment Policy (AIOPS-001)
+
+All AI models must complete the following before production deployment:
+1. Model Card: Document intended use, out-of-scope uses, training data provenance, evaluation results by demographic slice, known limitations. Template at internal.wiki/model-card-template.
+2. Bias & Fairness Report: Run IBM AI Fairness 360 or Microsoft Fairlearn. Demographic parity, equalized odds, and counterfactual fairness checks required. Threshold: <2% disparity across subgroups for high-risk models.
+3. CISO Approval: Required for any model handling PII or making decisions affecting individuals.
+4. Rollback Plan: Documented and tested before go-live.
+5. Monitoring Dashboards: Data drift (PSI threshold 0.2), concept drift, prediction distribution shift configured before go-live.
+Standard review SLA: 5 business days. Emergency deployment: 24-hour fast-track with VP sign-off.

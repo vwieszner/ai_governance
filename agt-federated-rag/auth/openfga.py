@@ -88,10 +88,19 @@ class OpenFGAAuth:
                 "openfga_sdk is required. Install: pip install openfga-sdk"
             ) from exc
 
+        # OpenFGA server runs with preshared-key auth — authenticate every call.
+        credentials = None
+        if settings.openfga_api_token:
+            from openfga_sdk.credentials import CredentialConfiguration, Credentials
+            credentials = Credentials(
+                method="api_token",
+                configuration=CredentialConfiguration(api_token=settings.openfga_api_token),
+            )
         config = ClientConfiguration(
             api_url=settings.openfga_api_url,
             store_id=settings.openfga_store_id,
             authorization_model_id=settings.openfga_model_id,
+            credentials=credentials,
         )
         self._client = OpenFgaClient(config)
         await self._client.__aenter__()
@@ -227,21 +236,41 @@ class OpenFGAAuth:
     # ── Tuple write helpers ────────────────────────────────────────────────────
 
     async def _write_tuple(self, user_id: str, chunk_id: str, relation: Relation) -> None:
-        """Write a single authorisation tuple to OpenFGA."""
+        """Write a single authorisation tuple to OpenFGA (idempotent on "already exists").
+
+        OpenFGA returns HTTP 400 when writing a tuple that already exists. That
+        happens when a chunk was pre-seeded (setup seeds alice→pending_approval on
+        the q4 chunk) or when an approval write is retried. Re-asserting an
+        existing tuple is a no-op, so we swallow *only* the "already exists" 400
+        and let every other 400 (malformed tuple, etc.) propagate.
+        """
         assert self._client is not None
         from openfga_sdk import ClientTuple, ClientWriteRequest  # type: ignore[import]
 
-        await self._client.write(
-            ClientWriteRequest(
-                writes=[
-                    ClientTuple(
-                        user=self._user_id(user_id),
-                        relation=relation.value,
-                        object=self._object_id(chunk_id),
-                    )
-                ]
+        try:
+            await self._client.write(
+                ClientWriteRequest(
+                    writes=[
+                        ClientTuple(
+                            user=self._user_id(user_id),
+                            relation=relation.value,
+                            object=self._object_id(chunk_id),
+                        )
+                    ]
+                )
             )
-        )
+        except ApiException as exc:
+            detail = (getattr(exc, "body", "") or str(exc)).lower()
+            if exc.status == 400 and "already exist" in detail:
+                log.warning(
+                    "openfga.write_tuple.exists",
+                    user_id=user_id,
+                    chunk_id=chunk_id,
+                    relation=relation.value,
+                    reason="tuple already exists (400)",
+                )
+                return
+            raise
         log.info(
             "openfga.write_tuple",
             user_id=user_id,

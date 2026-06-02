@@ -1,0 +1,17 @@
+Human Oversight Requirements for AI Decisions (AIGOV-005)
+
+High-risk AI decisions requiring mandatory human review before action:
+- Credit and loan decisions affecting >£10,000
+- Hiring and employment decisions
+- Healthcare triage and treatment recommendations
+- Insurance underwriting
+- Law enforcement risk assessments
+- Benefits eligibility determinations
+
+Human reviewers must:
+- Complete AI literacy training (minimum 8 hours annually)
+- Receive model output, confidence score, and top feature contributions
+- Have authority to override the model recommendation
+- Document their review rationale
+
+Prohibited: fully automated decisions on the above categories without human review.

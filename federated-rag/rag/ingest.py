@@ -70,7 +70,7 @@ async def ingest_to_neo4j(chunks: list[dict[str, Any]]) -> None:
     # Q-6: always close the driver, even if ingestion raises an exception.
     try:
         embedder = OpenAIEmbeddings(
-            model="text-embedding-3-small",
+            model=settings.embedding_model,
             base_url=settings.openai_api_base,
             api_key=settings.openai_api_key,
         )

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac as hmac_lib
+import time
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode
 
@@ -117,15 +118,17 @@ class A2ACallbackInput:
 
 # ── HMAC helper ───────────────────────────────────────────────────────────────
 
-def _sign_approval(request_id: str, decision: str) -> str:
+def _sign_approval(request_id: str, decision: str, exp: int) -> str:
     """HMAC-SHA256 hex digest used to authenticate approval deep-links.
 
     The key is the ``approval_hmac_secret`` setting (required, random 32-byte
-    hex).  The message is ``{request_id}:{decision}`` — both are included so a
-    valid approve token cannot be reused as a deny token and vice-versa.
+    hex).  The message is ``{request_id}:{decision}:{exp}`` — request_id and
+    decision are included so a valid approve token cannot be reused as a deny
+    token, and exp (Finding #2) so a leaked link cannot be replayed after it
+    expires.
     """
     key = settings.approval_hmac_secret.encode()
-    msg = f"{request_id}:{decision}".encode()
+    msg = f"{request_id}:{decision}:{exp}".encode()
     return hmac_lib.new(key, msg, hashlib.sha256).hexdigest()
 
 
@@ -135,9 +138,13 @@ def _approval_url(request_id: str, decision: str) -> str:
     MED-5: all query-string values are percent-encoded via urlencode + quote
     to prevent header injection and ensure URLs are valid if request_id or
     decision ever contain special characters.
+    Finding #2: a short-lived expiry (the approval workflow timeout) is bound
+    into the signed token so the link stops working once the request can no
+    longer be acted on.
     """
-    tok = _sign_approval(request_id, decision)
-    qs = urlencode({"decision": decision, "token": tok})
+    exp = int(time.time()) + settings.approval_timeout_seconds
+    tok = _sign_approval(request_id, decision, exp)
+    qs = urlencode({"decision": decision, "exp": exp, "token": tok})
     return f"{settings.approval_ui_base_url}/approve/{quote(request_id)}?{qs}"
 
 

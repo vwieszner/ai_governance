@@ -26,12 +26,21 @@ Security fixes in this file:
 """
 from __future__ import annotations
 
+# Use the OS trust store for TLS verification BEFORE any SSL context is created.
+# Python's bundled certifi CA bundle does not include the issuer for the NVIDIA
+# (and some other) endpoints on this host, causing CERTIFICATE_VERIFY_FAILED.
+# truststore delegates verification to the OS, which has the issuer. Must run
+# first, before httpx/openai build their default SSL contexts.
+import truststore
+truststore.inject_into_ssl()
+
 import asyncio
 import contextvars
 import hashlib
 import hmac as hmac_lib
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -40,6 +49,7 @@ import redis.asyncio as aioredis
 import structlog
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from jose import JWTError
 from pydantic import ValidationError
@@ -266,16 +276,42 @@ async def _store_callback_url(task_id: str, url: str) -> None:
         log.warning("redis_store_callback_url_failed", task_id=task_id, error=str(exc))
 
 
+# ── Rate limiting (Finding #7) ────────────────────────────────────────────────
+
+async def _check_rate_limit(subject: str) -> None:
+    """
+    Finding #7: fixed-window per-subject rate limit for expensive query
+    endpoints. Backed by Redis (INCR + EXPIRE). Fails OPEN on a Redis error —
+    availability is preferred over hard-blocking when the limiter is degraded.
+    """
+    try:
+        r = await _get_redis()
+        window = int(time.time()) // 60
+        key = f"ratelimit:{subject}:{window}"
+        count = await r.incr(key)
+        if count == 1:
+            await r.expire(key, 120)
+    except Exception as exc:
+        log.warning("rate_limit_check_failed", subject=subject, error=str(exc))
+        return
+    if count > settings.rate_limit_per_minute:
+        log.warning("rate_limit_exceeded", subject=subject, count=count)
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please slow down.")
+
+
 # ── HMAC helpers (C-2) ────────────────────────────────────────────────────────
 
-def _sign_approval(request_id: str, decision: str) -> str:
+def _sign_approval(request_id: str, decision: str, exp: int) -> str:
+    # Finding #2: the signed message binds an expiry timestamp so an approval
+    # deep-link cannot be replayed indefinitely after it leaks (mail archive,
+    # Slack export, log aggregation, browser history).
     key = settings.approval_hmac_secret.encode()
-    msg = f"{request_id}:{decision}".encode()
+    msg = f"{request_id}:{decision}:{exp}".encode()
     return hmac_lib.new(key, msg, hashlib.sha256).hexdigest()
 
 
-def _verify_approval_token(request_id: str, decision: str, token: str) -> bool:
-    expected = _sign_approval(request_id, decision)
+def _verify_approval_token(request_id: str, decision: str, exp: int, token: str) -> bool:
+    expected = _sign_approval(request_id, decision, exp)
     return hmac_lib.compare_digest(expected, token)
 
 
@@ -314,6 +350,18 @@ app.add_middleware(_CorrelationIdMiddleware)
 
 # S-1 + Q-1: pure ASGI body-size limit that does NOT buffer SSE responses
 app.add_middleware(_LimitBodySizeMiddleware, max_bytes=settings.max_request_body_bytes)
+
+# CORS — outermost layer so preflight OPTIONS is handled before body-size checks.
+# allow_origins is read from settings.cors_origins (default: localhost dev server).
+# Override via CORS_ORIGINS env var — comma-separated list of allowed origins:
+#   CORS_ORIGINS=https://rag.example.com,https://admin.example.com
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Request-ID"],
+)
 
 
 # ── Dependency: validate bearer token ─────────────────────────────────────────
@@ -395,6 +443,10 @@ async def send_task(
     task_id = req.id or str(uuid.uuid4())
     user_id = extract_user_id(auth["claims"])
     user_token = auth["token"]
+
+    # Finding #7: per-subject rate limit before doing any expensive work
+    # (retrieval fan-out + LLM call). Fails open on Redis error.
+    await _check_rate_limit(user_id)
 
     # Validate query length before processing (missing input validation fix)
     query = ""
@@ -482,6 +534,12 @@ async def send_task(
             task.history.append(agent_msg)
             task.status = TaskStatus(state=TaskState.COMPLETED, message="Done")
 
+        # Finding #3: mark the task as eligible for a peer callback only when
+        # this agent actually delegated it to a peer cluster. task_callback
+        # rejects callbacks for any task without this flag.
+        if final_state.get("peer_task_id"):
+            task.metadata["awaiting_peer_callback"] = True
+
         await _store_task(task, owner_id=user_id)
         yield {
             "event": "task_status_update",
@@ -532,6 +590,10 @@ async def task_callback(
     FIX Q-4: empty peer_agent_client_ids now rejects all callbacks (previously
              skipped the check entirely when the list was empty).
     FIX S-2: payload validated with Pydantic TaskStatusUpdateEvent before use.
+    Finding #3: the callback is accepted only for a task that this agent
+             actually delegated to a peer (metadata flag awaiting_peer_callback).
+             This stops an authorised peer from overwriting the status of
+             local-only tasks it was never a participant in.
     """
     # C-4 + Q-4: always enforce; empty list → deny all
     caller_client_id = extract_client_id(auth["claims"])
@@ -546,6 +608,17 @@ async def task_callback(
 
     task = await _load_task(task_id)
     if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Finding #3: only tasks this agent delegated to a peer may receive a
+    # callback. Return 404 (not 403) so the endpoint does not confirm the
+    # existence of tasks the caller has no legitimate relationship with.
+    if not task.metadata.get("awaiting_peer_callback"):
+        log.warning(
+            "callback_for_non_delegated_task",
+            task_id=task_id,
+            caller_client_id=caller_client_id,
+        )
         raise HTTPException(status_code=404, detail="Task not found")
 
     # S-2: validate payload structure with Pydantic; bad data → 422 not 500
@@ -570,18 +643,29 @@ async def task_callback(
 @app.get("/approve/{request_id}")
 async def handle_approval(
     request_id: str,
+    # FA-5 / syntax fix: Request has no default, so it must precede the
+    # Query(...)-defaulted parameters — otherwise the module fails to import
+    # with "parameter without a default follows parameter with a default".
+    request: Request,
     decision: str = Query(..., pattern="^(approve|deny)$"),
-    token: str = Query(..., description="HMAC-SHA256 signature of '{request_id}:{decision}'"),
+    exp: int = Query(..., description="Unix expiry timestamp — link rejected after this time"),
+    token: str = Query(..., description="HMAC-SHA256 of '{request_id}:{decision}:{exp}'"),
     reason: str = Query("", description="Optional reason for the decision"),
-    request: Request,  # FA-5: Request has no default — omitting it causes a 422 on every call
 ) -> JSONResponse:
     """
     FIX C-2: HMAC-signed deep-link — only Slack/email links generated by the
     workflow can trigger a Temporal signal.
     FIX S-6: Temporal errors are logged internally; only a generic message is
     returned to the caller to prevent information disclosure.
+    Finding #2: the link carries a signed expiry timestamp; expired links are
+    rejected so a leaked URL cannot be replayed indefinitely.
     """
-    if not _verify_approval_token(request_id, decision, token):
+    # Finding #2: reject expired links before any work. The expiry is part of
+    # the HMAC-signed message, so a caller cannot extend it by editing the query.
+    if exp < int(time.time()):
+        log.warning("approval_link_expired", request_id=request_id)
+        raise HTTPException(status_code=401, detail="Approval link has expired")
+    if not _verify_approval_token(request_id, decision, exp, token):
         log.warning("approval_hmac_invalid", request_id=request_id, decision=decision)
         raise HTTPException(status_code=401, detail="Invalid or expired approval token")
 
@@ -597,6 +681,10 @@ async def handle_approval(
                 # M3-3: cap reason to 500 chars — approver input is free-text and
                 # could otherwise inject oversized Slack payloads or mrkdwn markup.
                 reason=reason[:500],
+                # Finding #8: record the decision channel so the workflow audit
+                # log is not blank. Full human attribution requires an
+                # authenticated approval UI (see SECURITY_REVIEW.md).
+                approver_id="approval-deeplink",
             ),
         )
     except Exception as e:

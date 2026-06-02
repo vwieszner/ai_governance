@@ -1,0 +1,15 @@
+AI Risk Assessment Framework (RISK-007)
+
+Mandatory before deployment, updated annually or after significant model changes.
+
+Risk dimensions to assess:
+1. Purpose and context: Who makes decisions? Who is affected? What are the stakes?
+2. Data quality and bias: Representativeness, historical bias, data gaps by demographic group
+3. Harm potential: Individual harm (financial, physical, reputational), societal harm (discrimination, polarisation)
+4. Security vulnerabilities: Adversarial attacks, data poisoning, model inversion
+5. Transparency: Explainability of outputs, auditability of decisions
+6. Mitigation measures: Technical and organisational controls in place
+
+High-risk systems require independent auditor review of the assessment.
+Results must be documented in the AI Risk Register and reviewed by the AI Governance Board.
+Risk register accessible to all stakeholders via the GRC platform.

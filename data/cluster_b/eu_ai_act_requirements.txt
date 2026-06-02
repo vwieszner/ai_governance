@@ -1,0 +1,21 @@
+EU AI Act — Requirements for High-Risk AI Systems (EUREG-001, effective August 2024)
+
+High-risk AI categories (Annex III):
+- Biometric identification and categorisation
+- Critical infrastructure management
+- Educational and vocational training access
+- Employment, workers management, self-employment
+- Access to essential private/public services (credit, insurance)
+- Law enforcement
+- Migration, asylum, border control
+- Administration of justice and democratic processes
+
+Obligations for providers of high-risk AI:
+1. Register in the EU database before market placement
+2. Conformity assessment (internal or third-party)
+3. Technical documentation maintained for 10 years
+4. Human oversight mechanisms enabling intervention
+5. Post-market monitoring plan with annual reporting
+6. Incident reporting to national authority within 15 days of serious incident
+
+Prohibited practices (Article 5): social scoring by public authorities, real-time remote biometric identification in public spaces (with exceptions), subliminal manipulation, exploitation of vulnerable groups.

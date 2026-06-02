@@ -1,17 +1,20 @@
 """
-AGT AgentMesh peer client — IATP-encrypted cross-cluster agent communication.
+AgentMesh peer client — cross-cluster agent-to-agent communication built on the
+Microsoft Agent Governance Toolkit.
 
-Replaces the custom A2AClient + RFC 8693 token exchange from federated-rag.
+Real toolkit APIs used here:
+  - ``agentmesh.ProtocolBridge``          — the actual peer message transport
+                                            (a2a → iatp protocol bridging).
+  - ``agentmesh.TrustBridge`` (via mesh)  — peer DID verification + trust score.
+  - ``agentmesh.AgentMeshClient`` (via mesh.govern_action) — governance gate.
+  - ``agent_os.circuit_breaker.CircuitBreaker`` — cascading-failure protection.
 
-What changed vs. the original:
-  - No raw user JWTs forwarded to peers (was RFC 8693; now DID-signed messages)
-  - Transport is IATP (Inter-Agent Trust Protocol) — end-to-end encrypted with
-    Ed25519 + ephemeral ECDH key exchange; no TLS termination at the proxy layer
-  - Every outbound message is signed with this agent's DID
-  - Every inbound message has its DID signature verified before processing
-  - AgentMesh trust scoring gates both send and receive
-  - Circuit breaker (Agent SRE) wraps every peer call
-  - All decisions are recorded in the AGT audit log
+Security controls applied before any peer message is sent:
+  1. Verify the peer DID + trust score against the AgentMesh registry.
+  2. Check the circuit breaker (open → fail fast — ASI-08).
+  3. Run the AGT governance gate for ``peer.send_message``.
+  4. Sign the outbound message with this agent's DID credentials.
+  5. Record the interaction in the TrustTracker (reward / penalty).
 """
 from __future__ import annotations
 
@@ -20,52 +23,79 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from agentmesh import AgentMeshClient, IATProtocolError  # type: ignore[import]
-from agentmesh.trust import TrustScore  # type: ignore[import]
-from agent_sre import CircuitBreaker, CircuitState  # type: ignore[import]
+from agentmesh import ProtocolBridge
+from agentmesh.exceptions import AgentMeshError
+from agent_os.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitState
 
 from config import settings
 from mesh.agent_identity import (
-    get_mesh,
+    get_did,
+    govern_action,
+    report_trust_event,
     sign_outbound_message,
     verify_peer_identity,
-    report_trust_event,
 )
 
 log = structlog.get_logger(__name__)
 
-# ── Per-peer circuit breakers (Agent SRE — ASI-08) ───────────────────────────
-# Key: peer_agent_url string.  Created lazily on first use.
+# ── Per-peer circuit breakers (ASI-08) ────────────────────────────────────────
 _circuit_breakers: dict[str, CircuitBreaker] = {}
 _cb_lock: asyncio.Lock = asyncio.Lock()
+_protocol_bridge: ProtocolBridge | None = None
+_bridge_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def _get_circuit_breaker(peer_url: str) -> CircuitBreaker:
-    if peer_url not in _circuit_breakers:
-        async with _cb_lock:
-            if peer_url not in _circuit_breakers:
-                _circuit_breakers[peer_url] = CircuitBreaker(
-                    name=f"peer:{peer_url}",
-                    failure_threshold=5,        # open after 5 consecutive failures
-                    recovery_timeout_seconds=30, # attempt half-open after 30 s
-                    success_threshold=2,         # close after 2 consecutive successes
+    """Return (creating once) the circuit breaker for a peer URL."""
+    cb = _circuit_breakers.get(peer_url)
+    if cb is not None:
+        return cb
+    async with _cb_lock:
+        cb = _circuit_breakers.get(peer_url)
+        if cb is None:
+            cb = CircuitBreaker(
+                config=CircuitBreakerConfig(
+                    failure_threshold=5,            # open after 5 consecutive failures
+                    recovery_timeout_seconds=30.0,  # attempt half-open after 30 s
                 )
-    return _circuit_breakers[peer_url]
+            )
+            _circuit_breakers[peer_url] = cb
+    return cb
 
 
-# ── Response dataclass ─────────────────────────────────────────────────────────
+async def _get_protocol_bridge() -> ProtocolBridge:
+    """Return (creating once) the AgentMesh ProtocolBridge for peer transport."""
+    global _protocol_bridge
+    if _protocol_bridge is not None:
+        return _protocol_bridge
+    did = await get_did()
+    async with _bridge_lock:
+        if _protocol_bridge is None:
+            _protocol_bridge = ProtocolBridge(
+                agent_did=did,
+                supported_protocols=["a2a", "iatp"],
+            )
+    return _protocol_bridge
+
 
 @dataclass
 class PeerResponse:
     """Normalised response from a peer agent call."""
-    status: str           # "completed" | "input_required" | "failed"
+    status: str            # "completed" | "input_required" | "failed"
     answer: str | None
     task_id: str
     peer_did: str
     trust_score: float
 
 
-# ── Main peer call ─────────────────────────────────────────────────────────────
+async def get_peer_circuit_state(peer_url: str | None = None) -> CircuitState:
+    """Return the circuit-breaker state for the configured (or given) peer."""
+    url = peer_url or str(settings.peer_agent_url or "")
+    if not url:
+        return CircuitState.CLOSED
+    cb = await _get_circuit_breaker(url)
+    return cb.get_state()
+
 
 async def call_peer_agent(
     query: str,
@@ -74,35 +104,26 @@ async def call_peer_agent(
     callback_url: str | None = None,
 ) -> PeerResponse:
     """
-    Send a governed query to the peer agent via IATP.
+    Send a governed, signed query to the peer agent via the AgentMesh
+    ProtocolBridge.
 
-    Security controls applied (all before the HTTP call is made):
-      1. Verify peer DID against AgentMesh registry
-      2. Check peer trust score >= threshold
-      3. Check circuit breaker state (open → fail fast)
-      4. Sign outbound message with this agent's DID
-      5. IATP transport encryption enforced by AgentMesh SDK
-      6. Audit log entry written for every call attempt
-
-    The *user_id* is included in the signed payload so the peer can make
-    its own OpenFGA authorization decision.  No raw user JWT is forwarded —
-    the peer trusts the user_id claim because it is signed by a verified agent DID.
+    The user_id is carried inside the signed payload so the peer can make its own
+    OpenFGA authorization decision. No raw user JWT is forwarded — the peer
+    trusts the user_id because the message is signed by this agent's verified DID.
     """
     if not settings.peer_agent_url:
         raise RuntimeError("No peer agent URL configured")
-
     peer_url = str(settings.peer_agent_url)
 
-    # ── Step 1: verify peer DID ───────────────────────────────────────────────
     peer_did = settings.peer_agent_did
     if not peer_did:
         raise ValueError("PEER_AGENT_DID not configured — cannot verify peer identity")
 
+    # ── Step 1: verify peer DID + trust score against the AgentMesh registry ──
     verified, trust_score = await verify_peer_identity(peer_did)
     if not verified:
         log.error("peer_did_not_verified", peer_did=peer_did)
-        raise IATProtocolError(f"Peer DID '{peer_did}' could not be verified")
-
+        raise AgentMeshError(f"Peer DID '{peer_did}' could not be verified")
     if trust_score < settings.agent_trust_threshold:
         log.error(
             "peer_trust_below_threshold",
@@ -110,89 +131,73 @@ async def call_peer_agent(
             trust_score=trust_score,
             threshold=settings.agent_trust_threshold,
         )
-        raise IATProtocolError(
-            f"Peer trust score {trust_score:.2f} is below threshold {settings.agent_trust_threshold}"
+        raise AgentMeshError(
+            f"Peer trust score {trust_score:.2f} is below threshold "
+            f"{settings.agent_trust_threshold}"
         )
 
-    # ── Step 2: circuit breaker check ────────────────────────────────────────
+    # ── Step 2: circuit breaker — fail fast if open ──────────────────────────
     cb = await _get_circuit_breaker(peer_url)
-    if cb.state == CircuitState.OPEN:
+    if cb.get_state() == CircuitState.OPEN:
         log.warning("peer_circuit_open", peer_url=peer_url)
         raise RuntimeError(f"Circuit breaker OPEN for peer {peer_url} — call rejected")
 
-    # ── Step 3: build and sign message ───────────────────────────────────────
-    payload = {
+    # ── Step 3: AGT governance gate for the outbound peer message ────────────
+    gov = await govern_action(
+        "peer.send_message",
+        {
+            "user_id": user_id,
+            "peer_did": peer_did,
+            "peer_trust_score": trust_score,
+            "transport": "iatp",
+        },
+    )
+    if not gov.allowed:
+        log.warning("peer_send_governance_denied", peer_did=peer_did, decision=gov.decision)
+        raise AgentMeshError(f"Governance denied peer.send_message: {gov.decision}")
+
+    # ── Step 4: build + sign the outbound message ────────────────────────────
+    payload: dict[str, Any] = {
         "query": query,
-        "user_id": user_id,       # signed claim — peer can trust this
+        "user_id": user_id,        # signed claim — the peer can trust this
         "context_id": context_id,
         "callback_url": callback_url,
         "source_cluster": settings.cluster_id,
     }
     signed_payload = await sign_outbound_message(payload)
 
-    # ── Step 4: IATP call ─────────────────────────────────────────────────────
-    mesh = await get_mesh()
-    client = AgentMeshClient(
-        mesh=mesh,
-        peer_url=peer_url,
-        peer_did=peer_did,
-        # IATP enforces encryption and DID verification on the transport layer.
-        # The SDK raises IATProtocolError if the peer cannot be verified or
-        # if the channel cannot be encrypted.
-        require_encryption=True,
-        require_verified_peer=True,
-    )
+    log.info("peer_call_sending", peer_url=peer_url, peer_did=peer_did, trust_score=trust_score)
 
-    log.info(
-        "peer_call_sending",
-        peer_url=peer_url,
-        peer_did=peer_did,
-        user_id=user_id,
-        trust_score=trust_score,
-    )
-
+    # ── Step 5: send via the AgentMesh ProtocolBridge (a2a → iatp) ───────────
+    bridge = await _get_protocol_bridge()
     try:
-        async with cb:  # circuit breaker wraps the actual call
-            response = await client.send_governed_message(
-                payload=signed_payload,
-                timeout_seconds=30.0,
-            )
-    except IATProtocolError as exc:
+        response = await asyncio.to_thread(
+            bridge.send_message,
+            peer_did,
+            signed_payload,
+            "a2a",     # source_protocol
+            "iatp",    # target_protocol
+        )
+    except AgentMeshError as exc:
+        cb.record_failure()
         log.error("peer_iatp_error", error=str(exc))
-        await report_trust_event(
-            peer_did=peer_did,
-            event_type="iatp_error",
-            details={"error": str(exc)},
-        )
+        await report_trust_event(peer_did, "iatp_error", {"error": str(exc)})
         raise
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — any transport failure trips the breaker
+        cb.record_failure()
         log.error("peer_call_failed", error=str(exc))
-        await report_trust_event(
-            peer_did=peer_did,
-            event_type="call_failure",
-            details={"error": str(exc)},
-        )
+        await report_trust_event(peer_did, "call_failure", {"error": str(exc)})
         raise
 
-    log.info(
-        "peer_call_success",
-        peer_url=peer_url,
-        status=response.get("status"),
-    )
+    cb.record_success()
+    await report_trust_event(peer_did, "call_success", {})
 
+    data: dict[str, Any] = response if isinstance(response, dict) else {}
+    log.info("peer_call_success", peer_url=peer_url, status=data.get("status"))
     return PeerResponse(
-        status=response.get("status", "unknown"),
-        answer=response.get("answer"),
-        task_id=response.get("task_id", ""),
+        status=str(data.get("status", "unknown")),
+        answer=data.get("answer"),
+        task_id=str(data.get("task_id", "")),
         peer_did=peer_did,
         trust_score=trust_score,
     )
-
-
-async def get_peer_circuit_state(peer_url: str | None = None) -> CircuitState:
-    """Return the circuit breaker state for the configured peer."""
-    url = peer_url or str(settings.peer_agent_url or "")
-    if not url:
-        return CircuitState.CLOSED
-    cb = await _get_circuit_breaker(url)
-    return cb.state

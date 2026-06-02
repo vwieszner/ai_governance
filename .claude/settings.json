@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(git log*)",
+      "PowerShell(git status*)",
+      "PowerShell(Get-CimInstance Win32_Process*)",
+      "PowerShell(docker ps*)",
+      "PowerShell(docker compose*)",
+      "PowerShell(docker start*)",
+      "PowerShell(docker stop*)",
+      "PowerShell(docker rm*)",
+      "PowerShell(docker logs*)",
+      "PowerShell(docker inspect*)",
+      "PowerShell(docker exec*)",
+      "PowerShell(Invoke-WebRequest*)",
+      "PowerShell(Start-Process*)",
+      "PowerShell(Stop-Process*)",
+      "PowerShell(netstat*)",
+      "PowerShell(Start-Sleep*)",
+      "PowerShell(*\\.venv\\Scripts\\python.exe*)",
+      "PowerShell(*\\.venv\\Scripts\\pip.exe*)",
+      "PowerShell(*.venv/Scripts/python.exe*)",
+      "PowerShell(npx vite*)",
+      "PowerShell(npm *)",
+      "PowerShell(Get-Content*)",
+      "PowerShell(Test-NetConnection*)",
+      "mcp__serena__find_symbol",
+      "mcp__serena__get_symbols_overview"
+    ]
+  }
+}
