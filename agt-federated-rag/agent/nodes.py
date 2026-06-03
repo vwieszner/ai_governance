@@ -133,6 +133,34 @@ async def _enforce(action: str, context: dict[str, Any]) -> None:
     log.debug("agt_policy_allowed", action=action)
 
 
+# ── Output DLP: credential-leak HARD-DENY (task #10, OWASP ASI-05) ────────────
+#
+# Post-LLM output safety control. format_response calls
+# _enforce("agent.output_check", {"llm_output": answer}) on the OUTGOING answer.
+# The `block-credential-leak-in-output` policy rule (data-access-policy.yaml,
+# priority 950) matches a tight set of structured secret formats — AWS AKIA,
+# PEM PRIVATE KEY block, OpenAI sk-…, Slack xox…, JWT eyJ…, and explicit
+# api_key/secret/password = value assignments — and DENIES on a hit; a clean
+# answer falls through to the priority-100 allow-output-check rule and passes.
+#
+# HARD-DENY (not redact): on detection the PermissionError propagates and the API
+# layer returns the generic safe message — the whole answer is withheld rather
+# than partially redacted. This is the fail-closed posture team-lead chose for
+# task #10: a partial redaction could leave a regex-evaded fragment of the secret
+# in the returned text, whereas withholding the answer cannot leak.
+#
+# This makes the previously-decorative rule LIVE (GOVERNANCE_AUDIT.md Item 3a):
+# it never fired before because no node passed `llm_output`. The check runs at
+# format_response — the single universal output choke point — so it covers BOTH
+# locally-generated AND cross-cluster peer answers (generate_answer never sees
+# peer answers, which arrive via handle_peer_result -> format_response).
+#
+# FAIL-SAFE: the patterns are deliberately tight (structured formats + explicit
+# assignments) so a legitimate answer that merely discusses infra/auth topology,
+# a retention policy, or financials — even one that uses the words "secret" or
+# "token" in prose — is NOT blocked. See the policy file for the rule rationale.
+
+
 # ── Service singletons (double-checked asyncio.Lock locking) ──────────────────
 
 _qdrant: HybridQdrantRetriever | None = None
@@ -687,5 +715,27 @@ async def format_response(state: AgentState) -> dict[str, Any]:
 
     if not answer:
         answer = status or "I could not find an answer to your query."
+
+    # Output DLP (task #10, HARD-DENY): gate the OUTGOING answer through the policy
+    # engine before it leaves the agent. This is the single universal output choke
+    # point — every terminal route (local answer AND cross-cluster peer answer)
+    # passes through here, so a peer-sourced secret is caught without trusting the
+    # peer. The `block-credential-leak-in-output` rule DENIES on a credential
+    # match; on a clean answer it passes via allow-output-check. On a hit we
+    # withhold the ENTIRE answer (fail-closed) rather than return a partial
+    # redaction. PermissionError is caught here so the user gets a clear safe
+    # message instead of the generic governance-denial.
+    try:
+        await _enforce("agent.output_check", {"llm_output": answer})
+    except PermissionError:
+        log.warning("output_credential_blocked", agt_audit=True)  # never log the answer/secret
+        return {
+            "answer": (
+                "The response was withheld because it appeared to contain sensitive "
+                "credential material. Please contact an administrator if you believe "
+                "this is an error."
+            ),
+            "status_message": "blocked_credential_leak",
+        }
 
     return {"answer": answer, "status_message": status or "completed"}

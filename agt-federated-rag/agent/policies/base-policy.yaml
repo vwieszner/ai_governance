@@ -96,3 +96,13 @@ rules:
     priority: 100
     condition: {field: action, operator: eq, value: agent.format_response}
     action: allow
+
+  # Output-DLP gate (task #10). The action is allow-listed here so a clean answer
+  # passes; the high-priority `block-credential-leak-in-output` deny rule in
+  # data-access-policy.yaml fires FIRST when the answer carries a credential,
+  # overriding this allow (priority 950 > 100). HARD-DENY posture: a detected
+  # secret aborts the whole answer (PermissionError -> generic safe message).
+  - name: allow-output-check
+    priority: 100
+    condition: {field: action, operator: eq, value: agent.output_check}
+    action: allow

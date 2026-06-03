@@ -83,8 +83,13 @@ class GraphRAGRetriever:
                 self._graph_unavailable = True
                 return None
 
+            # QUERY embedder MUST match the INGEST embedder (rag/ingest.py uses
+            # settings.embedding_model) and the chunkVector index dimension
+            # (settings.embedding_dim = 1024). The previous hardcoded
+            # "text-embedding-3-small" is 1536-dim AND is not served by the NVIDIA
+            # endpoint, so graph vector search would 404 / dimension-mismatch.
             embedder = OpenAIEmbeddings(
-                model="text-embedding-3-small",      # replaced at runtime if NVIDIA endpoint supports embeddings
+                model=settings.embedding_model,
                 base_url=settings.openai_api_base,
                 api_key=settings.openai_api_key,
             )

@@ -113,6 +113,11 @@ function Show-Status {
     }
 }
 
+# Track health so the script exits 0 only when every targeted backend is healthy
+# (start/restart). This gives a meaningful exit code for CI/automation instead of
+# leaking a stray non-zero from an internal native command.
+$allHealthy = $true
+
 switch ($Action) {
     'status' { Show-Status }
     'stop' { foreach ($n in (Resolve-Targets $Targets)) { Stop-One $n } }
@@ -120,7 +125,7 @@ switch ($Action) {
         $names = Resolve-Targets $Targets
         foreach ($n in $names) { Start-One $n }
         Start-Sleep 2
-        foreach ($n in $names) { Wait-Health $n | Out-Null }
+        foreach ($n in $names) { if (-not (Wait-Health $n)) { $allHealthy = $false } }
     }
     'restart' {
         $names = Resolve-Targets $Targets
@@ -128,6 +133,8 @@ switch ($Action) {
         Start-Sleep 2
         foreach ($n in $names) { Start-One $n }
         Start-Sleep 2
-        foreach ($n in $names) { Wait-Health $n | Out-Null }
+        foreach ($n in $names) { if (-not (Wait-Health $n)) { $allHealthy = $false } }
     }
 }
+
+if ($allHealthy) { exit 0 } else { exit 1 }

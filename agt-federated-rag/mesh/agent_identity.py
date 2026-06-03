@@ -28,6 +28,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
+import uuid
 from typing import Any
 
 import structlog
@@ -62,6 +64,20 @@ _mesh_client: AgentMeshClient | None = None
 _trust_tracker: TrustTracker | None = None
 _identity_registry: IdentityRegistry | None = None
 _lock: asyncio.Lock = asyncio.Lock()
+
+# ── Replay protection for DID-signed messages ─────────────────────────────────
+# Every signed message carries a `ts` (unix seconds) and a `nonce` (uuid4) INSIDE
+# the signed body, so both are covered by the Ed25519 signature and cannot be
+# altered by a man-in-the-middle. On verify we reject a message whose timestamp
+# is outside the freshness window OR whose (sender_did, nonce) has been seen
+# before — defeating capture-and-replay even before TLS is in front of the mesh.
+_REPLAY_MAX_AGE_SECONDS = 300          # accept messages within ±5 min of now
+_SEEN_NONCE_MAX = 50_000               # hard cap on the seen-cache (memory bound)
+# (sender_did, nonce) -> expiry_unix. A nonce need only be remembered for the
+# freshness window: once `ts` ages out, the timestamp check rejects the replay,
+# so the entry can be evicted.
+_seen_nonces: dict[tuple[str, str], float] = {}
+_seen_lock: asyncio.Lock = asyncio.Lock()
 
 
 def _canonical_bytes(payload: dict[str, Any]) -> bytes:
@@ -221,13 +237,21 @@ async def sign_outbound_message(payload: dict[str, Any]) -> dict[str, Any]:
     """
     Sign an outbound message with this agent's DID credentials.
 
-    Returns a new dict with an ``_agentmesh`` envelope holding the sender DID
-    and the Ed25519 signature over the canonical message bytes. The peer verifies
-    this with verify_signed_message() before processing.
+    Replay protection: a fresh ``ts`` (unix seconds) and ``nonce`` (uuid4) are
+    added to the body BEFORE signing, so the signature covers them and the peer
+    can reject stale or replayed messages (see verify_signed_message). Existing
+    ``ts``/``nonce`` keys are always overwritten so a caller cannot accidentally
+    (or maliciously) pin a stale value.
+
+    Returns a new dict with the freshness fields plus an ``_agentmesh`` envelope
+    holding the sender DID and the Ed25519 signature over the canonical message
+    bytes. The peer verifies this with verify_signed_message() before processing.
     """
     identity = await get_identity()
-    signature = identity.sign(_canonical_bytes(payload))
     signed = dict(payload)
+    signed["ts"] = int(time.time())
+    signed["nonce"] = str(uuid.uuid4())
+    signature = identity.sign(_canonical_bytes(signed))
     signed["_agentmesh"] = {
         "sender_did": str(identity.did),
         "signature": signature,
@@ -291,7 +315,63 @@ async def verify_signed_message(payload: dict[str, Any]) -> tuple[bool, str | No
     if not verified:
         log.warning("verify_signed_message_signature_invalid", sender_did=sender_did)
         return False, None
+
+    # ── Replay protection (signature already valid past this point) ──────────
+    # The freshness check runs AFTER signature verification so that a forged
+    # message can never insert an entry into the seen-nonce cache (which would
+    # otherwise be a memory-exhaustion / cache-poisoning vector). ts + nonce are
+    # part of the signed body, so a MITM cannot alter them without breaking the
+    # signature.
+    fresh = await _check_freshness_and_nonce(payload, sender_did)
+    if not fresh:
+        return False, None
     return True, sender_did
+
+
+async def _check_freshness_and_nonce(payload: dict[str, Any], sender_did: str) -> bool:
+    """Reject stale or replayed messages. Fail-closed on a missing/invalid ts/nonce.
+
+    A message is accepted only if (1) it carries an integer ``ts`` within
+    ±_REPLAY_MAX_AGE_SECONDS of now and (2) its (sender_did, nonce) has not been
+    seen inside that window. Must be called only AFTER the Ed25519 signature has
+    been verified, so the ts/nonce are authenticated and the cache cannot be
+    poisoned by unauthenticated callers.
+    """
+    raw_ts = payload.get("ts")
+    nonce = payload.get("nonce")
+    if not isinstance(raw_ts, int) or not isinstance(nonce, str) or not nonce:
+        log.warning("verify_signed_message_missing_freshness", sender_did=sender_did)
+        return False
+
+    now = time.time()
+    if abs(now - raw_ts) > _REPLAY_MAX_AGE_SECONDS:
+        log.warning(
+            "verify_signed_message_stale",
+            sender_did=sender_did,
+            age_seconds=round(now - raw_ts, 1),
+            max_age=_REPLAY_MAX_AGE_SECONDS,
+        )
+        return False
+
+    key = (sender_did, nonce)
+    async with _seen_lock:
+        if key in _seen_nonces and _seen_nonces[key] > now:
+            log.warning("verify_signed_message_replayed_nonce", sender_did=sender_did)
+            return False
+        # Lazy eviction of expired entries keeps the cache bounded under normal
+        # load (a nonce older than the freshness window can't be replayed anyway).
+        if len(_seen_nonces) >= _SEEN_NONCE_MAX:
+            for k in [k for k, e in _seen_nonces.items() if e <= now]:
+                _seen_nonces.pop(k, None)
+        # If still at the cap after eviction, refuse to grow unbounded — a flood
+        # of >50k distinct fresh nonces from the trusted peer inside 5 min is
+        # itself anomalous. Fail-closed (memory-exhaustion defence, ASI-08).
+        if len(_seen_nonces) >= _SEEN_NONCE_MAX:
+            log.error("verify_signed_message_nonce_cache_full", sender_did=sender_did)
+            return False
+        # Remember this nonce only for as long as its ts could still be fresh.
+        _seen_nonces[key] = now + _REPLAY_MAX_AGE_SECONDS
+    return True
 
 
 # ── Peer trust verification ───────────────────────────────────────────────────

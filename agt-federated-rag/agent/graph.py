@@ -1,9 +1,5 @@
 """LangGraph StateGraph for the AGT federated RAG agent.
 
-Wraps the compiled graph with AGT GovernanceMiddleware so every invocation
-is recorded in the AGT audit log, governed by the Agent OS policy engine,
-and traceable via AgentMesh telemetry.
-
 Authorization flow routing
 --------------------------
 After ``check_auth`` runs, ``_route`` reads the flow field and dispatches:
@@ -20,15 +16,29 @@ After ``check_auth`` runs, ``_route`` reads the flow field and dispatches:
 into state (e.g. circuit open, DID unverifiable) we short-circuit directly to
 ``format_response`` without passing through ``handle_peer_result``.
 
-GovernanceMiddleware
---------------------
-``agentmesh_integrations.langgraph.GovernanceMiddleware`` wraps every graph
-invocation.  It:
-  - Enforces the Agent OS policies before and after the graph runs.
-  - Emits a structured audit event (agt_audit=True) for every invocation.
-  - Integrates with AgentMesh trust scoring (anomalous behaviour decays score).
-  - Exposes a kill-switch: if the agent's trust score drops below the threshold
-    the middleware rejects the invocation before any node runs.
+Governance gates (what actually enforces policy)
+------------------------------------------------
+There are two ENFORCING layers, both fail-closed:
+
+  1. Per-node ``_enforce(action, ctx)`` (agent.nodes) — the primary control.
+     Every node calls it before doing any work; it evaluates the Agent OS
+     PolicyEvaluator loaded from ``settings.policy_dir`` and RAISES
+     ``PermissionError`` on a deny (default-deny: unknown action / unmatched
+     context → deny). This is what blocks oversized context, untrusted
+     collections, unverified/low-trust peers, etc.
+  2. OpenFGA per-chunk ReBAC (check_auth) — data-level authorization.
+
+``run_query`` additionally calls ``govern_action("agent.graph.invoke", ...)``
+(AgentMesh ``AgentMeshClient.execute_with_governance``) and raises if it returns
+``allowed=False``. This is wired as a DEFENCE-IN-DEPTH / audit hook, NOT a
+working kill-switch: ``get_mesh()`` constructs the client with no policy YAML, so
+the library loads its built-in allow-all baseline and the gate can never deny
+(and the client's own trust score only ever rises). The named
+``GovernanceMiddleware`` from earlier designs is NOT used here. A real
+trust-based kill-switch would require an agentmesh-format policy with a concrete
+threshold AND a downward trust signal — a design change tracked separately, not
+something this gate provides today. The data-path controls above remain
+fail-closed regardless.
 
 Compiled graph singleton
 ------------------------

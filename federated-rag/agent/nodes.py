@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import re
 import uuid
 from typing import Any
 
@@ -68,6 +69,57 @@ _delegated_token_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
 def set_user_token(token: str) -> None:
     """Called once per request (in run_query) before the graph is invoked."""
     _user_token_ctx.set(token)
+
+
+# ── Output DLP: credential-leak HARD-DENY (task #10, OWASP ASI-05) ────────────
+#
+# Post-LLM output safety control. Scans the final answer for credential/secret
+# material; on a hit the ENTIRE answer is withheld (replaced with a generic safe
+# message) before it leaves the agent — never returned partially redacted. This
+# is the fail-closed posture chosen for task #10: a partial redaction could leave
+# a regex-evaded fragment of the secret in the returned text; withholding cannot.
+# Applied at format_response — the single universal output choke point that every
+# terminal route (local answer AND cross-cluster peer answer) passes through.
+#
+# This solution intentionally has NO dependency on the AGT governance toolkit
+# (agent_os / agentmesh), so the detection is a small self-contained scanner. The
+# pattern set is kept BYTE-IDENTICAL to the AGT solution's
+# `block-credential-leak-in-output` policy regex (agt-federated-rag/agent/policies/
+# data-access-policy.yaml) so both solutions block exactly the same secret formats.
+# Keep the two in sync if either changes.
+#
+# TIGHT patterns (fail-safe is non-negotiable — must NOT block a legitimate
+# answer): each branch is a specific, structured secret format. The
+# api_key/secret/password branch requires an explicit `= value` / `: value`
+# assignment, so a legitimate answer that merely discusses infra/auth topology, a
+# retention policy, or financials — even one that uses the words "secret"/"token"
+# in prose — is NOT blocked. PII (emails / IPs / SSNs) is deliberately not matched.
+_CREDENTIAL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("pem_private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("openai_api_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b")),
+    (
+        "key_assignment",
+        re.compile(
+            r"(?i)\b(?:api[_-]?key|client[_-]?secret|secret|password)\b\s*[:=]\s*\S{6,}"
+        ),
+    ),
+]
+
+# Generic message returned in place of any answer that trips a credential pattern.
+_CREDENTIAL_BLOCK_MESSAGE = (
+    "The response was withheld because it appeared to contain sensitive credential "
+    "material. Please contact an administrator if you believe this is an error."
+)
+
+
+def detect_credentials(answer: str | None) -> list[str]:
+    """Return the names of any credential patterns found in the answer (else [])."""
+    if not answer:
+        return []
+    return [name for name, pattern in _CREDENTIAL_PATTERNS if pattern.search(answer)]
 
 
 # ── Async-safe singletons (H-2 + S-8) ────────────────────────────────────────
@@ -547,5 +599,23 @@ async def format_response(state: AgentState) -> dict[str, Any]:
         }
     if not answer:
         answer = status or "I could not find an answer to your query."
+
+    # Output DLP (task #10, HARD-DENY): scan the OUTGOING answer for credential
+    # material before it leaves the agent. This is the single universal output
+    # choke point — every terminal route (local answer AND cross-cluster peer
+    # answer) passes through here, so a peer-sourced secret is caught without
+    # trusting the peer. On a hit, withhold the ENTIRE answer (fail-closed) rather
+    # than return a partial redaction that might leak a regex-evaded fragment.
+    detected = detect_credentials(answer)
+    if detected:
+        log.warning(
+            "output_credential_blocked",
+            credential_types=detected,   # type names only — never the secret value
+            count=len(detected),
+        )
+        return {
+            "answer": _CREDENTIAL_BLOCK_MESSAGE,
+            "status_message": "blocked_credential_leak",
+        }
 
     return {"answer": answer, "status_message": status or "completed"}

@@ -3,17 +3,27 @@
 #
 # OWASP coverage:
 #   ASI-02 Excessive Capabilities — chunk count cap, query length guard
-#   ASI-05 Insecure Output        — credential pattern blocking in LLM output
+#   ASI-05 Insecure Output        — block credential leak in LLM output
+#                                   (live: format_response passes llm_output to
+#                                    the policy gate; hard-deny on a match)
 #   ASI-06 Memory Poisoning       — block retrieval from untrusted collections
 version: "1.0"
 name: data-access-policy
 description: Governs retrieval scope and LLM context for the agent.
 
-# Data-access actions inherit allow at this layer; per-chunk authorization is
-# enforced separately and more deeply by OpenFGA (ReBAC). The rules below add
-# input-validation and output-safety guard-rails on top.
+# Per-chunk authorization is enforced separately and more deeply by OpenFGA
+# (ReBAC); the rules below add input-validation and output-safety guard-rails on
+# top. Each governed data-access action is explicitly allow-listed in
+# base-policy.yaml, so this document only needs to carry its DENY guard-rails.
+#
+# FAIL-CLOSED: default is deny. The PolicyEvaluator applies the default action of
+# policies[0] (the first file loaded — base-policy.yaml sorts first) when no rule
+# matches, so today the effective global default is base-policy's deny. Declaring
+# deny here too removes the latent fail-open if file load order ever changes
+# (e.g. a new policy file sorting before "base-", or this file being renamed):
+# every policy document in the directory must agree on deny-by-default.
 defaults:
-  action: allow
+  action: deny
 
 rules:
   # ── Query input validation (ASI-02) ──────────────────────────────────────
@@ -69,11 +79,25 @@ rules:
     message: "LLM context exceeds the token budget — truncation required"
 
   # ── Block credential leakage in outbound LLM output (ASI-05) ─────────────
+  # LIVE (task #10): agent.nodes.format_response calls
+  # _enforce("agent.output_check", {"llm_output": answer}) on the OUTGOING answer
+  # — covering BOTH locally-generated and cross-cluster peer answers — so this
+  # rule actually fires (previously decorative, GOVERNANCE_AUDIT.md Item 3a: no
+  # node passed `llm_output`). HARD-DENY posture: on a match the node lets the
+  # PermissionError propagate and returns a generic safe message — the whole
+  # answer is withheld rather than partially redacted (avoids regex-evaded
+  # partial leakage). Priority 950 beats the priority-100 allow-output-check rule.
+  #
+  # TIGHT patterns (fail-safe is non-negotiable — must NOT block a legitimate
+  # answer): each branch is a specific, structured secret format, not a loose
+  # keyword. The `(api_key|secret|password) = value` branch requires an explicit
+  # assignment so prose that merely mentions the words "secret"/"token" (common in
+  # this RAG corpus of infra / auth / retention docs) is NOT blocked.
   - name: block-credential-leak-in-output
     priority: 950
     condition:
       field: llm_output
       operator: matches
-      value: "(PRIVATE KEY|BEGIN RSA|sk-[A-Za-z0-9]{32,}|xoxb-[A-Za-z0-9-]+)"
+      value: "(?i)(AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\\bsk-[A-Za-z0-9]{20,}\\b|\\bxox[baprs]-[A-Za-z0-9-]{10,}\\b|\\beyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}\\b|\\b(?:api[_-]?key|client[_-]?secret|secret|password)\\b\\s*[:=]\\s*\\S{6,})"
     action: deny
     message: "Potential credential or API key detected in LLM output"

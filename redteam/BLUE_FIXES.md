@@ -97,3 +97,89 @@ authorization invariant of the system holding: `pending_approval` does not grant
 `redteam/probe_lib.py` holds the shared helpers (token mint, `alg:none` / tamper forgery, SSE
 collection); `redteam/run_probes.py` is the runner. The probes never modify backend source — they
 only send HTTP and classify the response.
+
+---
+
+# Round 2 — deeper probe + governance audit (2026-06-04)
+
+Driven by the standing goal "continuously fix and check; security & agent-governance top priority."
+Round 2 = a deeper red-team probe (`redteam/run_probes_r2.py`) + a full agent-governance correctness
+audit (`redteam/GOVERNANCE_AUDIT.md`). **Result: 0 open bypasses; 1 real code-level vuln found &
+fixed (replay); 2 governance GAPs fixed; remaining findings bounded/documented.** Every fix below was
+re-verified by team-lead (restart + empirical re-test), not taken on report.
+
+## R2-A — Signed-message replay (AGT DID transport) — REAL, FIXED, VERIFIED
+- **Found** (sec-redteam R2-4, confirmed by team-lead): the DID-signed `/a2a/query` + `/callback`
+  payload had **no nonce/timestamp** and `verify_signed_message` kept no replay cache. A captured
+  valid signed message could be replayed and re-execute (re-run RAG+LLM, re-touch approval state).
+  Bounded (needs network capture; mitigated further by TLS in prod) but a genuine gap.
+- **Fixed** (agt-eng, `agt-federated-rag/mesh/agent_identity.py`): `sign_outbound_message` injects a
+  fresh `ts`+`nonce` **into the signed body** (covered by the Ed25519 signature, so a MITM can't
+  alter them). `verify_signed_message` → `_check_freshness_and_nonce` rejects messages outside
+  ±300 s or whose `(sender_did,nonce)` is already in a bounded (50 k, fail-closed) TTL cache. The
+  freshness check runs **after** signature verification, so a forged message can't poison the cache.
+- **Verified** (team-lead, end-to-end at the live endpoint via `agt-federated-rag/_repro_replay.py`):
+  sign a real `/a2a/query` as cluster-a, POST the byte-identical message to cluster-b twice →
+  `1st = HTTP 200` (answer), `2nd = HTTP 401`. Plus all 4 AGT flows green after the change (Temporal
+  callback retries re-sign fresh, so legit retries aren't false-flagged).
+
+## R2-B — Governance deny-by-default was load-order-fragile — FIXED, VERIFIED
+- **Found** (team-lead, confirmed by gov-auditor Item 3): the Agent-OS engine's global default is
+  `policies[0].defaults.action`, and policy files load alphabetically. `base-policy.yaml` (deny)
+  wins **today**, but `data-access-policy.yaml` declared `defaults: allow` — a latent fail-open if any
+  file ever sorted before `base-`.
+- **Fixed** (gov-auditor, `agt-federated-rag/agent/policies/data-access-policy.yaml`): `defaults.action:
+  allow → deny`. Now every policy file is deny-by-default, so the invariant no longer hinges on
+  filename sort order.
+- **Verified** (team-lead, real `PolicyEvaluator` over on-disk policies): unknown action → deny,
+  empty context → deny, all 7 governed actions → allow (their explicit allow rules live in
+  `base-policy.yaml`, not the data-access file, so the flip can't deny a legit action). Engine also
+  fails closed on internal exception. 4 AGT flows green after restart — zero regression.
+
+## R2-C — Decorative graph-level "kill-switch" — docstring corrected (NOT a data-path hole)
+- gov-auditor (Item 2): the `govern_action("agent.graph.invoke")` gate is non-functional — the mesh
+  client is built with no policy (library allow-all baseline) and self-trust only rises. It is
+  **defense-in-depth/audit, not an access-control path** (real controls = per-node `_enforce`
+  default-deny + OpenFGA per-chunk ReBAC, both verified fail-closed). Fix = corrected the false
+  docstring in `agent/graph.py`; a genuine self-trust kill-switch is flagged as a design item (not
+  faked, since self-trust starts 0.5 < the 0.6 threshold and only climbs). Also documented 4
+  decorative DENY rules (YAML field vs `_enforce`-context name mismatch) — none a data-path fail-open.
+
+## R2-D — Output credential-leak DLP — IMPLEMENTED (HARD-DENY), VERIFIED
+- **Found** (sec-redteam R2-8 + gov-auditor Item 3a): the declared `block-credential-leak-in-output`
+  rule never fired — no node passed `llm_output`, so the output DLP control was decorative.
+- **Fixed** (gov-auditor, both solutions): a real post-LLM credential scanner wired into
+  **`format_response`** — the single universal output choke point, so it covers BOTH locally-generated
+  AND **cross-cluster peer** answers (a `generate_answer`-only hook would let a peer-sourced secret
+  through). **HARD-DENY** posture (team-lead's call): on a credential hit the ENTIRE answer is withheld
+  and replaced with a generic safe message — never partially redacted (a partial redaction could leak
+  a regex-evaded fragment). AGT routes through the restored `block-credential-leak-in-output` policy
+  rule via `_enforce("agent.output_check", {"llm_output": answer})` (the formerly-decorative rule is
+  now LIVE); A2A uses a self-contained `detect_credentials()` (no agent_os dependency). Both use the
+  **identical tight-6** pattern set — AKIA, PEM header, `sk-…`, `xox…`, JWT, `(api_key|client_secret|
+  secret|password) [:=] value`. Patterns are deliberately tight (structured formats, key=value
+  requires an explicit assignment) so prose that merely mentions "secret"/"token"/"password" is not
+  blocked — non-negotiable fail-safe under hard-deny.
+- **Verified** (team-lead, after a clean all-4 restart): all 6 vectors BLOCK in BOTH solutions via the
+  exact functions `format_response` calls (A2A `detect_credentials`, AGT policy `agent.output_check`);
+  a realistic clean answer ("secrets rotated quarterly", Cilium/ALB topology, "token bucket 60/min",
+  "provide your password to the IdP") PASSES in both. Live: AGT flows A/B/C/D and A2A flow A all
+  return full normal answers — no false-positive blocking. PARITY confirmed (byte-identical tight-6).
+  _(Note: an intermediate redact implementation was built and discarded in favour of hard-deny; the
+  final state is hard-deny, tight-6, consistent across both solutions.)_
+
+## R2-E — Audience confusion — BOUNDED, documented (production hardening, not an app bypass)
+- One `rag-ui` token carries `aud=[all 4 backend client_ids]`, so it authenticates to every cluster
+  of both solutions (root cause: the test-enablement Keycloak audience mappers added so the demo
+  login can reach AGT). **No privilege gain** — every endpoint re-enforces authorization on `sub`
+  (OpenFGA), `azp` (A2A callback allowlist), or DID signature (AGT peer paths); token acceptance
+  alone grants nothing. App-layer audience checks are correct. **Production fix = IdP audience
+  hygiene** (scope tokens per cluster / RFC 8693 token-exchange), tracked in the deployment-readiness
+  notes — not an application-code change.
+
+## Re-probe / reproduce round 2
+```powershell
+.\scripts\clusters.ps1 status                              # all 4 up
+.venv\Scripts\python.exe redteam\run_probes_r2.py          # deeper vectors -> RED_FINDINGS.md "Round 2"
+# replay (from agt-federated-rag, RAG_ENV_FILE=.env): ..\.venv\Scripts\python.exe _repro_replay.py
+```

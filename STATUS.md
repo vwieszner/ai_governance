@@ -1,11 +1,15 @@
 # Project Status — Federated RAG (resume notes)
 
-_Last updated: 2026-06-03. Read this first when resuming._
+_Last updated: 2026-06-04. Read this first when resuming._
 
 ## TL;DR
-Two federated-RAG solutions in this repo, each meant to run as **two clusters that federate**:
+Two federated-RAG solutions in this repo, each running as **two clusters that federate**:
 1. **A2A** = `federated-rag/` — A2A protocol + RFC 8693 token exchange. **WORKING: all 4 flows pass.**
-2. **AGT** = `agt-federated-rag/` — Microsoft AGT / AgentMesh DID governance. **PARTIAL: local flows work; cross-cluster (C/D) needs more work — see "AGT open issues".**
+2. **AGT** = `agt-federated-rag/` — Microsoft AGT / AgentMesh DID governance. **WORKING: all 4 flows pass** over a real DID-signed HTTP `/a2a/query` transport (verified 2026-06-04 with real content + cross-hop logs).
+
+LLM = `meta/llama-3.3-70b-instruct` (reliable ~8s; the prior `z-ai/glm-5.1` cold-started ~184s and timed out). Configurable via `LLM_MODEL`.
+Adversarial security pass (round 1): **43 DEFENDED / 0 VULNERABLE / 4 EXPECTED** — see `redteam/`.
+Shipped: commit `21d1bfd` on `origin/main`. Round-2 hardening (deeper probes + governance audit + GraphRAG embedder fix) in progress.
 
 Architecture principle (corrected mid-project): **one codebase = two clusters**, selected by the
 `RAG_ENV_FILE` env var (`.env` = cluster-a, `.env.cluster-b` = cluster-b). The two *directories*
