@@ -366,10 +366,24 @@ app.add_middleware(
 
 # ── Dependency: validate bearer token ─────────────────────────────────────────
 
-async def get_token_claims(authorization: str = Header(...)) -> dict[str, Any]:
+async def get_token_claims(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    # SEC: a MISSING Authorization header must be 401 (RFC 7235), not FastAPI's
+    # default 422 for a required header. Declaring it Optional and checking here
+    # makes "missing" and "malformed" both fail closed with the same 401, and
+    # lets us emit a WWW-Authenticate challenge.
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token:
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     try:
         claims = await validate_token(token)
         # LOW-5: reject tokens that lack a `sub` claim — an empty user_id would

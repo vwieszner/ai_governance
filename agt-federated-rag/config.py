@@ -1,12 +1,18 @@
 """Central configuration — loaded once at startup from environment / .env file."""
 from __future__ import annotations
 
+import os
+
 from pydantic import AnyHttpUrl, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# RAG_ENV_FILE selects which env file to load, so the SAME codebase runs as two
+# federated AGT clusters (cluster-a -> .env, cluster-b -> .env.cluster-b).
+_ENV_FILE = os.environ.get("RAG_ENV_FILE", ".env")
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
     # ── Cluster identity ──────────────────────────────────────────────────────
     cluster_id: str = "cluster-a"
@@ -20,7 +26,7 @@ class Settings(BaseSettings):
     # ── LLM ───────────────────────────────────────────────────────────────────
     openai_api_base: str = "https://integrate.api.nvidia.com/v1"
     openai_api_key: str = Field(default=...)  # REQUIRED
-    llm_model: str = "nvidia/llama-3.1-nemotron-70b-instruct"
+    llm_model: str = "meta/llama-3.3-70b-instruct"
     llm_temperature: float = 0.0
     llm_max_tokens: int = 2048
     # Generous timeout + retries for the slow NVIDIA cold-connect (see federated-rag).

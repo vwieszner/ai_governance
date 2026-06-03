@@ -155,7 +155,7 @@ async def _get_qdrant() -> HybridQdrantRetriever:
     async with _qdrant_lock:
         if _qdrant is None:
             inst = HybridQdrantRetriever()
-            await inst._init()
+            await inst.ensure_collection()  # idempotent; matches the retriever API
             _qdrant = inst
     return _qdrant
 
@@ -236,8 +236,12 @@ async def retrieve_local(state: AgentState) -> dict[str, Any]:
     log.debug("node_retrieve_local", query_len=len(state["query"]))
     query = state["query"]
 
+    # Retrieve WITHOUT an ACL pre-filter (allowed_chunk_ids=None): per-chunk
+    # authorization is decided next in check_auth via OpenFGA. Passing an empty
+    # list here would build a MatchAny(any=[]) filter that matches zero points,
+    # silently returning no results (the cause of the empty-answer bug).
     qdrant_results, graph_results = await asyncio.gather(
-        (await _get_qdrant()).retrieve(query, allowed_chunk_ids=[]),
+        (await _get_qdrant()).retrieve(query),
         (await _get_graph()).retrieve_context(query),
     )
 

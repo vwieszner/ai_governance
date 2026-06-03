@@ -64,8 +64,14 @@ class GraphRAGRetriever:
             try:
                 import neo4j  # type: ignore[import]
                 from fastembed import TextEmbedding  # type: ignore[import]
-                from neo4j_graphrag.embeddings import BaseEmbedder  # type: ignore[import]
                 from neo4j_graphrag.retrievers import VectorRetriever  # type: ignore[import]
+                # neo4j-graphrag renamed the embedder base class from
+                # ``BaseEmbedder`` to ``Embedder``; accept either so the code
+                # works across library versions.
+                try:
+                    from neo4j_graphrag.embeddings import Embedder as BaseEmbedder  # type: ignore[import]
+                except ImportError:  # older library exposes BaseEmbedder
+                    from neo4j_graphrag.embeddings import BaseEmbedder  # type: ignore[import]
             except ImportError as exc:
                 raise RuntimeError(
                     "neo4j, neo4j-graphrag, and fastembed are required. "

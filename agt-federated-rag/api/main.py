@@ -343,11 +343,25 @@ def _build_agent_card(agent_did: str) -> dict[str, Any]:
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
 
-async def _get_bearer_token(authorization: str) -> tuple[str, dict[str, Any]]:
+async def _get_bearer_token(authorization: str | None) -> tuple[str, dict[str, Any]]:
     """Parse Authorization header, validate JWT, return (raw_token, claims)."""
+    # A wholly-absent Authorization header must fail closed with 401 (not 422).
+    # The param is Optional at the route layer so FastAPI doesn't 422 before this
+    # handler runs; the None-guard must precede .partition() (which AttributeErrors
+    # on None). RFC 6750: a 401 challenge carries WWW-Authenticate: Bearer.
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token:
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     try:
         claims = await validate_token(token)
@@ -487,7 +501,7 @@ async def identity() -> dict[str, Any]:
 @app.post("/query", response_class=EventSourceResponse)
 async def query(
     request: Request,
-    authorization: str = Header(...),
+    authorization: str | None = Header(default=None),
 ) -> EventSourceResponse:
     """Main query endpoint — streams results as Server-Sent Events.
 
@@ -590,6 +604,148 @@ async def query(
         yield {"event": "done", "data": "{}"}
 
     return EventSourceResponse(event_stream())
+
+
+# ── POST /a2a/query ───────────────────────────────────────────────────────────
+
+@app.post("/a2a/query")
+async def a2a_query(request: Request) -> JSONResponse:
+    """Cross-cluster peer query endpoint — DID-authenticated, not user-JWT.
+
+    This is the receiving side of the AgentMesh federation transport. The peer
+    cluster's mesh.peer_client.call_peer_agent() POSTs a DID-signed query here.
+
+    Auth (peer-to-peer): there is NO user bearer token on this path. The request
+    is authenticated by the Ed25519 signature in the ``_agentmesh`` envelope,
+    verified by verify_signed_message() against the peer's PUBLIC key from
+    trusted config (settings.peer_agent_public_jwk) — never from the body. The
+    verified signer must equal the configured PEER_AGENT_DID. A request whose
+    signature does not verify is rejected with 401.
+
+    Delegated authorization: the ``user_id`` is read from the *signed* payload
+    (so it cannot be forged) and the SAME governed pipeline as /query runs with
+    that user_id. OpenFGA therefore re-decides the delegated user's access to
+    THIS cluster's data — the peer does not bypass authorization, it only
+    vouches for the user's identity. The raw user JWT is never forwarded.
+
+    Response: a DID-SIGNED JSON object (sign_outbound_message) so the caller can
+    verify it came from this cluster's private key. Shape:
+        {status, answer, task_id, approval_request_id, _agentmesh}
+    where status ∈ {"completed", "input_required", "failed"}.
+    """
+    # Parse body
+    try:
+        payload: dict[str, Any] = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body must be valid JSON")
+
+    # ── DID authentication: verify the Ed25519 signature on the payload ──────
+    sig_verified, signer_did = await agent_identity.verify_signed_message(payload)
+    if not sig_verified or not signer_did:
+        log.warning("a2a_query_signature_invalid")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing AgentMesh message signature",
+        )
+
+    # Registry trust-score gate on the verified signer (defence in depth).
+    verified, trust_score = await agent_identity.verify_peer_identity(signer_did)
+    if not verified or trust_score < settings.agent_trust_threshold:
+        log.warning(
+            "a2a_query_peer_identity_rejected",
+            signer_did=signer_did,
+            trust_score=trust_score,
+        )
+        raise HTTPException(status_code=403, detail="Peer identity verification failed")
+
+    # The verified signer must be the configured peer.
+    if settings.peer_agent_did and signer_did != settings.peer_agent_did:
+        log.warning(
+            "a2a_query_unexpected_peer_did",
+            signer_did=signer_did,
+            expected_did=settings.peer_agent_did,
+        )
+        raise HTTPException(status_code=403, detail="Sender DID does not match configured peer")
+
+    # ── Extract the delegated query from the SIGNED payload ──────────────────
+    raw_query = payload.get("query", "")
+    if not isinstance(raw_query, str) or not raw_query.strip():
+        raise HTTPException(status_code=400, detail="'query' field must be a non-empty string")
+    if len(raw_query) > settings.max_query_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Query exceeds maximum length of {settings.max_query_length} characters",
+        )
+
+    # user_id is trusted because the message is DID-signed by the verified peer.
+    user_id = str(payload.get("user_id", "")).strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Signed payload missing 'user_id'")
+
+    context_id = str(payload.get("context_id", "")) or str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
+
+    log.info(
+        "a2a_query_received",
+        signer_did=signer_did,
+        trust_score=trust_score,
+        user_id=user_id,
+    )
+
+    # ── Run the SAME governed pipeline as /query ─────────────────────────────
+    # No user JWT on this path — the peer vouches for user_id and OpenFGA on
+    # THIS cluster re-checks the delegated user's access to local data.
+    try:
+        result = await agent_graph.run_query(
+            query=raw_query,
+            user_id=user_id,
+            user_token="",        # peer-to-peer: no user bearer token to forward
+            task_id=task_id,
+            context_id=context_id,
+        )
+    except PermissionError as exc:
+        log.warning("a2a_query_governance_denied", task_id=task_id, error=str(exc))
+        result = {
+            "answer": "",
+            "status_message": "denied",
+            "approval_request_id": None,
+            "task_id": task_id,
+        }
+    except Exception as exc:
+        log.error("a2a_query_run_failed", task_id=task_id, error=str(exc))
+        result = {
+            "answer": "",
+            "status_message": "failed",
+            "approval_request_id": None,
+            "task_id": task_id,
+        }
+
+    # ── Map the pipeline outcome to a peer-protocol status ───────────────────
+    # approval_request_id is checked FIRST: format_response overwrites a None
+    # answer with the status_message, so the pending-approval case (flow B/D on
+    # this cluster) returns a non-empty answer — keying on answer-presence would
+    # misclassify it as completed.
+    approval_request_id = result.get("approval_request_id")
+    status_message = result.get("status_message", "")
+    answer = result.get("answer") or ""
+    if approval_request_id:
+        peer_status = "input_required"
+    elif status_message == "completed" and answer:
+        peer_status = "completed"
+    else:
+        peer_status = "failed"
+
+    response_payload: dict[str, Any] = {
+        "status": peer_status,
+        "answer": answer if peer_status == "completed" else None,
+        "task_id": result.get("task_id", task_id),
+        "approval_request_id": approval_request_id,
+    }
+
+    # Sign the response so the caller can verify it came from this cluster.
+    signed_response = await agent_identity.sign_outbound_message(response_payload)
+    log.info("a2a_query_responding", task_id=task_id, status=peer_status)
+    return JSONResponse(content=signed_response)
 
 
 # ── POST /tasks/{task_id}/callback ────────────────────────────────────────────

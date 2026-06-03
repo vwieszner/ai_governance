@@ -51,7 +51,10 @@ rules:
     condition:
       field: qdrant_collection
       operator: not_in
-      value: [knowledge_base]   # extend with additional trusted collections
+      # Trusted collections. The two federated AGT clusters each own a distinct
+      # per-cluster collection (cluster-a -> _agt_a, cluster-b -> _agt_b); both
+      # are first-party knowledge bases provisioned by setup_agt.py.
+      value: [knowledge_base, knowledge_base_agt_a, knowledge_base_agt_b]
     action: deny
     message: "Retrieval from an untrusted Qdrant collection blocked"
 

@@ -3,15 +3,29 @@
 ## What this is
 
 A production-quality, secure **federated Retrieval-Augmented Generation (RAG)** system that
-demonstrates real AI governance: two independent FastAPI agents — each with its own vector
-store, knowledge graph, and identity — collaborate to answer a user's question **without ever
-sharing raw data**. Every chunk of knowledge is access-controlled per user (relationship-based
-authorization), sensitive answers are gated behind **human approval** workflows, and when one
-cluster needs the other's data the user's identity is **cryptographically delegated** across the
-trust boundary (RFC 8693 token exchange) over a **DID-signed agent-to-agent** channel. A
-side-by-side React UI shows both users at once with a live monitor of the agent communication.
-Nothing is mocked — real Keycloak, OpenFGA, Temporal, Qdrant, Neo4j and an NVIDIA-hosted LLM
-are wired in end to end.
+demonstrates real AI governance: the same agent codebase runs as **two federated clusters** —
+each with its own knowledge collection and authorization scope — that collaborate to answer a
+user's question **without ever sharing raw data**. Every chunk of knowledge is access-controlled
+per user (relationship-based authorization), sensitive answers are gated behind **human approval**
+workflows, and when one cluster needs the other's data the user's identity is **cryptographically
+delegated** across the trust boundary via **RFC 8693 token exchange** and an **A2A** (agent-to-agent)
+call. A side-by-side React UI shows both users at once with a live monitor of the agent
+communication. Nothing is mocked — real Keycloak, OpenFGA, Temporal, Qdrant, Neo4j and an
+NVIDIA-hosted LLM are wired in end to end.
+
+> **One concept, two clusters — and two independent federations.** Each solution is a *single*
+> codebase that runs as **two federating clusters**, selected by the `RAG_ENV_FILE` environment
+> variable (`.env` = cluster-a, `.env.cluster-b` = cluster-b):
+>
+> - **`federated-rag/`** (ports 8000 / 8002) — the **A2A** federation: cross-cluster delegation via
+>   **RFC 8693** OAuth token exchange and the **A2A** protocol.
+> - **`agt-federated-rag/`** (ports 8010 / 8012) — the **AGT / AgentMesh** federation: the *same*
+>   four governance flows, but cross-cluster trust is built on **DID identities with per-message
+>   Ed25519 signatures** over a real HTTP `/a2a/query` transport, with the AgentMesh governance
+>   engine deciding each agent action.
+>
+> The two directories are two *different governance approaches* to the same problem, each a complete
+> two-cluster federation — not two halves of one system.
 
 ---
 
@@ -29,11 +43,11 @@ are wired in end to end.
                                  │ (login via Keycloak OIDC) │
                 ┌────────────────▼──────────┐   ┌────────────▼─────────────────┐
                 │  Cluster A                 │   │  Cluster B                    │
-                │  federated-rag/  :8000     │   │  agt-federated-rag/  :8002    │
-                │  A2A protocol              │◀─▶│  AGT / AgentMesh DID identity │
-                │  FastAPI + LangGraph       │A2A│  FastAPI + LangGraph          │
-                │                            │   │  + GovernanceMiddleware       │
-                │  RFC 8693 token exchange   │   │  Ed25519 DID-signed callbacks │
+                │  federated-rag/  :8000     │   │  federated-rag/  :8002         │
+                │  RAG_ENV_FILE=.env         │◀─▶│  RAG_ENV_FILE=.env.cluster-b  │
+                │  FastAPI + LangGraph       │A2A│  FastAPI + LangGraph           │
+                │  A2A protocol              │   │  A2A protocol                  │
+                │  RFC 8693 token exchange   │   │  (same codebase, cfg differs) │
                 └─────────────┬──────────────┘   └─────────────┬────────────────┘
                               │      both clusters share one    │
                               ▼      governed infrastructure     ▼
@@ -50,9 +64,9 @@ are wired in end to end.
    └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Keycloak, OpenFGA, Temporal and Postgres run from `docker-compose.yml`. Qdrant, Neo4j and Redis
-are existing host containers (`claude-qdrant`, `claude-neo4j`, `storyteller-redis-1`) re-seeded by
-`setup_all.py`.
+Keycloak, OpenFGA, Temporal and Postgres run from `docker-compose.yml` (loopback-only binds,
+preshared-key auth on OpenFGA, no default passwords). Qdrant, Neo4j and Redis are existing host
+containers (`claude-qdrant`, `claude-neo4j`, `storyteller-redis-1`) re-seeded by `setup_all.py`.
 
 ---
 
@@ -73,10 +87,11 @@ This demo exists to make four governance controls concrete and observable:
   mint a delegated token whose audience is the peer agent's client ID, then calls the peer on the
   user's behalf. The peer re-evaluates authorization for the delegated identity — data stays put,
   only the answer crosses.
-- **DID-signed agent-to-agent (A2A).** Cluster B (`agt-federated-rag`) holds a permanent
-  AgentMesh Ed25519 **DID identity**. Inbound peer callbacks are verified against a trusted,
-  out-of-band public key; cross-cluster callbacks are also gated by an OAuth `client_id` allowlist
-  and an `awaiting_peer_callback` flag so a callback can't be forged or replayed.
+- **Hardened agent-to-agent (A2A) callbacks.** Cross-cluster push callbacks are gated by an OAuth
+  `client_id` allowlist *and* an `awaiting_peer_callback` flag set only when the outbound peer call
+  was made, so a callback can't be forged, replayed, or target a task the peer never participated in.
+  (The separate `agt-federated-rag/` variant additionally signs callbacks with an Ed25519 DID — see
+  that directory for the AgentMesh approach.)
 
 The orchestration is a **LangGraph** state machine
 (`retrieve_local → check_auth → {generate_answer | start_approval | call_peer_agent} →
@@ -113,11 +128,11 @@ The matching OpenFGA tuples are seeded by `setup_all.py` (its summary prints **6
 | Cross-cluster identity | **RFC 8693 Token Exchange** | Delegate the user's identity to the peer agent |
 | Vector retrieval | **Qdrant + FastEmbed** | Hybrid `BAAI/bge-large-en-v1.5` dense + `Qdrant/bm25` sparse, server-side RRF |
 | Graph retrieval | **Neo4j GraphRAG** | Entity-graph context (embeddings: `nvidia/nv-embedqa-e5-v5`) |
-| Agent governance | **AGT / AgentMesh** (Cluster B) | DID identity, GovernanceMiddleware, trust scoring, SRE/SLO |
+| Agent governance | **AGT / AgentMesh** (the `agt-federated-rag/` federation) | DID identity, per-message Ed25519 signing, registry trust, governed actions |
 | Inter-agent protocol | **A2A** | Typed `AgentCard` / `Task` / status-update messaging between clusters |
 | API | **FastAPI** | Both backends; SSE streaming |
 | Frontend | **React + Vite** | Side-by-side dual-user UI with live agent monitor |
-| LLM | **NVIDIA NIM — `z-ai/glm-5.1`** (GLM-5.1) | Answer generation (OpenAI-compatible endpoint) |
+| LLM | **NVIDIA NIM — `meta/llama-3.3-70b-instruct`** (configurable via `LLM_MODEL`) | Answer generation (any OpenAI-compatible model/endpoint) |
 
 ---
 
@@ -131,19 +146,28 @@ docker compose up -d
 #    plus the existing host containers for vectors/graph/cache:
 docker start claude-qdrant claude-neo4j storyteller-redis-1
 
-# 2. Create OpenFGA store, Keycloak realm + users, ingest docs, seed tuples  (~30s, prints 6/6 PASS)
-.venv\Scripts\python.exe setup_all.py --no-neo4j
+# 2. Generate secrets (random infra passwords, OpenFGA token, HMAC keys) into a gitignored .env
+.venv\Scripts\python.exe init_secrets.py          # needs NVIDIA_API_KEY in your environment
 
-# 3. Launch both backends + Temporal workers + UI
-.\launch_all.ps1
+# 3a. A2A federation: OpenFGA store, Keycloak realm + users, ingest, seed tuples  (~30s, 6/6 PASS)
+.venv\Scripts\python.exe setup_all.py --no-neo4j
+# 3b. AGT federation: DID identities, AGT clients, ingest, seed tuples            (~30s, 6/6 PASS)
+.venv\Scripts\python.exe setup_agt.py --no-neo4j
+
+# 4. Start the backends. scripts/clusters.ps1 manages all four by name and persists across turns:
+.\scripts\clusters.ps1 start a2a-a a2a-b agt-a agt-b   # or: .\scripts\clusters.ps1 start all
+.\scripts\clusters.ps1 status                          # health of all four + the UI
+#    (launch_all.ps1 also starts the A2A backends + workers + UI in one shot.)
 ```
 
-Then open **http://localhost:5173** and log in: **alice / demo** (left, Cluster A) and
-**bob / demo** (right, Cluster B). Stop everything with `.\launch_all.ps1 -Stop`.
+Then open **http://localhost:5173** and log in: **alice / demo** (left, cluster-a `:8000`) and
+**bob / demo** (right, cluster-b `:8002`). The UI drives the **A2A** federation; the **AGT**
+federation (`:8010` / `:8012`) is exercised via its `POST /query` SSE endpoint (see
+`agt-federated-rag/_repro_agt.py`). Stop everything with `.\scripts\clusters.ps1 stop all`.
 
-> **Known issue:** `launch_all.ps1` still health-checks Cluster B on the retired port 8001 and
-> aborts before starting the UI. The backends are already running by then — just start the UI
-> manually. See **Troubleshooting** below.
+> **Note:** after running `setup_all.py` / `setup_agt.py` (which rotate that solution's OpenFGA
+> store id), restart that solution's backends so they pick up the new store —
+> `.\scripts\clusters.ps1 restart a2a-a a2a-b` (or `agt-a agt-b`).
 
 > `--no-neo4j` runs a fast Qdrant-only ingest (GraphRAG context is empty). For full Neo4j
 > GraphRAG, run `setup_all.py` **without** `--no-neo4j` (slower; one LLM call per chunk).
@@ -156,11 +180,11 @@ Then open **http://localhost:5173** and log in: **alice / demo** (left, Cluster 
 
 | Path | Contents |
 |------|----------|
-| `federated-rag/` | **Cluster A** backend (A2A). FastAPI `api/`, LangGraph `agent/` (graph + nodes + state), `rag/` (Qdrant hybrid + Neo4j GraphRAG + RRF fusion + ingest), `auth/` (OpenFGA checks, JWT validation, RFC 8693 exchange), `a2a/` (peer client + Pydantic models), `workflow/` (Temporal approval + activities + worker). Also `tests/docs/` source documents. |
-| `agt-federated-rag/` | **Cluster B** backend (AGT / AgentMesh). Same RAG/auth/workflow structure plus `mesh/` (Ed25519 DID identity, signed peer client), `sre.py` (SLO/SLI middleware), and AGT `GovernanceMiddleware` wrapping the LangGraph in `agent/graph.py`. |
-| `ui/` | React + Vite frontend. `src/components/` (LoginForm, ChatArea, MonitorPanel, UserPane, TaskMessage), `src/api/` (auth, rag, nvidia). `.env.prod` points the UI at the real backends + Keycloak. |
-| `demo/` | **Legacy, superseded.** Pre-real mock clusters (`cluster_a.py`, `cluster_b.py`, `knowledge_*.json`, `start.ps1`). Kept for reference; the real launch path is `launch_all.ps1`, not `demo/start.ps1`. Slated for deletion. |
-| (root) | `docker-compose.yml`, `setup_all.py`, `launch_all.ps1`, helper scripts (`bootstrap_keycloak.py`, `enable_token_exchange.py`), and the docs below. |
+| `federated-rag/` | The **A2A federation** — one codebase run as **both** clusters (cluster-a `:8000` via `.env`, cluster-b `:8002` via `.env.cluster-b`). FastAPI `api/`, LangGraph `agent/` (graph + nodes + state), `rag/` (Qdrant hybrid + Neo4j GraphRAG + RRF fusion + ingest), `auth/` (OpenFGA checks, JWT validation, RFC 8693 exchange), `a2a/` (peer client + Pydantic models), `workflow/` (Temporal approval + activities + worker). Also `tests/docs/` source documents. |
+| `agt-federated-rag/` | The **AGT / AgentMesh federation** — one codebase run as **both** clusters (cluster-a `:8010`, cluster-b `:8012`). Same RAG/auth/workflow structure plus `mesh/` (Ed25519 DID identity, signed peer client + the real HTTP `/a2a/query` transport), `sre.py` (SLO/SLI middleware), and AGT `GovernanceMiddleware` wrapping the LangGraph in `agent/graph.py`. Bring-up: `setup_agt.py`. |
+| `ui/` | React + Vite frontend. `src/components/` (LoginForm, ChatArea, MonitorPanel, UserPane, TaskMessage), `src/api/` (auth, rag). `.env.prod` points the UI at the real backends + Keycloak. |
+| `scripts/` | `clusters.ps1` (start/stop/restart/status for all four backends + workers, by name: `a2a-a a2a-b agt-a agt-b`) and `logs.ps1` (filtered tail of a backend's structured log). |
+| (root) | `docker-compose.yml`, `setup_all.py` (A2A federation), `setup_agt.py` (AGT federation), `init_secrets.py`, `launch_all.ps1`, and the docs below. |
 
 ---
 
@@ -186,8 +210,9 @@ existing **SECURITY_REVIEW.md** for the detailed findings log):
   alone never grants reads.
 - **Per-user rate limiting** (Redis fixed-window) and an **ASGI body-size limit** (never buffers
   SSE) protect the expensive query endpoint.
-- **AGT GovernanceMiddleware** (Cluster B) enforces policy and emits audit events before the graph
-  runs; **trust scoring** decays a misbehaving peer's score toward a kill-switch threshold.
+- **AGT GovernanceMiddleware** (the `agt-federated-rag/` federation) enforces policy and emits audit
+  events before the graph runs; cross-cluster calls are authenticated by **per-message Ed25519 DID
+  signatures** verified in both directions, with registry-membership trust gating peer actions.
 
 ---
 

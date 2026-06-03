@@ -35,11 +35,14 @@ from agentmesh import (
     AgentIdentity,
     AgentMeshClient,
     GovernanceResult,
-    TrustBridge,
     TrustTracker,
 )
 from agentmesh.exceptions import AgentMeshError
 from agentmesh.lifecycle import LifecycleManager
+from agentmesh.trust.handshake import (
+    TIER_TRUSTED_THRESHOLD,
+    IdentityRegistry,
+)
 
 from config import settings
 
@@ -56,8 +59,8 @@ _TRUST_SCALE = 1000.0
 # ── Module-level singletons (double-checked locking) ──────────────────────────
 _identity: AgentIdentity | None = None
 _mesh_client: AgentMeshClient | None = None
-_trust_bridge: TrustBridge | None = None
 _trust_tracker: TrustTracker | None = None
+_identity_registry: IdentityRegistry | None = None
 _lock: asyncio.Lock = asyncio.Lock()
 
 
@@ -161,16 +164,45 @@ async def get_mesh() -> AgentMeshClient:
     return _mesh_client
 
 
-async def _get_trust_bridge() -> TrustBridge:
-    """Return (creating once) the TrustBridge for peer verification."""
-    global _trust_bridge
-    if _trust_bridge is not None:
-        return _trust_bridge
-    did = await get_did()
+def _build_identity_registry(self_identity: AgentIdentity) -> IdentityRegistry:
+    """Build a local IdentityRegistry holding THIS agent and the configured peer.
+
+    The AgentMesh trust handshake resolves peer DIDs (and their authoritative
+    trust score / capabilities) from an IdentityRegistry — without one, every
+    peer is rejected ("no IdentityRegistry configured"). In a federation the two
+    clusters trust each other out-of-band: each registers itself plus the peer,
+    where the peer identity is reconstructed from the trusted public JWK that the
+    operator copied from the peer's GET /identity endpoint into PEER_AGENT_PUBLIC_JWK.
+    """
+    reg = IdentityRegistry(require_attestation=False)
+    reg.register(self_identity)
+    if settings.peer_agent_public_jwk:
+        try:
+            peer_jwk = json.loads(settings.peer_agent_public_jwk)
+            peer_identity = AgentIdentity.from_jwk(peer_jwk)
+            reg.register(peer_identity)
+            log.info("peer_identity_registered", peer_did=str(peer_identity.did))
+        except Exception as exc:  # noqa: BLE001 — bad/missing peer JWK must not crash startup
+            log.warning("peer_identity_register_failed", error=str(exc))
+    return reg
+
+
+async def _get_identity_registry() -> IdentityRegistry:
+    """Return (creating once) the IdentityRegistry holding this agent + the peer.
+
+    This is the source of truth for peer membership in the federation: the peer
+    is registered out-of-band from its public JWK (see _build_identity_registry).
+    Membership + active status is what verify_peer_identity checks — see the note
+    there on why the registry handshake cannot run offline.
+    """
+    global _identity_registry
+    if _identity_registry is not None:
+        return _identity_registry
+    identity = await get_identity()
     async with _lock:
-        if _trust_bridge is None:
-            _trust_bridge = TrustBridge(agent_did=did)
-    return _trust_bridge
+        if _identity_registry is None:
+            _identity_registry = _build_identity_registry(identity)
+    return _identity_registry
 
 
 async def _get_trust_tracker() -> TrustTracker:
@@ -266,28 +298,65 @@ async def verify_signed_message(payload: dict[str, Any]) -> tuple[bool, str | No
 
 async def verify_peer_identity(peer_did: str) -> tuple[bool, float]:
     """
-    Verify a peer agent's DID against the AgentMesh registry via TrustBridge.
+    Verify a peer agent's DID against the AgentMesh IdentityRegistry.
 
     Returns (verified, trust_score) where trust_score is normalised to 0.0–1.0.
-    Fails closed — any registry / handshake error returns (False, 0.0).
+    Fails closed — an unknown / inactive peer or any error returns (False, 0.0).
+
+    WHY REGISTRY MEMBERSHIP, NOT TrustBridge.verify_peer
+    ----------------------------------------------------
+    TrustBridge.verify_peer performs a *mutual* challenge/response handshake: it
+    simulates the peer's side in-process by signing the challenge with the peer
+    identity taken from the registry (handshake._get_peer_response → respond →
+    peer_identity.sign()). In a real federation each cluster holds only the
+    PEER's PUBLIC key (PEER_AGENT_PUBLIC_JWK), so that sign() raises
+    "Private key not available for signing" and every peer is rejected — the
+    library API cannot complete offline by design.
+
+    The actual cross-network authentication in this architecture is the per-
+    message Ed25519 signature: every outbound message is signed
+    (sign_outbound_message) and every inbound message is cryptographically
+    verified against the peer's public key (verify_signed_message), in BOTH
+    directions. That is the real zero-trust control and it is enforced
+    independently of this function (peer_client verifies the response signature;
+    /a2a/query verifies the request signature).
+
+    This function therefore answers the question it can answer offline: is the
+    peer a known, active member of the trust registry? Registry membership is the
+    out-of-band trust establishment — the operator deliberately copied the peer's
+    DID + public JWK from its /identity endpoint into PEER_AGENT_PUBLIC_JWK, which
+    makes the peer a trusted federation partner. The trust score is read from the
+    registered identity if it carries one, otherwise it floors at the library's
+    TIER_TRUSTED_THRESHOLD (a registered partner sits in the trusted tier).
     """
-    threshold_int = int(settings.agent_trust_threshold * _TRUST_SCALE)
     try:
-        bridge = await _get_trust_bridge()
-        result = await asyncio.to_thread(
-            bridge.verify_peer,
-            peer_did,
-            protocol="iatp",
-            required_trust_score=threshold_int,
-        )
+        registry = await _get_identity_registry()
+        peer_identity = registry.get(peer_did)
     except Exception as exc:  # noqa: BLE001 — fail closed on any error
         log.warning("peer_identity_verification_failed", peer_did=peer_did, error=str(exc))
         return False, 0.0
-    verified = bool(getattr(result, "verified", False))
-    raw_score = getattr(result, "trust_score", 0) or 0
+
+    if peer_identity is None:
+        log.warning("peer_identity_not_registered", peer_did=peer_did)
+        return False, 0.0
+    try:
+        active = bool(peer_identity.is_active())
+    except Exception:  # noqa: BLE001 — treat an unparseable status as inactive
+        active = False
+    if not active:
+        log.warning(
+            "peer_identity_inactive",
+            peer_did=peer_did,
+            status=getattr(peer_identity, "status", "unknown"),
+        )
+        return False, 0.0
+
+    raw_score = getattr(peer_identity, "trust_score", None)
+    if raw_score is None:
+        raw_score = TIER_TRUSTED_THRESHOLD
     score = float(raw_score) / _TRUST_SCALE
-    log.info("peer_identity_verified", peer_did=peer_did, verified=verified, trust_score=score)
-    return verified, score
+    log.info("peer_identity_verified", peer_did=peer_did, verified=True, trust_score=score)
+    return True, score
 
 
 # ── Governed action execution ─────────────────────────────────────────────────

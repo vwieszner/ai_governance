@@ -129,14 +129,16 @@ class OpenFGAAuth:
         Emits a structured audit log event for every check (AGT audit hook).
         """
         assert self._client is not None
-        from openfga_sdk import CheckRequest, TupleKey  # type: ignore[import]
+        # openfga-sdk 0.10: OpenFgaClient.check() takes a ClientCheckRequest with
+        # flat user/relation/object fields — NOT the protocol-level CheckRequest
+        # wrapping a TupleKey (the SDK reads body.user directly, which a
+        # CheckRequest does not expose -> "'CheckRequest' object has no attribute 'user'").
+        from openfga_sdk.client.models import ClientCheckRequest  # type: ignore[import]
 
-        body = CheckRequest(
-            tuple_key=TupleKey(
-                user=self._user_id(user_id),
-                relation=relation.value,
-                object=self._object_id(chunk_id),
-            ),
+        body = ClientCheckRequest(
+            user=self._user_id(user_id),
+            relation=relation.value,
+            object=self._object_id(chunk_id),
         )
         try:
             resp = await self._client.check(body)
@@ -208,19 +210,18 @@ class OpenFGAAuth:
         """
         assert self._client is not None
         try:
-            from openfga_sdk import ListObjectsRequest  # type: ignore[import]
-
-            # There is no direct 'who owns this object' API; we use ListObjects
-            # to list objects of type 'chunk' for which any user has 'owner'.
-            # For a reverse lookup we need to use the Expand or ReadTuples API.
-            from openfga_sdk import ReadRequest, TupleKey  # type: ignore[import]
+            # openfga-sdk 0.10: OpenFgaClient.read() takes a ReadRequestTupleKey
+            # (user=None matches any user with the relation) — not a protocol
+            # ReadRequest wrapping a TupleKey.
+            from openfga_sdk.models.read_request_tuple_key import (  # type: ignore[import]
+                ReadRequestTupleKey,
+            )
 
             resp = await self._client.read(
-                ReadRequest(
-                    tuple_key=TupleKey(
-                        relation=Relation.OWNER.value,
-                        object=self._object_id(chunk_id),
-                    ),
+                ReadRequestTupleKey(
+                    user=None,
+                    relation=Relation.OWNER.value,
+                    object=self._object_id(chunk_id),
                 )
             )
             tuples = getattr(resp, "tuples", [])
@@ -245,7 +246,7 @@ class OpenFGAAuth:
         and let every other 400 (malformed tuple, etc.) propagate.
         """
         assert self._client is not None
-        from openfga_sdk import ClientTuple, ClientWriteRequest  # type: ignore[import]
+        from openfga_sdk.client.models import ClientTuple, ClientWriteRequest  # type: ignore[import]
 
         try:
             await self._client.write(
@@ -282,7 +283,7 @@ class OpenFGAAuth:
     async def _delete_tuple(self, user_id: str, chunk_id: str, relation: Relation) -> None:
         """Delete a single authorisation tuple from OpenFGA (idempotent on 404)."""
         assert self._client is not None
-        from openfga_sdk import ClientTuple, ClientWriteRequest  # type: ignore[import]
+        from openfga_sdk.client.models import ClientTuple, ClientWriteRequest  # type: ignore[import]
 
         try:
             await self._client.write(

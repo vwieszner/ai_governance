@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     # LLM — NVIDIA NIM (OpenAI-compatible)
     openai_api_base: str = "https://integrate.api.nvidia.com/v1"
     openai_api_key: str = Field(default=...)  # REQUIRED — set OPENAI_API_KEY in .env
-    llm_model: str = "nvidia/llama-3.1-nemotron-70b-instruct"
+    llm_model: str = "meta/llama-3.3-70b-instruct"
     llm_temperature: float = 0.0
     llm_max_tokens: int = 2048
     # The first call to the NVIDIA endpoint has a slow cold-connect; a short

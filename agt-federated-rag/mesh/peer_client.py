@@ -2,11 +2,16 @@
 AgentMesh peer client — cross-cluster agent-to-agent communication built on the
 Microsoft Agent Governance Toolkit.
 
+Transport: a real HTTP POST of a DID-signed message to the peer cluster's
+``/a2a/query`` endpoint. AgentMesh supplies the *security envelope* (DID identity,
+Ed25519 message signing, registry-backed trust scoring); HTTP is the wire. The
+peer authenticates the call by verifying the Ed25519 signature — no user JWT is
+forwarded — and re-runs its own OpenFGA authorization for the delegated user.
+
 Real toolkit APIs used here:
-  - ``agentmesh.ProtocolBridge``          — the actual peer message transport
-                                            (a2a → iatp protocol bridging).
   - ``agentmesh.TrustBridge`` (via mesh)  — peer DID verification + trust score.
   - ``agentmesh.AgentMeshClient`` (via mesh.govern_action) — governance gate.
+  - ``mesh.agent_identity.sign_outbound_message`` — Ed25519 message signing.
   - ``agent_os.circuit_breaker.CircuitBreaker`` — cascading-failure protection.
 
 Security controls applied before any peer message is sent:
@@ -14,7 +19,8 @@ Security controls applied before any peer message is sent:
   2. Check the circuit breaker (open → fail fast — ASI-08).
   3. Run the AGT governance gate for ``peer.send_message``.
   4. Sign the outbound message with this agent's DID credentials.
-  5. Record the interaction in the TrustTracker (reward / penalty).
+  5. Verify the peer's signature on the response (fail closed otherwise).
+  6. Record the interaction in the TrustTracker (reward / penalty).
 """
 from __future__ import annotations
 
@@ -22,27 +28,38 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 import structlog
-from agentmesh import ProtocolBridge
 from agentmesh.exceptions import AgentMeshError
 from agent_os.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitState
 
 from config import settings
 from mesh.agent_identity import (
-    get_did,
     govern_action,
     report_trust_event,
     sign_outbound_message,
     verify_peer_identity,
+    verify_signed_message,
 )
 
 log = structlog.get_logger(__name__)
 
+# Path on the peer cluster that receives DID-signed federation queries.
+_PEER_QUERY_PATH = "/a2a/query"
+
+# Outbound HTTP timeout. The peer runs a full RAG + LLM pipeline on receipt, so
+# this must exceed the peer's WORST-CASE LLM time — llm_timeout_seconds across
+# the initial attempt plus every retry — or the caller would ReadTimeout while
+# the peer is still working and (after failure_threshold such timeouts) open the
+# circuit breaker against a slow-but-alive peer, failing even healthy calls fast.
+# Derived from settings so it can't drift from the peer's LLM budget.
+_PEER_HTTP_TIMEOUT = (
+    settings.llm_timeout_seconds * (1 + settings.llm_max_retries) + 30.0
+)
+
 # ── Per-peer circuit breakers (ASI-08) ────────────────────────────────────────
 _circuit_breakers: dict[str, CircuitBreaker] = {}
 _cb_lock: asyncio.Lock = asyncio.Lock()
-_protocol_bridge: ProtocolBridge | None = None
-_bridge_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def _get_circuit_breaker(peer_url: str) -> CircuitBreaker:
@@ -61,21 +78,6 @@ async def _get_circuit_breaker(peer_url: str) -> CircuitBreaker:
             )
             _circuit_breakers[peer_url] = cb
     return cb
-
-
-async def _get_protocol_bridge() -> ProtocolBridge:
-    """Return (creating once) the AgentMesh ProtocolBridge for peer transport."""
-    global _protocol_bridge
-    if _protocol_bridge is not None:
-        return _protocol_bridge
-    did = await get_did()
-    async with _bridge_lock:
-        if _protocol_bridge is None:
-            _protocol_bridge = ProtocolBridge(
-                agent_did=did,
-                supported_protocols=["a2a", "iatp"],
-            )
-    return _protocol_bridge
 
 
 @dataclass
@@ -104,8 +106,7 @@ async def call_peer_agent(
     callback_url: str | None = None,
 ) -> PeerResponse:
     """
-    Send a governed, signed query to the peer agent via the AgentMesh
-    ProtocolBridge.
+    Send a governed, DID-signed query to the peer agent over HTTP.
 
     The user_id is carried inside the signed payload so the peer can make its own
     OpenFGA authorization decision. No raw user JWT is forwarded — the peer
@@ -166,38 +167,57 @@ async def call_peer_agent(
     }
     signed_payload = await sign_outbound_message(payload)
 
-    log.info("peer_call_sending", peer_url=peer_url, peer_did=peer_did, trust_score=trust_score)
+    endpoint = peer_url.rstrip("/") + _PEER_QUERY_PATH
+    log.info("peer_call_sending", peer_url=endpoint, peer_did=peer_did, trust_score=trust_score)
 
-    # ── Step 5: send via the AgentMesh ProtocolBridge (a2a → iatp) ───────────
-    bridge = await _get_protocol_bridge()
+    # ── Step 5: real HTTP POST of the DID-signed message to the peer ─────────
+    # AgentMesh provides the security envelope (DID + Ed25519 signature); HTTP is
+    # the wire. The peer authenticates the call by verifying that signature.
     try:
-        response = await asyncio.to_thread(
-            bridge.send_message,
-            peer_did,
-            signed_payload,
-            "a2a",     # source_protocol
-            "iatp",    # target_protocol
-        )
-    except AgentMeshError as exc:
+        async with httpx.AsyncClient(timeout=_PEER_HTTP_TIMEOUT) as client:
+            http_response = await client.post(endpoint, json=signed_payload)
+        http_response.raise_for_status()
+        response = http_response.json()
+    except httpx.HTTPStatusError as exc:
+        # Non-2xx from the peer (401 unverified signature, 403 governance, 5xx).
         cb.record_failure()
-        log.error("peer_iatp_error", error=str(exc))
-        await report_trust_event(peer_did, "iatp_error", {"error": str(exc)})
-        raise
+        log.error("peer_http_error", status_code=exc.response.status_code, error=str(exc))
+        await report_trust_event(peer_did, "iatp_error", {"status": exc.response.status_code})
+        raise AgentMeshError(
+            f"Peer returned HTTP {exc.response.status_code}"
+        ) from exc
     except Exception as exc:  # noqa: BLE001 — any transport failure trips the breaker
         cb.record_failure()
-        log.error("peer_call_failed", error=str(exc))
-        await report_trust_event(peer_did, "call_failure", {"error": str(exc)})
+        # str() on httpx.ReadTimeout/ConnectTimeout is empty — log the exception
+        # type so a timeout is distinguishable from a connection refusal etc.
+        log.error("peer_call_failed", error_type=type(exc).__name__, error=repr(exc))
+        await report_trust_event(peer_did, "call_failure", {"error": type(exc).__name__})
         raise
+
+    # ── Step 6: verify the peer's signature on the response (fail closed) ─────
+    # A valid HTTP 200 is not enough — the response body must carry the peer's
+    # Ed25519 signature, verified against the configured peer public key. This
+    # closes the loop: both directions of the exchange are DID-authenticated.
+    if not isinstance(response, dict):
+        cb.record_failure()
+        await report_trust_event(peer_did, "unexpected_payload", {})
+        raise AgentMeshError("Peer response was not a JSON object")
+
+    resp_verified, resp_signer = await verify_signed_message(response)
+    if not resp_verified or resp_signer != peer_did:
+        cb.record_failure()
+        log.error("peer_response_signature_invalid", peer_did=peer_did, signer=resp_signer)
+        await report_trust_event(peer_did, "policy_violation", {"reason": "bad_response_signature"})
+        raise AgentMeshError("Peer response signature could not be verified")
 
     cb.record_success()
     await report_trust_event(peer_did, "call_success", {})
 
-    data: dict[str, Any] = response if isinstance(response, dict) else {}
-    log.info("peer_call_success", peer_url=peer_url, status=data.get("status"))
+    log.info("peer_call_success", peer_url=endpoint, status=response.get("status"))
     return PeerResponse(
-        status=str(data.get("status", "unknown")),
-        answer=data.get("answer"),
-        task_id=str(data.get("task_id", "")),
+        status=str(response.get("status", "unknown")),
+        answer=response.get("answer"),
+        task_id=str(response.get("task_id", "")),
         peer_did=peer_did,
         trust_score=trust_score,
     )
