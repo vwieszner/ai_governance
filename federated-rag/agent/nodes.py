@@ -132,13 +132,19 @@ _qdrant: HybridQdrantRetriever | None = None
 _graph: GraphRAGRetriever | None = None
 _openfga: OpenFGAAuth | None = None
 _llm: ChatOpenAI | None = None
+_intent_llm: ChatOpenAI | None = None
 _temporal_client: TemporalClient | None = None
 
 _qdrant_lock: asyncio.Lock = asyncio.Lock()
 _graph_lock: asyncio.Lock = asyncio.Lock()
 _openfga_lock: asyncio.Lock = asyncio.Lock()
 _llm_lock: asyncio.Lock = asyncio.Lock()
+_intent_llm_lock: asyncio.Lock = asyncio.Lock()
 _temporal_lock: asyncio.Lock = asyncio.Lock()
+
+# Small fast model for cheap YES/NO intent classification.
+# Using llama-3.2-3b — free tier on NVIDIA NIM, sub-second latency.
+_INTENT_MODEL = "meta/llama-3.2-3b-instruct"
 
 
 async def _get_qdrant() -> HybridQdrantRetriever:
@@ -191,6 +197,29 @@ async def _get_llm() -> ChatOpenAI:
                 max_retries=settings.llm_max_retries,
             )
     return _llm
+
+
+async def _get_intent_llm() -> ChatOpenAI:
+    """Fast small LLM for intent classification only (YES/NO).
+
+    Uses a small free-tier model from NVIDIA NIM — sub-second latency
+    vs ~8s for the main 70B model. Same API base and key.
+    """
+    global _intent_llm
+    if _intent_llm is not None:
+        return _intent_llm
+    async with _intent_llm_lock:
+        if _intent_llm is None:
+            _intent_llm = ChatOpenAI(
+                model=_INTENT_MODEL,
+                openai_api_base=settings.openai_api_base,
+                openai_api_key=settings.openai_api_key,
+                temperature=0.0,
+                max_tokens=5,
+                timeout=settings.llm_timeout_seconds,
+                max_retries=settings.llm_max_retries,
+            )
+    return _intent_llm
 
 
 async def _get_temporal() -> TemporalClient:
@@ -290,7 +319,7 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         # (e.g. "how is your day?") get an instant response instead of a 16s
         # round-trip through two clusters and two LLM calls.
         try:
-            llm = await _get_llm()
+            llm = await _get_intent_llm()
             intent_resp = await llm.ainvoke(
                 "You are a classifier. Reply with exactly one word: YES if this question "
                 "could reasonably be answered by a company knowledge base (policies, "
