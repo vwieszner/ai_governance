@@ -228,3 +228,55 @@ export function submitQuery(
 ): Promise<void> {
   return submitQueryClusterA(cluster, user, token, query, onTask, onEvent)
 }
+
+// ── Approval inbox (human-in-the-loop) ───────────────────────────────────────
+//
+// The data owner (this logged-in user) fetches the access requests they are
+// entitled to decide and records an approve/deny decision. Backend verifies the
+// caller is the designated owner (real attribution); the requester never learns
+// the request_id. Temporal's namespace is shared across clusters, so polling
+// this user's own cluster surfaces requests that originated on either cluster.
+
+export interface PendingApproval {
+  requestId: string
+  requesterId: string
+  query: string
+}
+
+export async function listPendingApprovals(
+  cluster: ClusterConfig,
+  token: string,
+): Promise<PendingApproval[]> {
+  const res = await fetch(`${cluster.apiBase}/approvals/pending`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!res.ok) {
+    throw new RagError(`Failed to load approvals (${res.status})`, String(res.status))
+  }
+  const data = (await res.json()) as { pending?: Array<Record<string, string>> }
+  return (data.pending ?? []).map((p) => ({
+    requestId: p.request_id,
+    requesterId: p.requester_id,
+    query: p.query,
+  }))
+}
+
+export async function decideApproval(
+  cluster: ClusterConfig,
+  token: string,
+  requestId: string,
+  decision: 'approve' | 'deny',
+): Promise<void> {
+  const res = await fetch(
+    `${cluster.apiBase}/approvals/${encodeURIComponent(requestId)}/decision`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new RagError(`Decision failed (${res.status}): ${text}`, String(res.status))
+  }
+}

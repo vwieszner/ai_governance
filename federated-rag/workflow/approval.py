@@ -94,6 +94,12 @@ class ApprovalWorkflow:
 
     def __init__(self) -> None:
         self._decision: ApprovalDecisionSignal | None = None
+        # Snapshotted at run() start so the authenticated approval endpoint
+        # (POST /approvals/{id}/decision) can verify, via the get_info query,
+        # that the caller is the designated data owner before accepting a decision.
+        self._approver_id: str = ""
+        self._user_id: str = ""
+        self._query: str = ""
 
     @workflow.signal
     async def approval_decision(self, signal: ApprovalDecisionSignal) -> None:
@@ -105,8 +111,31 @@ class ApprovalWorkflow:
             approver=signal.approver_id,
         )
 
+    @workflow.query
+    def get_info(self) -> dict[str, object]:
+        """Read-only snapshot for the authenticated approval API.
+
+        Lets POST /approvals/{id}/decision confirm the caller's JWT `sub` matches
+        the designated approver (the chunk owner) and that the request is still
+        open — without exposing chunk contents. Replay-safe: pure reads, no
+        commands, no awaits.
+        """
+        return {
+            "approver_id": self._approver_id,
+            "user_id": self._user_id,
+            "query": self._query,
+            "decided": self._decision is not None,
+        }
+
     @workflow.run
     async def run(self, inp: ApprovalInput) -> ApprovalResult:
+        # Snapshot the identity fields so the get_info query (used by the
+        # authenticated approval endpoint for owner-verification + the pending
+        # inbox) can read them. Plain assignments — no Temporal commands — so
+        # this is replay-safe.
+        self._approver_id = inp.approver_id
+        self._user_id = inp.user_id
+        self._query = inp.query
         workflow.logger.info(
             "approval_workflow_started",
             request_id=inp.approval_request_id,

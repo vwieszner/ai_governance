@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { LoginForm } from './LoginForm'
 import { ChatArea } from './ChatArea'
+import { ApprovalInbox } from './ApprovalInbox'
 import type { AgentEvent, ClusterConfig } from '../types'
 
 interface Props {
@@ -30,13 +31,16 @@ export function UserPane({ cluster, onEvent }: Props) {
       </div>
 
       {token ? (
-        <ChatArea
-          cluster={cluster}
-          user={username}
-          token={token}
-          onEvent={onEvent}
-          onLogout={handleLogout}
-        />
+        <>
+          <ApprovalInbox cluster={cluster} token={token} />
+          <ChatArea
+            cluster={cluster}
+            user={username}
+            token={token}
+            onEvent={onEvent}
+            onLogout={handleLogout}
+          />
+        </>
       ) : (
         <LoginForm cluster={cluster} onLogin={handleLogin} />
       )}
