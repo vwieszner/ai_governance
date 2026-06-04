@@ -82,6 +82,15 @@ class NotifyUserInput:
 
 
 @dataclass
+class RecordDecisionInput:
+    """Persist an approval outcome so the requester's client can retrieve it
+    over the network (cross-machine) by polling — keyed on the original task id."""
+    task_id: str
+    decision: str            # "approved" | "denied" | "timeout"
+    reason: str = ""
+
+
+@dataclass
 class A2ACallbackInput:
     """
     H-7 FIX: delegated_token removed.
@@ -222,6 +231,47 @@ async def revoke_pending_in_openfga(inp: RevokeApprovalInput) -> None:
 async def notify_user_of_decision(inp: NotifyUserInput) -> None:
     """In-app notification to user (stub — integrate with your notification system)."""
     log.info("user_notified", user_id=inp.user_id, message=inp.message)
+
+
+# Redis singleton for the worker — same store the API uses for tasks, so the
+# requester can poll the outcome from a different machine/session.
+_redis_singleton: "Any | None" = None
+
+
+def _get_decision_redis() -> "Any":
+    global _redis_singleton
+    if _redis_singleton is None:
+        import redis.asyncio as aioredis  # noqa: PLC0415
+        _redis_singleton = aioredis.from_url(settings.redis_url, decode_responses=True)
+    return _redis_singleton
+
+
+_DECISION_TTL_SECONDS = 3600  # an unclaimed outcome expires after an hour
+
+
+@activity.defn
+async def record_decision(inp: RecordDecisionInput) -> None:
+    """Persist the approval outcome under the requester's task id.
+
+    The requester polls ``GET /tasks/{task_id}/result`` (authenticated, owner-only)
+    to retrieve it — this is the cross-machine, server-mediated channel that
+    delivers the decision back to whoever asked, wherever they are.
+    """
+    if not inp.task_id:
+        log.warning("record_decision_no_task_id", decision=inp.decision)
+        return
+    import json as _json  # noqa: PLC0415
+    r = _get_decision_redis()
+    try:
+        await r.set(
+            f"decision:{inp.task_id}",
+            _json.dumps({"decision": inp.decision, "reason": inp.reason}),
+            ex=_DECISION_TTL_SECONDS,
+        )
+        log.info("decision_recorded", task_id=inp.task_id, decision=inp.decision)
+    except Exception as exc:
+        log.error("record_decision_failed", task_id=inp.task_id, error=str(exc))
+        raise
 
 
 def _is_allowed_peer_url(url: str) -> bool:

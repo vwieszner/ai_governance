@@ -39,10 +39,12 @@ with workflow.unsafe.imports_passed_through():
         GrantAccessInput,
         NotifyApproverInput,
         NotifyUserInput,
+        RecordDecisionInput,
         RevokeApprovalInput,
         grant_access_in_openfga,
         notify_approver,
         notify_user_of_decision,
+        record_decision,
         revoke_pending_in_openfga,
         send_a2a_callback,
     )
@@ -69,6 +71,10 @@ class ApprovalInput:
     # The send_a2a_callback activity obtains a fresh token via client credentials.
     originating_task_id: str | None = None
     originating_agent_url: str | None = None
+
+    # The requester's own task id on THIS cluster — used to persist the outcome
+    # so the requester can poll for it (cross-machine, server-mediated delivery).
+    requester_task_id: str | None = None
 
     # Q-7 FIX: snapshot approval_timeout_seconds at workflow-start time so
     # Temporal replay is deterministic even if the env var changes mid-flight.
@@ -196,6 +202,16 @@ class ApprovalWorkflow:
         )
         # grant_access_in_openfga already revokes pending tuples (see activities.py)
 
+        # Persist the outcome AFTER the grant so the requester's poll (which
+        # re-runs the authorized query) cannot observe "approved" before access
+        # actually exists in OpenFGA.
+        await workflow.execute_activity(
+            record_decision,
+            RecordDecisionInput(task_id=inp.requester_task_id or "", decision="approved"),
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RETRY_3,
+        )
+
         # Notify the user
         await workflow.execute_activity(
             notify_user_of_decision,
@@ -237,6 +253,17 @@ class ApprovalWorkflow:
         )
 
         await workflow.execute_activity(
+            record_decision,
+            RecordDecisionInput(
+                task_id=inp.requester_task_id or "",
+                decision="denied",
+                reason=(decision.reason or "Not specified")[:500],
+            ),
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RETRY_3,
+        )
+
+        await workflow.execute_activity(
             notify_user_of_decision,
             NotifyUserInput(
                 user_id=inp.user_id,
@@ -269,6 +296,17 @@ class ApprovalWorkflow:
         await workflow.execute_activity(
             revoke_pending_in_openfga,
             RevokeApprovalInput(user_id=inp.user_id, chunk_ids=inp.chunk_ids),
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RETRY_3,
+        )
+
+        await workflow.execute_activity(
+            record_decision,
+            RecordDecisionInput(
+                task_id=inp.requester_task_id or "",
+                decision="timeout",
+                reason="No response from the approver within the deadline.",
+            ),
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RETRY_3,
         )

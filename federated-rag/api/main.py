@@ -610,6 +610,82 @@ async def get_task(
     return task
 
 
+@app.get("/tasks/{task_id}/result")
+async def get_task_result(
+    task_id: str,
+    auth: dict[str, Any] = Depends(get_token_claims),
+) -> JSONResponse:
+    """Poll the outcome of a pending-approval request — the cross-machine,
+    server-mediated delivery channel back to the requester.
+
+    Security / governance:
+      - Authenticated (JWT) and **owner-only**: the caller must own the task,
+        else 404 (never confirms another user's task exists).
+      - On 'approved' the answer is produced by **re-running the query through the
+        full governance pipeline** (run_query → OpenFGA re-check). The endpoint
+        does NOT trust the recorded decision to release data — it only releases
+        what the user is *currently* authorized for. If access was somehow not
+        actually granted, the re-run will not return restricted content.
+
+    Returns one of:
+      {"status": "pending"}                          — no decision yet
+      {"status": "denied",  "message": "<reason>"}   — denied / timed out
+      {"status": "completed", "answer": "<text>"}    — approved → fresh answer
+    """
+    task = await _load_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    caller_id = extract_user_id(auth["claims"])
+    owner_id = task.metadata.get("owner_id")
+    if not owner_id or owner_id != caller_id:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    import json as _json  # noqa: PLC0415
+    r = await _get_redis()
+    raw = await r.get(f"decision:{task_id}")
+    if not raw:
+        return JSONResponse(content={"status": "pending"})
+
+    try:
+        decision = _json.loads(raw)
+    except Exception:
+        decision = {"decision": "pending"}
+
+    verdict = decision.get("decision", "pending")
+    if verdict in ("denied", "timeout"):
+        return JSONResponse(content={
+            "status": "denied",
+            "message": decision.get("reason") or "Your request was not approved.",
+        })
+
+    if verdict == "approved":
+        # Recover the original question from the task's first user message.
+        query = ""
+        for msg in task.history:
+            if msg.role == "user":
+                for part in msg.parts:
+                    if getattr(part, "text", None):
+                        query = part.text
+                        break
+            if query:
+                break
+        if not query:
+            return JSONResponse(content={"status": "pending"})
+        # Re-run through the FULL governed pipeline as this user — access is
+        # re-checked in OpenFGA, so the answer is only released if truly allowed.
+        final_state = await run_query(
+            query=query,
+            user_id=caller_id,
+            user_token=auth["token"],
+            task_id=task_id,
+            context_id="",
+        )
+        answer = final_state.get("answer") or final_state.get("status_message") or ""
+        return JSONResponse(content={"status": "completed", "answer": answer})
+
+    return JSONResponse(content={"status": "pending"})
+
+
 # ── tasks/{task_id}/callback POST (A2A push notification) ─────────────────────
 
 @app.post("/tasks/{task_id}/callback", response_model=dict[str, bool])  # FA-4

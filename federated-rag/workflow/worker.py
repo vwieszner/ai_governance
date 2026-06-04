@@ -24,6 +24,7 @@ from workflow.activities import (
     grant_access_in_openfga,
     notify_approver,
     notify_user_of_decision,
+    record_decision,
     revoke_pending_in_openfga,   # FIX R-1
     send_a2a_callback,
 )
@@ -67,6 +68,7 @@ async def _run() -> None:
             grant_access_in_openfga,
             revoke_pending_in_openfga,   # FIX R-1: was missing
             notify_user_of_decision,
+            record_decision,
             send_a2a_callback,
         ],
     ):

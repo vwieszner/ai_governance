@@ -52,10 +52,24 @@ function Stop-Port([int]$Port) {
 }
 
 function Stop-Worker([string]$name, [string]$dir, [string]$env) {
-    # Workers have no port; match the python process by its working dir + RAG_ENV_FILE.
-    Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'workflow.worker' -and $_.CommandLine -match [regex]::Escape($dir) } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    # Workers have no port. The python `-m workflow.worker` command line does NOT
+    # contain the working directory, so matching on $dir never worked and left
+    # zombie workers on every restart. Track the worker PID in a file at start
+    # and kill exactly that PID here.
+    $pidFile = Join-Path $logDir "$name-worker.pid"
+    if (Test-Path $pidFile) {
+        $wpid = (Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($wpid) {
+            $p = Get-Process -Id $wpid -ErrorAction SilentlyContinue
+            if ($p -and $p.ProcessName -eq 'python') {
+                # `python -m workflow.worker` spawns a child worker process; a plain
+                # Stop-Process kills only the parent and orphans the child (which keeps
+                # polling Temporal). taskkill /T kills the whole tree.
+                & taskkill /PID $wpid /T /F *> $null
+            }
+        }
+        Remove-Item $pidFile -ErrorAction SilentlyContinue
+    }
 }
 
 function Start-One([string]$name) {
@@ -66,9 +80,11 @@ function Start-One([string]$name) {
     Start-Process $py -ArgumentList '-m', 'api.main' -WorkingDirectory $dir `
         -RedirectStandardOutput (Join-Path $logDir "$name-api.out") `
         -RedirectStandardError  (Join-Path $logDir "$name-api.err") -WindowStyle Hidden | Out-Null
-    Start-Process $py -ArgumentList '-m', 'workflow.worker' -WorkingDirectory $dir `
+    # -PassThru so we can record the worker PID and reliably stop it later.
+    $wp = Start-Process $py -ArgumentList '-m', 'workflow.worker' -WorkingDirectory $dir `
         -RedirectStandardOutput (Join-Path $logDir "$name-worker.out") `
-        -RedirectStandardError  (Join-Path $logDir "$name-worker.err") -WindowStyle Hidden | Out-Null
+        -RedirectStandardError  (Join-Path $logDir "$name-worker.err") -WindowStyle Hidden -PassThru
+    $wp.Id | Out-File -FilePath (Join-Path $logDir "$name-worker.pid") -Encoding ascii
     Remove-Item Env:RAG_ENV_FILE -ErrorAction SilentlyContinue
     Write-Host "  started $name ($($c.env) -> :$($c.port))" -ForegroundColor Green
 }

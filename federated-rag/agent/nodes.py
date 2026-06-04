@@ -592,6 +592,9 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
                 approver_email=None,
                 # Q-7: snapshot timeout at start so replay is deterministic
                 timeout_seconds=settings.approval_timeout_seconds,
+                # The requester's task id — lets the workflow persist the outcome
+                # so the requester can poll for it (cross-machine delivery).
+                requester_task_id=state.get("task_id") or None,
             ),
             id=f"approval-{approval_request_id}",
             task_queue=settings.temporal_task_queue,
