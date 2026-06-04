@@ -45,7 +45,7 @@ export function MonitorPanel({ events, isOpen, onClose }: Props) {
         ) : (
           events.map((ev) => {
             const meta = KIND_META[ev.kind]
-            const clusterCls = ev.cluster === 'cluster-a' ? 'ev-cluster-a' : 'ev-cluster-b'
+            const clusterCls = ev.cluster === 'cluster-a' ? 'ev-cluster-a' : ev.cluster === 'cluster-agt-a' ? 'ev-cluster-agt-a' : 'ev-cluster-b'
             return (
               <div key={ev.id} className={`monitor-event ${meta.cls}`}>
                 <span className="ev-time">{fmtTime(ev.timestamp)}</span>
