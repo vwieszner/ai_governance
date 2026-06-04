@@ -89,17 +89,25 @@ When serving behind FastAPI or nginx, make sure the `/api/a`, `/api/b`, `/auth/a
 
 ## Note on CORS
 
-Both backends are configured with `CORSMiddleware(allow_origins=["*"])` for local development. Before deploying to production, restrict origins to the exact UI URL:
+Both backends configure `CORSMiddleware` with an **explicit origin allow-list** — `allow_origins=settings.cors_origins_list` — never a wildcard. The dev default is the Vite dev server (`http://localhost:5173`), and `allow_credentials=False` (the API authenticates via the `Authorization: Bearer` header, not cookies), with methods/headers restricted to the set the UI actually needs.
+
+To point the backends at a production UI origin, set the `CORS_ORIGINS` env var (comma-separated) — no code change required:
+
+```bash
+# federated-rag / agt-federated-rag .env
+CORS_ORIGINS=https://rag.example.com,https://admin.example.com
+```
+
+This maps to the middleware already wired in each `api/main.py`:
 
 ```python
-# federated-rag / agt-federated-rag main.py
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://your-ui-domain.example.com"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.cors_origins_list,  # explicit allow-list from CORS_ORIGINS
+    allow_credentials=False,                    # bearer-token auth, no cookies
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Request-ID"],
 )
 ```
 
-Similarly, update the Keycloak client's **Valid Redirect URIs** and **Web Origins** to match the production UI origin.
+Keep `allow_credentials=False`: it avoids the wildcard-plus-credentials footgun and matches the bearer-token design. Similarly, update the Keycloak client's **Valid Redirect URIs** and **Web Origins** to match the production UI origin.

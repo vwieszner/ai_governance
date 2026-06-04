@@ -1,13 +1,18 @@
 # Federated Cross-Cluster RAG
 
-Two Kubernetes clusters, each running a LangGraph agent with hybrid RAG (Qdrant + Neo4j GraphRAG), communicating via the A2A v1.0 protocol with OpenFGA per-chunk authorization and Temporal approval workflows.
+Two Kubernetes clusters, each running a LangGraph agent with hybrid Qdrant RAG (dense + sparse with RRF) and a scaffolded Neo4j graph-retrieval seam, communicating via the A2A v1.0 protocol with OpenFGA per-chunk authorization and Temporal approval workflows.
+
+> **Retrieval status:** the demo runs **Qdrant-only** hybrid retrieval. The Neo4j path is wired
+> in and RRF-fused, but the documented bring-up uses `--no-neo4j` so it is not exercised; even when
+> populated it does vector + keyword lookup of chunks (`HybridRetriever`), **not** graph traversal
+> or entity-neighbourhood expansion. See the root `README.md` GraphRAG note for details.
 
 ## Architecture
 
 ```
 User → Agent A (LangGraph)
          ├── Qdrant (BGE-M3 dense + BM25 sparse, RRF fusion)
-         ├── Neo4j  (GraphRAG via neo4j-graphrag)
+         ├── Neo4j  (graph-retrieval seam via neo4j-graphrag; scaffolded, not exercised by the demo)
          ├── OpenFGA (per-chunk ReBAC: viewer / editor / owner / pending_approval)
          ├── Temporal (approval workflow + Slack notification)
          └── A2A client ──→ Agent B (same stack, other cluster)
@@ -109,7 +114,7 @@ kubectl apply -f k8s/cluster-a/agent-deployment.yaml
 ```
 federated-rag/
 ├── agent/              LangGraph agent (state, nodes, graph)
-├── rag/                Qdrant hybrid + Neo4j GraphRAG + RRF fusion + ingest
+├── rag/                Qdrant hybrid retrieval + scaffolded Neo4j graph-retrieval seam + RRF fusion + ingest
 ├── a2a/                A2A v1.0 protocol (models, client)
 ├── auth/               OpenFGA client + RFC 8693 token exchange
 ├── workflow/           Temporal approval workflow + activities + worker

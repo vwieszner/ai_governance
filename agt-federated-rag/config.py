@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = Field(default=...)  # REQUIRED
+    # reserved/unused — graph-hop expansion not implemented (the AGT retriever is a
+    # plain VectorRetriever with no traversal; see rag/neo4j_retriever.py docstring).
     neo4j_graph_hops: int = 2
     neo4j_top_k: int = 5
 
@@ -100,6 +102,21 @@ class Settings(BaseSettings):
     policy_dir: str = "agent/policies"
     # Whether to run in audit-only mode (log violations but don't block).
     policy_audit_only: bool = False
+
+    # ── Graph-level kill-switch (AgentMesh govern_action gate) ───────────────
+    # Operator emergency off-switch. When true, the graph-level govern_action
+    # gate in agent.graph.run_query DENIES every invocation (raises PermissionError
+    # before any node runs / before the graph is compiled), disabling this agent's
+    # /query and /a2a/query paths entirely. The denial currently surfaces as an SSE
+    # error event (/query, stream is already HTTP 200) / a signed status="failed"
+    # (/a2a/query) — not a 403 — unless the endpoints also check this flag before
+    # streaming. Default false = normal
+    # operation. This is a DEPLOY-TIME lever: settings is read once at startup, so
+    # changing AGENT_KILL_SWITCH_ENGAGED requires an agent RESTART to take effect.
+    # It is NOT an automatic trust-based trip (see mesh/agent_identity.py
+    # _GRAPH_GOVERNANCE_POLICY) and does NOT replace the fail-closed data-path
+    # controls (per-node _enforce default-deny + OpenFGA per-chunk ReBAC).
+    agent_kill_switch_engaged: bool = False
 
     # ── AGT Agent SRE ─────────────────────────────────────────────────────────
     sre_enabled: bool = True

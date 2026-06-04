@@ -21,9 +21,9 @@ reference corresponds to live code in `federated-rag/` and `agt-federated-rag/`.
 │  federated-rag/         │     │  agt-federated-rag/                  │
 │                         │     │                                      │
 │  FastAPI  api/main.py   │     │  FastAPI  api/main.py                │
-│  LangGraph  graph.py    │ A2A │  LangGraph + GovernanceMiddleware    │
+│  LangGraph  graph.py    │ A2A │  LangGraph + govern-action gate      │
 │  Qdrant (hybrid RAG)    │────▶│  Qdrant (hybrid RAG)                 │
-│  Neo4j  (GraphRAG)      │     │  Neo4j  (GraphRAG)                   │
+│  Neo4j  (seam, inert)   │     │  Neo4j  (seam, inert)                │
 │  OpenFGA (ReBAC)        │     │  OpenFGA + AGT policy engine         │
 │  Temporal (approvals)   │     │  Temporal (approvals)                │
 │  Redis  (task store)    │     │  Redis  (task store)                 │
@@ -42,11 +42,11 @@ reference corresponds to live code in `federated-rag/` and `agt-federated-rag/`.
 | **OpenFGA** ReBAC | `auth/openfga.py` | Per-chunk access control (`viewer`, `owner`, `pending_approval` tuples) |
 | **Temporal** | `workflow/approval.py` | Signal-based approval gate with configurable timeout (default 24 h) |
 | **RFC 8693** token exchange | `auth/token_exchange.py` | Cluster-A delegates its JWT to Cluster-B when making A2A calls |
-| **AGT GovernanceMiddleware** | `agt-federated-rag/agent/graph.py` | Wraps every LangGraph invocation with audit, policy enforcement, kill-switch |
+| **AGT graph-invocation gate** | `agt-federated-rag/agent/graph.py` (`run_query`) | A `govern_action("agent.graph.invoke")` AgentMesh call before the graph compiles — audit + an enforcing operator kill-switch (deny on `kill_switch_engaged`; deploy-time, requires restart). Not a wrapping middleware. |
 | **AgentMesh DID** | `agt-federated-rag/mesh/agent_identity.py` | Ed25519-signed A2A callbacks; trust-score gating |
 | **FastEmbed + Qdrant** | `rag/qdrant_retriever.py` | BGE-M3 dense + BM25 sparse hybrid retrieval with server-side RRF |
-| **neo4j-graphrag** | `rag/neo4j_retriever.py` | Entity-graph context expansion |
-| **RRF fusion** | `rag/fusion.py` | Reciprocal Rank Fusion merges Qdrant and Neo4j results |
+| **neo4j-graphrag** | `rag/neo4j_retriever.py` | Graph-retrieval seam — **scaffolded but inert in the demo** (no Neo4j ingest, no graph traversal / entity-neighbourhood expansion); retrieval is Qdrant-only |
+| **RRF fusion** | `rag/fusion.py` | Reciprocal Rank Fusion merges Qdrant and Neo4j results (in the demo the Neo4j list is empty, so this fuses Qdrant only) |
 | **Keycloak** | `auth/token_exchange.py` | OIDC issuer; JWT validated via JWKS on every request |
 | **structlog** | throughout | Structured JSON logging with request-ID correlation |
 | **Pydantic v2** | `a2a/models.py`, `config.py` | Runtime type validation of all API payloads |
@@ -92,7 +92,7 @@ check_auth  ──── FlowDecision ────▶ generate_answer ──▶ 
 | 3. Rate limit checked | Redis fixed-window | `api/main.py:_check_rate_limit()` |
 | 4. Task stored | Redis (`task:{id}` key, 24 h TTL) | `api/main.py:_store_task()` |
 | 5. LangGraph invoked | `StateGraph.ainvoke()` | `agent/graph.py:run_query()` |
-| 6. **retrieve_local** | Qdrant BGE-M3 + BM25 → RRF → Neo4j entity graph | `agent/nodes.py:retrieve_local` |
+| 6. **retrieve_local** | Qdrant BGE-M3 + BM25 → RRF (graph retriever is called but inert, so it returns nothing) | `agent/nodes.py:retrieve_local` |
 | 7. **check_auth** | OpenFGA `check(user, viewer, chunk)` per retrieved chunk | `agent/nodes.py:check_auth` → `auth/openfga.py` |
 | 8. FlowDecision = `LOCAL_ALLOWED` | All chunks pass → `generate_answer` | `agent/graph.py:route_after_auth()` |
 | 9. **generate_answer** | NVIDIA NIM (OpenAI-compatible) with retrieved context | `agent/nodes.py:generate_answer` |
@@ -295,7 +295,8 @@ from agentmesh.lifecycle import LifecycleManager   # Credential rotation
 from agent_sre.slo import SLI, SLO, SLIValue       # Error budget management
 
 # agent-os-kernel / agent-governance-toolkit ── Policy enforcement
-# consumed via GovernanceMiddleware in agt-federated-rag/agent/graph.py
+# consumed via the govern_action("agent.graph.invoke") gate in run_query
+# (agt-federated-rag/agent/graph.py) and per-node _enforce() in agent/nodes.py
 ```
 
 Source: `agt-federated-rag/mesh/agent_identity.py`, `agt-federated-rag/sre.py`
@@ -365,18 +366,33 @@ tracker.record_interaction(agent_id, peer_did, "policy_violation", success=False
 tracker.record_interaction(agent_id, peer_did, "call_failure", success=False)
 ```
 
-### GovernanceMiddleware wrapping LangGraph
+### Graph-invocation governance gate (inside `run_query`, not a middleware)
 
 ```python
-# agt-federated-rag/agent/graph.py
-# Every graph.ainvoke() passes through AGT's policy engine first:
-result = await govern_action("rag.query", {"user_id": user_id, "query": query})
-if not result.allowed:
-    raise PermissionError(result.reason)   # → HTTP 403
+# agt-federated-rag/agent/graph.py — run_query()
+# Before the graph is even compiled, an AgentMesh govern_action gate runs. The
+# mesh client carries a real policy (default-allow + a priority-1000 deny rule on
+# kill_switch_engaged), so this is an enforcing OPERATOR KILL-SWITCH — defense in
+# depth on top of the real data-path controls (per-node _enforce default-deny +
+# OpenFGA per-chunk ReBAC), not a data-authorization control.
+gov = await govern_action(
+    "agent.graph.invoke",
+    {"user_id": user_id, "task_id": task_id,
+     "kill_switch_engaged": settings.agent_kill_switch_engaged},
+)
+if not gov.allowed:
+    raise PermissionError(...)   # short-circuits before any node/retrieval/LLM
 
-# Graph runs ONLY after policy clears
+# Graph runs ONLY if the gate allows
+graph = await _get_compiled_graph()
 final_state = await graph.ainvoke(initial_state)
 ```
+
+> When `AGENT_KILL_SWITCH_ENGAGED=true`, the `/query` endpoint also refuses up front
+> with HTTP **503**; the internal `govern_action` deny is caught inside the request
+> handlers (SSE `error` event on `/query`, signed `status="failed"` on `/a2a/query`)
+> — the guarantee is the early denial, not a 403. It's a deploy-time lever (settings
+> read once at startup → restart to engage), NOT a trust-based auto-trip.
 
 ### SRE middleware (agent_sre)
 
@@ -398,14 +414,14 @@ class SREMiddleware:
 
 ## AGT / AgentMesh additions (Cluster-B only)
 
-Cluster-B runs `agt-federated-rag/` which wraps LangGraph with Microsoft AGT.
+Cluster-B runs `agt-federated-rag/`, which adds a Microsoft AGT / AgentMesh layer around its LangGraph agent.
 
 | Feature | Code | What it does |
 |---------|------|--------------|
-| `GovernanceMiddleware` | `agent/graph.py` | Wraps every `StateGraph.ainvoke()` — enforces YAML policies, emits audit events |
+| Graph-invocation gate | `agent/graph.py` (`run_query`) | `run_query` calls `govern_action("agent.graph.invoke")` before the graph compiles — emits an AgentMesh audit event and is an enforcing operator kill-switch (deny on `kill_switch_engaged`; deploy-time lever — requires restart to engage). It is a gate inside `run_query`, **not** a middleware that wraps `StateGraph.ainvoke()`. |
 | AgentMesh DID | `mesh/agent_identity.py` | Cluster-B has a permanent Ed25519 identity; every callback is signed |
 | Signature verification | `mesh/agent_identity.py:verify_signed_message()` | Inbound A2A callbacks rejected if signature doesn't verify against payload |
-| Trust scoring | AgentMesh registry | Anomalous behaviour decays score; below threshold → kill-switch |
+| Trust scoring | AgentMesh registry | Tracks **peer** trust (decays a peer's score on IATP/policy/call failures); gates peer actions. NOTE: self-trust only ever rises, so it does **not** drive the kill-switch — the kill-switch is the operator flag above. |
 | SRE middleware | `sre.py:SREMiddleware` | Per-request SLO tracking; P99 latency budget enforced |
 | `/identity` endpoint | `api/main.py:identity()` | Returns `{did, cluster, public_key_jwk}` for peer configuration |
 
@@ -462,7 +478,7 @@ The clusters federate: when the AI Ops team needs a regulatory answer, Cluster-A
 **Act 4 — Compliance team query (Cluster-B direct)**
 - Bob types: `What are our obligations when an AI system makes an automated hiring decision?`
 - Answer: GDPR Article 22 + EU AI Act high-risk classification for employment AI
-- Talking point: this goes through AGT `GovernanceMiddleware` — YAML policy check, audit event emitted, trust score updated before LangGraph even runs
+- Talking point: before the graph runs, `run_query` calls AGT's `govern_action("agent.graph.invoke")` gate — it emits an AgentMesh audit event and acts as an enforcing operator kill-switch; the real per-request authorization is per-node `_enforce` (default-deny) + OpenFGA per-chunk ReBAC
 
 **Act 5 — Another A2A scenario**
 - Alice types: `We had an AI model produce biased outputs in production — what do we do?`

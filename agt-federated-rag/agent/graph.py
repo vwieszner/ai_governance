@@ -30,15 +30,30 @@ There are two ENFORCING layers, both fail-closed:
 
 ``run_query`` additionally calls ``govern_action("agent.graph.invoke", ...)``
 (AgentMesh ``AgentMeshClient.execute_with_governance``) and raises if it returns
-``allowed=False``. This is wired as a DEFENCE-IN-DEPTH / audit hook, NOT a
-working kill-switch: ``get_mesh()`` constructs the client with no policy YAML, so
-the library loads its built-in allow-all baseline and the gate can never deny
-(and the client's own trust score only ever rises). The named
-``GovernanceMiddleware`` from earlier designs is NOT used here. A real
-trust-based kill-switch would require an agentmesh-format policy with a concrete
-threshold AND a downward trust signal — a design change tracked separately, not
-something this gate provides today. The data-path controls above remain
-fail-closed regardless.
+``allowed=False``. This is DEFENCE-IN-DEPTH on top of the two data-path layers
+above — an operator KILL-SWITCH, not a data-authorization control. ``get_mesh()``
+now builds the client with a real agentmesh-format policy
+(``_GRAPH_GOVERNANCE_POLICY``: ``default_action: allow`` + a priority-1000 deny
+rule on ``kill_switch_engaged``), so the gate genuinely DENIES — verified
+empirically — when ``run_query`` injects ``settings.agent_kill_switch_engaged ==
+True`` into the context: the deny raises ``PermissionError`` before the graph is
+even compiled (no node runs, no retrieval, no LLM). NOTE on the HTTP surface: this
+``PermissionError`` is caught *inside* the request handlers — ``/query`` reports it
+as an SSE ``error`` event (the stream is already HTTP 200) and ``/a2a/query``
+returns a signed ``status="failed"`` (HTTP 200); it does NOT surface as a 403
+unless the endpoint also checks the flag before streaming. The security-relevant
+guarantee is the early denial, not the status code.
+
+SCOPE / HONESTY (do not overclaim): this is a DEPLOY-TIME operator disable lever.
+``settings`` is read once at startup, so engaging it means setting
+``AGENT_KILL_SWITCH_ENGAGED=true`` and RESTARTING the agent — it is NOT an instant
+runtime lever, and it is NOT the automatic trust-based self-trust trip. The mesh
+client's self-trust starts at 0.5 and only ever rises, so a trust-threshold rule
+could never function as a kill-switch; an automatic downward-trust-degradation
+signal remains a separately-tracked design item. The named ``GovernanceMiddleware``
+from earlier designs is NOT used here. The fail-closed DATA-PATH controls above
+(per-node ``_enforce`` default-deny + OpenFGA per-chunk ReBAC) are unchanged and
+remain the real access-control boundary regardless of this gate.
 
 Compiled graph singleton
 ------------------------
@@ -72,6 +87,7 @@ from agent.nodes import (
     start_approval,
 )
 from agent.state import AgentState, FlowDecision
+from config import settings
 from mesh.agent_identity import govern_action
 
 log = structlog.get_logger(__name__)
@@ -228,13 +244,24 @@ async def run_query(
 
     log.info("agent_graph_invoked", user_id=user_id, task_id=initial_state["task_id"])
 
-    # AGT governance gate — every graph invocation is checked by the AgentMesh
-    # governance engine (AgentMeshClient.execute_with_governance) and recorded in
-    # its audit log. A denial (e.g. agent trust score below threshold — the AGT
-    # kill-switch) rejects the invocation before any node runs.
+    # AGT governance gate (kill-switch) — every graph invocation is checked by the
+    # AgentMesh governance engine (AgentMeshClient.execute_with_governance) and
+    # recorded in its audit log. The mesh client carries a real policy
+    # (_GRAPH_GOVERNANCE_POLICY) whose only deny rule fires on `kill_switch_engaged`,
+    # so when an operator has set AGENT_KILL_SWITCH_ENGAGED=true this DENIES the
+    # invocation before any node runs (and before the graph is compiled). This is a
+    # deploy-time operator off-switch (settings is read once at startup → restart to
+    # engage), NOT a data-authorization control — see the module docstring. The raised
+    # PermissionError is caught inside the request handlers (SSE error event on /query;
+    # signed status="failed" on /a2a/query) — the guarantee is the early denial before
+    # any node/retrieval/LLM, not a particular HTTP status code.
     gov = await govern_action(
         "agent.graph.invoke",
-        {"user_id": user_id, "task_id": initial_state["task_id"]},
+        {
+            "user_id": user_id,
+            "task_id": initial_state["task_id"],
+            "kill_switch_engaged": settings.agent_kill_switch_engaged,
+        },
     )
     if not gov.allowed:
         log.warning("agent_graph_invocation_denied", user_id=user_id, decision=gov.decision)

@@ -1,4 +1,10 @@
-"""Document ingestion pipeline: split → embed → upsert into Qdrant and Neo4j.
+"""Document ingestion pipeline: split → embed → upsert into Qdrant.
+
+NOTE: despite the GraphRAGRetriever wiring below, this pipeline writes to **Qdrant
+only** — it does NOT write Chunk nodes or a vector index to Neo4j.  The graph
+retriever is constructed (and its driver closed) for symmetry with the query
+path, but no Neo4j ingest happens here, so graph retrieval stays inert.  Wiring a
+real Neo4j ingest path is future work.
 
 Design decisions:
 - make_chunk_id: SHA-256 over the text gives a stable, content-addressable ID.
@@ -8,9 +14,10 @@ Design decisions:
   dependency-free.  Overlap is expressed in words so context is preserved
   across chunk boundaries.  ValueError is raised eagerly if overlap >= chunk_size
   to prevent infinite loops or degenerate splits.
-- ingest_documents: opens Qdrant and Neo4j clients in a try/finally to guarantee
-  close() is called even on partial failure.  Files are read, split, and upserted
-  one at a time to bound memory usage.
+- ingest_documents: opens the Qdrant retriever and (for symmetry/cleanup) the
+  Neo4j-backed GraphRAGRetriever in a try/finally so close() runs even on partial
+  failure.  Only Qdrant is written; the Neo4j client performs no ingest.  Files
+  are read, split, and upserted one at a time to bound memory usage.
 - cli() entry point: allows `python -m rag.ingest path/to/docs...` for batch
   ingestion from the command line or container init jobs.
 """
@@ -91,11 +98,11 @@ async def ingest_documents(
     chunk_size: int = 512,
     overlap: int = 64,
 ) -> None:
-    """Ingest a list of document files into Qdrant (and optionally Neo4j).
+    """Ingest a list of document files into Qdrant (Neo4j is NOT written).
 
     Each file is read as UTF-8 text, split into overlapping word-based chunks,
-    and upserted into Qdrant.  Neo4j ingestion requires a separate graph-import
-    pipeline and is noted here for future extension.
+    and upserted into Qdrant.  Neo4j ingestion would require a separate graph-import
+    pipeline and is left as future work — so graph retrieval is inert in the demo.
 
     The Qdrant and Neo4j clients are closed in a try/finally block to ensure
     connections are released even on partial failure.

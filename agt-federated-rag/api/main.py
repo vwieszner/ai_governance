@@ -510,7 +510,25 @@ async def query(
     Output: SSE stream with "result" events and a final "done" event.
 
     Rate limit: queries exceeding max_query_length are rejected with 400.
+
+    Kill-switch: when the operator has set AGENT_KILL_SWITCH_ENGAGED=true this
+    endpoint refuses with HTTP 503 (Service Unavailable = administrative disable)
+    BEFORE the SSE stream opens or any auth/retrieval/LLM work runs. 503 (not 403)
+    is the correct signal for a load balancer / health monitor: the query path is
+    administratively down, not a per-request authz denial. The internal
+    govern_action gate in run_query still denies independently (defense in depth /
+    AgentMesh audit), but catching the flag here gives callers a clean unsigned
+    HTTP status instead of a 200 SSE stream that immediately errors.
     """
+    # Kill-switch: refuse the whole query path before doing any work. /health
+    # stays 200 (the process is up); only this query surface is disabled.
+    if settings.agent_kill_switch_engaged:
+        log.warning("kill_switch_refused_query", agt_audit=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Agent administratively disabled (kill-switch engaged)",
+        )
+
     # Validate JWT and extract user identity
     try:
         token, claims = await _get_bearer_token(authorization)

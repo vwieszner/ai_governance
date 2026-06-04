@@ -8,10 +8,18 @@ Design decisions:
 - retrieve_context is the primary entry point.  It returns dicts with the same
   schema as HybridQdrantRetriever.retrieve so that rag/fusion.py can treat
   results from both retrievers uniformly.
-- The Neo4j VectorRetriever is used for graph-augmented retrieval (hop expansion
-  is configured via neo4j_graph_hops in settings).  For query embeddings we
-  reuse the same BGE-M3 model that Qdrant uses, embedding synchronously in an
-  executor to stay non-blocking.
+- The Neo4j VectorRetriever does plain vector lookup of Chunk nodes — it does
+  NOT traverse graph edges or expand entity neighbourhoods.  (The settings field
+  ``neo4j_graph_hops`` is reserved for a future traversal retriever and is not
+  read anywhere today.)  For query embeddings we reuse the same BGE-M3 model that
+  Qdrant uses, embedding synchronously in an executor to stay non-blocking.
+
+NOTE — as built, this retriever is INERT in the demo: the AGT ingest pipeline
+(rag/ingest.py) only upserts to Qdrant and never writes Chunk nodes or the
+``chunk_embedding`` vector index to Neo4j.  With no index, _sync_init() flips
+``_graph_unavailable`` and retrieve_context() returns [], so retrieval is
+Qdrant-only.  This class is kept as the graph-retrieval seam for when a Neo4j
+ingest path and a traversal retriever are wired up.
 """
 from __future__ import annotations
 
@@ -154,7 +162,10 @@ class GraphRAGRetriever:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     async def retrieve_context(self, query: str) -> list[dict]:
-        """Retrieve graph-augmented context for *query*.
+        """Retrieve vector-matched chunks from the Neo4j vector index for *query*.
+
+        This is plain vector lookup, NOT graph traversal.  In the demo it returns
+        an empty list (see the module docstring: no Neo4j ingest → no index).
 
         Returns:
             List of dicts with keys: chunk_id, text, metadata, score.

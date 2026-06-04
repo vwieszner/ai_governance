@@ -59,7 +59,7 @@ NVIDIA-hosted LLM are wired in end to end.
    │  Temporal   :7233   approval workflows  (queues: approval-queue-a / -b)          │
    │  Postgres           durable datastore for OpenFGA (compose volume)               │
    │  Qdrant     :16333  hybrid vectors      (collections: knowledge_base_a / _b)     │
-   │  Neo4j      :17687  GraphRAG entity graph                                        │
+   │  Neo4j      :17687  graph-retrieval seam (scaffolded; demo runs Qdrant-only)     │
    │  Redis      :6379   task store          (db /1 = cluster-a, db /2 = cluster-b)   │
    └───────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -126,8 +126,8 @@ The matching OpenFGA tuples are seeded by `setup_all.py` (its summary prints **6
 | Human approval | **Temporal** | Signal-based approval workflows, 24 h timeout |
 | Identity / OIDC | **Keycloak** | Realm `rag`, JWT issuance, JWKS validation, RFC 8693 token exchange |
 | Cross-cluster identity | **RFC 8693 Token Exchange** | Delegate the user's identity to the peer agent |
-| Vector retrieval | **Qdrant + FastEmbed** | Hybrid `BAAI/bge-large-en-v1.5` dense + `Qdrant/bm25` sparse, server-side RRF |
-| Graph retrieval | **Neo4j GraphRAG** | Entity-graph context (embeddings: `nvidia/nv-embedqa-e5-v5`) |
+| Vector retrieval | **Qdrant + FastEmbed** | Hybrid `BAAI/bge-large-en-v1.5` dense + `Qdrant/bm25` sparse, server-side RRF — **this is the retrieval the demo actually runs** |
+| Graph retrieval | **Neo4j** (scaffolded, not exercised by the demo) | The `neo4j-graphrag` seam is wired into both codebases and RRF-fused with Qdrant, but **no graph traversal / entity-neighbourhood expansion is performed** and the demo runs Qdrant-only — see the GraphRAG note below |
 | Agent governance | **AGT / AgentMesh** (the `agt-federated-rag/` federation) | DID identity, per-message Ed25519 signing, registry trust, governed actions |
 | Inter-agent protocol | **A2A** | Typed `AgentCard` / `Task` / status-update messaging between clusters |
 | API | **FastAPI** | Both backends; SSE streaming |
@@ -169,8 +169,15 @@ federation (`:8010` / `:8012`) is exercised via its `POST /query` SSE endpoint (
 > store id), restart that solution's backends so they pick up the new store —
 > `.\scripts\clusters.ps1 restart a2a-a a2a-b` (or `agt-a agt-b`).
 
-> `--no-neo4j` runs a fast Qdrant-only ingest (GraphRAG context is empty). For full Neo4j
-> GraphRAG, run `setup_all.py` **without** `--no-neo4j` (slower; one LLM call per chunk).
+> **GraphRAG / Neo4j status (what actually runs).** Retrieval in the demo is **Qdrant-only**
+> (hybrid dense + sparse with server-side RRF). The Neo4j graph-retrieval path is scaffolded but
+> **inert**, and even when populated it does plain vector/keyword lookup of chunks — there is **no
+> graph traversal or entity-neighbourhood expansion** (`neo4j_graph_hops` is reserved and unused):
+> - **AGT** (`agt-federated-rag/`): the ingest pipeline only upserts Qdrant and never writes Neo4j,
+>   so the graph retriever always degrades to empty and contributes nothing to fusion.
+> - **A2A** (`federated-rag/`): the full ingest path *can* populate Neo4j (run `setup_all.py`
+>   **without** `--no-neo4j`; slower, one LLM call per chunk) and the retriever is a `HybridRetriever`
+>   (vector + keyword), but the documented demo runs `--no-neo4j`, so the Neo4j path is not exercised.
 >
 > After any Docker restart that drops Qdrant data, re-run step 2 to re-ingest and re-seed.
 
@@ -180,8 +187,8 @@ federation (`:8010` / `:8012`) is exercised via its `POST /query` SSE endpoint (
 
 | Path | Contents |
 |------|----------|
-| `federated-rag/` | The **A2A federation** — one codebase run as **both** clusters (cluster-a `:8000` via `.env`, cluster-b `:8002` via `.env.cluster-b`). FastAPI `api/`, LangGraph `agent/` (graph + nodes + state), `rag/` (Qdrant hybrid + Neo4j GraphRAG + RRF fusion + ingest), `auth/` (OpenFGA checks, JWT validation, RFC 8693 exchange), `a2a/` (peer client + Pydantic models), `workflow/` (Temporal approval + activities + worker). Also `tests/docs/` source documents. |
-| `agt-federated-rag/` | The **AGT / AgentMesh federation** — one codebase run as **both** clusters (cluster-a `:8010`, cluster-b `:8012`). Same RAG/auth/workflow structure plus `mesh/` (Ed25519 DID identity, signed peer client + the real HTTP `/a2a/query` transport), `sre.py` (SLO/SLI middleware), and AGT `GovernanceMiddleware` wrapping the LangGraph in `agent/graph.py`. Bring-up: `setup_agt.py`. |
+| `federated-rag/` | The **A2A federation** — one codebase run as **both** clusters (cluster-a `:8000` via `.env`, cluster-b `:8002` via `.env.cluster-b`). FastAPI `api/`, LangGraph `agent/` (graph + nodes + state), `rag/` (Qdrant hybrid retrieval + a scaffolded-but-unexercised Neo4j graph-retrieval seam + RRF fusion + ingest), `auth/` (OpenFGA checks, JWT validation, RFC 8693 exchange), `a2a/` (peer client + Pydantic models), `workflow/` (Temporal approval + activities + worker). Also `tests/docs/` source documents. |
+| `agt-federated-rag/` | The **AGT / AgentMesh federation** — one codebase run as **both** clusters (cluster-a `:8010`, cluster-b `:8012`). Same RAG/auth/workflow structure plus `mesh/` (Ed25519 DID identity, signed peer client + the real HTTP `/a2a/query` transport), `sre.py` (SLO/SLI middleware), and an AGT `govern_action("agent.graph.invoke")` gate inside `run_query` in `agent/graph.py` (an enforcing operator kill-switch, not a wrapping middleware). Bring-up: `setup_agt.py`. |
 | `ui/` | React + Vite frontend. `src/components/` (LoginForm, ChatArea, MonitorPanel, UserPane, TaskMessage), `src/api/` (auth, rag). `.env.prod` points the UI at the real backends + Keycloak. |
 | `scripts/` | `clusters.ps1` (start/stop/restart/status for all four backends + workers, by name: `a2a-a a2a-b agt-a agt-b`) and `logs.ps1` (filtered tail of a backend's structured log). |
 | (root) | `docker-compose.yml`, `setup_all.py` (A2A federation), `setup_agt.py` (AGT federation), `init_secrets.py`, `launch_all.ps1`, and the docs below. |
@@ -210,9 +217,16 @@ existing **SECURITY_REVIEW.md** for the detailed findings log):
   alone never grants reads.
 - **Per-user rate limiting** (Redis fixed-window) and an **ASGI body-size limit** (never buffers
   SSE) protect the expensive query endpoint.
-- **AGT GovernanceMiddleware** (the `agt-federated-rag/` federation) enforces policy and emits audit
-  events before the graph runs; cross-cluster calls are authenticated by **per-message Ed25519 DID
-  signatures** verified in both directions, with registry-membership trust gating peer actions.
+- **AGT graph-invocation gate** (the `agt-federated-rag/` federation) — `run_query` calls
+  `govern_action("agent.graph.invoke")` (AgentMesh) before the graph is compiled, and the mesh client
+  now carries a real policy (default-allow + a priority-1000 deny on `kill_switch_engaged`), so it is
+  an **enforcing operator kill-switch** (deploy-time — `settings` is read once at startup, so engaging
+  it requires setting `AGENT_KILL_SWITCH_ENGAGED=true` and **restarting** the agent; it is not an
+  instant runtime lever, nor a trust-based auto-trip): with the flag set, the query path is refused
+  (`/query` → 503) and the internal deny short-circuits before any node/retrieval/LLM. It is
+  defense-in-depth — the real data-path controls are per-node `_enforce` (default-deny) + OpenFGA
+  per-chunk ReBAC. Cross-cluster calls are authenticated by **per-message Ed25519 DID signatures**
+  verified in both directions, with registry-membership trust gating peer actions.
 
 ---
 

@@ -54,6 +54,42 @@ log = structlog.get_logger(__name__)
 # restarts so the DID name is predictable for peer configuration.
 _AGENT_ID: str = f"rag-agent-{settings.cluster_id}"
 
+# ── Graph-level governance policy for AgentMeshClient ─────────────────────────
+# A real agentmesh-format policy (not the library's built-in allow-all baseline)
+# so the graph-level `govern_action` gate in agent.graph.run_query is an ENFORCING
+# control, not a decorative no-op. Semantics:
+#   • default_action: allow  → normal operation is preserved (every governed
+#     action — agent.graph.invoke, peer.send_message — passes unless a deny rule
+#     matches), so wiring this policy in cannot regress the working flows.
+#   • kill-switch-deny-graph-invoke (priority 1000) → DENIES whenever the request
+#     context carries `kill_switch_engaged: true`. run_query injects
+#     `settings.agent_kill_switch_engaged` into the govern_action context, so an
+#     operator can disable this agent by setting AGENT_KILL_SWITCH_ENGAGED=true.
+#
+# SCOPE / HONESTY: this is a DEPLOY-TIME operator disable lever — `settings` is
+# built once at startup, so engaging the kill-switch means editing the env and
+# RESTARTING the agent; it is NOT an instant runtime lever, and NOT an automatic
+# trust-based self-trust trip (the mesh client's self-trust starts at 0.5 and only
+# rises, so a trust-threshold rule could never function as a kill-switch — that
+# automatic-trust-degradation control remains a design item). The real, fail-closed
+# DATA-PATH enforcement is unchanged and lives elsewhere: per-node `_enforce`
+# (Agent OS PolicyEvaluator, default-deny) + OpenFGA per-chunk ReBAC. This gate is
+# defense-in-depth / an emergency off-switch on top of those.
+_GRAPH_GOVERNANCE_POLICY = """\
+apiVersion: governance.toolkit/v1
+name: rag-graph-governance
+agents:
+  - "*"
+default_action: allow
+rules:
+  - name: kill-switch-deny-graph-invoke
+    description: Operator kill-switch engaged — deny graph invocation
+    stage: pre_tool
+    condition: kill_switch_engaged
+    action: deny
+    priority: 1000
+"""
+
 # Trust scores in the toolkit are integers on a 0–1000 scale; settings express
 # the threshold as a 0.0–1.0 float. Convert at the boundary.
 _TRUST_SCALE = 1000.0
@@ -172,9 +208,15 @@ async def get_mesh() -> AgentMeshClient:
         return _mesh_client
     async with _lock:
         if _mesh_client is None:
+            # Pass a real agentmesh-format policy (default-allow + a kill-switch
+            # deny rule) instead of leaving the library to load its built-in
+            # allow-all baseline — this makes the graph-level govern_action gate
+            # in run_query an enforcing operator off-switch (see
+            # _GRAPH_GOVERNANCE_POLICY for scope/honesty notes).
             _mesh_client = AgentMeshClient(
                 agent_id=_AGENT_ID,
                 capabilities=["rag.query", "a2a.federate"],
+                policy_yaml=_GRAPH_GOVERNANCE_POLICY,
             )
             log.info("agentmesh_client_ready", agent_id=_AGENT_ID)
     return _mesh_client

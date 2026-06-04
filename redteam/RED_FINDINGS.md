@@ -1,6 +1,6 @@
 # RED_FINDINGS.md — Red-team adversarial probe results
 
-_Generated: 2026-06-04 00:12:39 by redteam/run_probes.py_
+_Generated: 2026-06-04 14:40:45 by redteam/run_probes.py_
 
 Targets: A2A (federated-rag) :8000/:8002, AGT (agt-federated-rag) :8010/:8012, OpenFGA :8089, Keycloak :8087.
 
@@ -71,7 +71,7 @@ Verdicts: **DEFENDED** = control rejected the attack as designed; **VULNERABLE**
 
 ## Round 2 — deeper vectors
 
-_Generated: 2026-06-04 01:01:26 by redteam/run_probes_r2.py_
+_Generated: 2026-06-04 14:42:35 by redteam/run_probes_r2.py_
 
 Round 1 was clean (43 DEFENDED / 0 VULNERABLE / 4 EXPECTED). Round 2 goes deeper: SSRF, JWT audience confusion + cross-cluster/cross-solution token reuse, kid/alg confusion, signed-message replay, direct OpenFGA tuple writes, rate-limit subject bypass, AGT governance-gate coverage, and prompt injection.
 

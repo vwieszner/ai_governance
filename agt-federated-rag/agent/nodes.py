@@ -244,7 +244,11 @@ async def _get_temporal() -> TemporalClient:
 # ── Node: retrieve_local ──────────────────────────────────────────────────────
 
 async def retrieve_local(state: AgentState) -> dict[str, Any]:
-    """Run hybrid Qdrant + GraphRAG retrieval, then RRF-fuse the results.
+    """Run hybrid Qdrant retrieval, RRF-fused with the Neo4j graph-retrieval seam.
+
+    The graph retriever is invoked but is INERT: AGT ingest never writes Neo4j, so
+    its vector index doesn't exist and retrieve_context() returns [] — retrieval is
+    Qdrant-only. (It is also plain vector lookup, not graph traversal.)
 
     AGT policy enforced: ``rag.retrieve``
     Context fields passed to the evaluator:
