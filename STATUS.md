@@ -2,7 +2,8 @@
 
 _Last updated: 2026-06-04 (session 2 — hardening pass: TODO #1–3 resolved, kill-switch now an enforcing
 operator off-switch (live-tested), both probe suites re-verified 0 VULNERABLE, git-history secret scan clean,
-CORS/replay doc accuracy fixed). Read this first when resuming. Verified-clean checkpoint._
+CORS/replay doc accuracy fixed; + approval inbox feature: Flow B now completable end-to-end in the UI).
+Two local commits ahead of `origin/main` — push needs explicit approval._
 
 ## TL;DR
 Two federated-RAG solutions, each running as **two clusters that federate**. Both work end-to-end;
