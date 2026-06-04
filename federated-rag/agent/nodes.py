@@ -142,8 +142,6 @@ _llm_lock: asyncio.Lock = asyncio.Lock()
 _intent_llm_lock: asyncio.Lock = asyncio.Lock()
 _temporal_lock: asyncio.Lock = asyncio.Lock()
 
-# Small fast model for cheap YES/NO intent classification.
-# Using llama-3.2-3b — free tier on NVIDIA NIM, sub-second latency.
 _INTENT_MODEL = "meta/llama-3.2-3b-instruct"
 
 
@@ -192,7 +190,6 @@ async def _get_llm() -> ChatOpenAI:
                 openai_api_base=settings.openai_api_base,
                 openai_api_key=settings.openai_api_key,
                 temperature=settings.llm_temperature,
-                max_tokens=settings.llm_max_tokens,
                 timeout=settings.llm_timeout_seconds,
                 max_retries=settings.llm_max_retries,
             )
@@ -215,9 +212,10 @@ async def _get_intent_llm() -> ChatOpenAI:
                 openai_api_base=settings.openai_api_base,
                 openai_api_key=settings.openai_api_key,
                 temperature=0.0,
-                max_tokens=5,
-                timeout=settings.llm_timeout_seconds,
-                max_retries=settings.llm_max_retries,
+                # NOTE: this NVIDIA NIM endpoint rejects max_tokens/max_completion_tokens
+                # with a 400, so it is intentionally omitted.
+                timeout=20.0,             # bounded; first call may cold-start the small model
+                max_retries=1,
             )
     return _intent_llm
 
@@ -288,12 +286,60 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     # L-5: guard against empty chunk_ids — batch_decide with an empty list is a
     # no-op but makes the logic below cleaner, and avoids a spurious OpenFGA call.
     if not chunk_ids:
-        return {
-            "flow": FlowDecision.REMOTE if (not fused and settings.peer_agent_url) else FlowDecision.LOCAL_DENIED,
+        # No local data. Before paying for a cross-cluster federated round-trip,
+        # classify intent: company-data questions go to the peer; general/personal
+        # chit-chat is answered directly here. Fail open (peer) on any error.
+        empty_flow = FlowDecision.LOCAL_DENIED
+        if not fused and settings.peer_agent_url:
+            empty_flow = FlowDecision.REMOTE
+            try:
+                intent_llm = await _get_intent_llm()
+                intent_resp = await intent_llm.ainvoke(
+                    "Classify whether a question is about COMPANY DATA (policies, salaries, "
+                    "compensation, HR, finances, revenue, infrastructure, Kubernetes, technical "
+                    "documentation, internal systems) or is GENERAL/PERSONAL chit-chat (greetings, "
+                    "how are you, opinions, jokes, world facts).\n"
+                    "Reply with ONLY the single word COMPANY or GENERAL.\n\n"
+                    "Question: How much do senior engineers earn?\nClassification: COMPANY\n"
+                    "Question: how is your day?\nClassification: GENERAL\n"
+                    "Question: what's the weather like?\nClassification: GENERAL\n"
+                    "Question: What Kubernetes version do we run?\nClassification: COMPANY\n"
+                    f"Question: {state['query']}\nClassification:"
+                )
+                raw = (intent_resp.content if hasattr(intent_resp, "content") else str(intent_resp))
+                # The small model may ramble / echo the few-shot examples — only the
+                # FIRST non-empty line is the actual classification.
+                first = next((ln.strip().upper() for ln in str(raw).splitlines() if ln.strip()), "")
+                empty_flow = FlowDecision.REMOTE if first.startswith("COMPANY") else FlowDecision.LOCAL_DENIED
+                log.info("intent_classified", classification=first[:20], routed=empty_flow.value)
+            except Exception as exc:
+                log.warning("intent_check_failed", error=str(exc))
+                empty_flow = FlowDecision.REMOTE  # fail open — let the peer decide
+
+        result_empty: dict[str, Any] = {
+            "flow": empty_flow,
             "allowed_chunk_ids": [],
             "pending_chunk_ids": [],
             "denied_chunk_ids": [],
         }
+        # If we're answering directly (general chit-chat / no peer), generate a
+        # helpful response via the LLM instead of returning a bare empty string.
+        if empty_flow == FlowDecision.LOCAL_DENIED:
+            try:
+                llm = await _get_llm()
+                resp = await llm.ainvoke(
+                    "You are a helpful AI assistant for a company knowledge-base system. "
+                    "The user asked something that isn't a company-data question, or no "
+                    "relevant information exists.\n\n"
+                    f"User's message: {state['query']}\n\n"
+                    "Reply briefly and naturally (1-2 sentences). If it's casual chit-chat, "
+                    "respond warmly but note you're specialised for company knowledge questions."
+                )
+                result_empty["status_message"] = resp.content if hasattr(resp, "content") else str(resp)
+            except Exception as exc:
+                log.warning("no_results_llm_message_failed", error=str(exc))
+                result_empty["status_message"] = "I'm specialised for company knowledge questions and couldn't find anything relevant to that."
+        return result_empty
     decisions = await auth.batch_decide(user_id, chunk_ids)
 
     allowed = [cid for cid, d in decisions.items() if d == AuthzDecision.ALLOWED]
@@ -321,14 +367,21 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         try:
             llm = await _get_intent_llm()
             intent_resp = await llm.ainvoke(
-                "You are a classifier. Reply with exactly one word: YES if this question "
-                "could reasonably be answered by a company knowledge base (policies, "
-                "salaries, infrastructure, financials, HR, technical docs, etc), NO if "
-                "it is a general/conversational/personal question unrelated to company data.\n"
-                f"Question: {state['query']}\nAnswer:"
+                "Classify whether a question is about COMPANY DATA (policies, salaries, "
+                "compensation, HR, finances, revenue, infrastructure, Kubernetes, technical "
+                "documentation, internal systems) or is GENERAL/PERSONAL chit-chat (greetings, "
+                "how are you, opinions, jokes, world facts).\n"
+                "Reply with ONLY the single word COMPANY or GENERAL.\n\n"
+                "Question: How much do senior engineers earn?\nClassification: COMPANY\n"
+                "Question: how is your day?\nClassification: GENERAL\n"
+                "Question: what's the weather like?\nClassification: GENERAL\n"
+                "Question: What Kubernetes version do we run?\nClassification: COMPANY\n"
+                f"Question: {state['query']}\nClassification:"
             )
             intent_text = (intent_resp.content if hasattr(intent_resp, "content") else str(intent_resp)).strip().upper()
-            flow = FlowDecision.REMOTE if "YES" in intent_text else FlowDecision.LOCAL_DENIED
+            # Route to the peer only if it's company data; otherwise answer directly.
+            flow = FlowDecision.REMOTE if "COMPANY" in intent_text else FlowDecision.LOCAL_DENIED
+            log.info("intent_classified", classification=intent_text[:20], routed=flow.value)
         except Exception as exc:
             log.warning("intent_check_failed", error=str(exc))
             flow = FlowDecision.REMOTE  # fail open — let the peer decide
