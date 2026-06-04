@@ -19,6 +19,14 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy: {
+        // NOTE: more-specific prefixes must come first — /api/agt-a before /api/a
+        // otherwise Vite matches /api/a first and strips only that prefix, leaving
+        // "gt-a/..." which the AGT backend doesn't recognise.
+        '/api/agt-a': {
+          target: agtAUrl,
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api\/agt-a/, ''),
+        },
         '/api/a': {
           target: clusterAUrl,
           changeOrigin: true,
@@ -28,11 +36,6 @@ export default defineConfig(({ mode }) => {
           target: clusterBUrl,
           changeOrigin: true,
           rewrite: (path) => path.replace(/^\/api\/b/, ''),
-        },
-        '/api/agt-a': {
-          target: agtAUrl,
-          changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/api\/agt-a/, ''),
         },
         '/auth/a': {
           target: keycloakAUrl,
