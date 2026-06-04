@@ -1,10 +1,10 @@
 import { useState, type FormEvent } from 'react'
-import { getToken, AuthError } from '../api/auth'
+import { getToken, AuthError, type AuthTokens } from '../api/auth'
 import type { ClusterConfig } from '../types'
 
 interface Props {
   cluster: ClusterConfig
-  onLogin: (token: string, username: string) => void
+  onLogin: (tokens: AuthTokens, username: string) => void
 }
 
 export function LoginForm({ cluster, onLogin }: Props) {
@@ -18,8 +18,8 @@ export function LoginForm({ cluster, onLogin }: Props) {
     setError('')
     setLoading(true)
     try {
-      const token = await getToken(cluster.authBase, cluster.clientId, username, password)
-      onLogin(token, username)
+      const tokens = await getToken(cluster.authBase, cluster.clientId, username, password)
+      onLogin(tokens, username)
     } catch (err) {
       setError(err instanceof AuthError ? err.message : 'Login failed — check credentials')
     } finally {

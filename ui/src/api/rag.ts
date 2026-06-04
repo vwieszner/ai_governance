@@ -213,11 +213,114 @@ async function submitQueryClusterA(
   }
 }
 
+// ── AGT cluster: POST /query → status / result / done SSE events ─────────────
+
+async function submitQueryAGT(
+  cluster: ClusterConfig,
+  user: string,
+  token: string,
+  query: string,
+  onTask: TaskCallback,
+  onEvent: EventCallback,
+): Promise<void> {
+  const taskId = crypto.randomUUID()
+
+  // Show the query bubble immediately — don't wait for the first SSE event
+  const task = blankTask(taskId, query)
+  onTask({ ...task })
+  onEvent(makeEvent(cluster, user, 'query_sent', taskId, query))
+
+  const res = await fetch(`${cluster.apiBase}/query`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify({
+      query,
+      task_id: taskId,
+      context_id: crypto.randomUUID(),
+    }),
+  })
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    task.state = 'failed'
+    task.statusMessage = `Error ${res.status}: ${text}`
+    onTask({ ...task })
+    const code = res.status === 401 ? '401' : res.status === 429 ? '429' : res.status >= 500 ? '500' : String(res.status)
+    throw new RagError(task.statusMessage, code)
+  }
+
+  task.state = 'working'
+  onTask({ ...task })
+
+  for await (const { event, data } of readSSE(res)) {
+    if (event === 'status') {
+      // {"status":"working"} — keep the row in the working state
+      task.state = 'working'
+      task.updatedAt = new Date()
+      onTask({ ...task })
+      onEvent(makeEvent(cluster, user, 'agent_working', taskId, 'working'))
+      continue
+    }
+
+    if (event === 'error') {
+      // Governance denial or backend exception — surfaced AFTER the stream opens
+      let message = 'Request failed'
+      try {
+        const parsed = JSON.parse(data) as Record<string, unknown>
+        message = (parsed['error'] as string) ?? message
+      } catch { /* keep default */ }
+      task.state = 'failed'
+      task.statusMessage = message
+      task.updatedAt = new Date()
+      onTask({ ...task })
+      onEvent(makeEvent(cluster, user, 'failed', taskId, message))
+      continue
+    }
+
+    if (event === 'result') {
+      let parsed: Record<string, unknown>
+      try { parsed = JSON.parse(data) } catch { continue }
+
+      const answer = (parsed['answer'] as string) ?? ''
+      const statusMessage = (parsed['status_message'] as string) ?? ''
+      const flow = (parsed['flow'] as string) ?? ''
+      const approvalRequestId = (parsed['approval_request_id'] as string | null) ?? null
+
+      // Classify like the AGT backend's own a2a_query mapper: key on
+      // approval_request_id FIRST. format_response overwrites a None answer
+      // with the (LLM-generated, not literally "pending") status_message, so
+      // the approval case carries a non-empty answer — keying on answer alone
+      // would misclassify it as completed and the approval prompt never shows.
+      let state: TaskState
+      if (approvalRequestId) state = 'input-required'
+      else if (statusMessage.toLowerCase().includes('pending')) state = 'input-required'
+      else if (answer) state = 'completed'
+      else state = 'working'
+
+      task.state = state
+      task.answer = answer
+      task.statusMessage = statusMessage
+      task.flow = flow || task.flow
+      task.approvalRequestId = approvalRequestId ?? task.approvalRequestId
+      task.updatedAt = new Date()
+      onTask({ ...task })
+      onEvent(makeEvent(cluster, user, inferKind(statusMessage, state), taskId, statusMessage || state))
+      continue
+    }
+
+    // event === 'done' (or unknown): stream ended — nothing more to emit
+  }
+}
+
 // ── Unified entry point ───────────────────────────────────────────────────────
 
-// Both clusters run the same federated-rag (A2A) codebase, so both speak the
-// A2A protocol: POST /tasks/send with task_status_update SSE events. There is no
-// separate /query path anymore.
+// Dispatch by the cluster's wire protocol: AGT clusters speak POST /query with
+// status/result/done SSE events; A2A clusters speak POST /tasks/send with
+// task_status_update events.
 export function submitQuery(
   cluster: ClusterConfig,
   user: string,
@@ -226,6 +329,9 @@ export function submitQuery(
   onTask: TaskCallback,
   onEvent: EventCallback,
 ): Promise<void> {
+  if (cluster.protocol === 'agt') {
+    return submitQueryAGT(cluster, user, token, query, onTask, onEvent)
+  }
   return submitQueryClusterA(cluster, user, token, query, onTask, onEvent)
 }
 

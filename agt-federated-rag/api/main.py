@@ -941,6 +941,125 @@ async def handle_approval(
     return JSONResponse(content={"message": "Decision recorded. Thank you."})
 
 
+# ── GET /approvals/pending ────────────────────────────────────────────────────
+
+@app.get("/approvals/pending")
+async def list_pending_approvals(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Authenticated approver inbox — the pending access requests THIS caller
+    (as data owner) is entitled to decide.
+
+    The requester never learns the ``request_id`` (L-6); only the owner can
+    enumerate the requests routed to them. Implemented by listing running
+    ``ApprovalWorkflow`` executions and keeping those whose designated approver
+    == the caller's ``sub``. (Demo-scale: O(open requests) point queries;
+    production would index the approver as a Temporal search attribute.)
+
+    Returns ``{"pending": [{"request_id", "requester_id", "query"}]}``.
+    """
+    _, claims = await _get_bearer_token(authorization)
+    caller_sub = claims.get("sub", "")
+    temporal_client: TemporalClient = request.app.state.temporal_client
+    pending: list[dict[str, str]] = []
+    try:
+        scanned = 0
+        async for wf in temporal_client.list_workflows(
+            "WorkflowType = 'ApprovalWorkflow' AND ExecutionStatus = 'Running'"
+        ):
+            scanned += 1
+            if scanned > 200:          # bound the scan for safety
+                break
+            try:
+                info = await temporal_client.get_workflow_handle(wf.id).query("get_info")
+            except Exception:
+                continue                # workflow completing / not yet queryable — skip
+            if info.get("decided") or info.get("approver_id") != caller_sub:
+                continue
+            pending.append({
+                "request_id": wf.id.removeprefix("approval-"),
+                "requester_id": str(info.get("user_id", "")),
+                "query": str(info.get("query", "")),
+            })
+    except Exception as e:
+        log.error("list_pending_approvals_failed", error=str(e))
+        raise HTTPException(status_code=503, detail="Approval service temporarily unavailable")
+    return JSONResponse(content={"pending": pending}, status_code=200)
+
+
+# ── POST /approvals/{request_id}/decision ─────────────────────────────────────
+
+@app.post("/approvals/{request_id}/decision")
+async def authenticated_approval(
+    request_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Authenticated approval decision — the product/UI path, alongside the HMAC
+    deep-link (`/approve`).
+
+    Why a second path: the deep-link is a bearer credential (anyone holding the
+    signed URL can decide) and records the approver as the constant
+    ``"approval-deeplink"`` — no human attribution. Here the caller's JWT is the
+    credential, so the decision carries REAL attribution and the backend verifies
+    the caller is the data owner before signalling Temporal.
+
+    - Bearer JWT required (``_get_bearer_token`` → 401 on missing/invalid).
+    - 403 unless the caller's ``sub`` == the request's designated approver (owner).
+    - 404 if no open approval workflow; 409 if already decided.
+    Body: ``{"decision": "approve"|"deny", "reason": "<optional>"}``.
+    """
+    # request_id is a server-generated uuid4; constrain it so it cannot be used
+    # to inject into the Temporal workflow-id namespace.
+    _validate_safe_id(request_id, "request_id")
+
+    _, claims = await _get_bearer_token(authorization)
+    approver_sub = claims.get("sub", "")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body must be valid JSON")
+    decision = body.get("decision")
+    if decision not in ("approve", "deny"):
+        raise HTTPException(status_code=400, detail="'decision' must be 'approve' or 'deny'")
+    reason = str(body.get("reason", ""))[:500]
+
+    temporal_client: TemporalClient = request.app.state.temporal_client
+    handle = temporal_client.get_workflow_handle(f"approval-{request_id}")
+
+    # Owner-verification: query the workflow for its designated approver. A
+    # closed/absent workflow → 404; the caller must be that approver → else 403.
+    try:
+        info = await handle.query("get_info")
+    except Exception as e:
+        log.warning("authenticated_approval_query_failed", error=str(e))
+        raise HTTPException(status_code=404, detail="No open approval request found")
+    if info.get("decided"):
+        raise HTTPException(status_code=409, detail="This request has already been decided")
+    if approver_sub != info.get("approver_id"):
+        log.warning("authenticated_approval_forbidden_not_owner")
+        raise HTTPException(status_code=403, detail="Only the data owner may decide this request")
+
+    try:
+        await handle.signal(
+            "approval_decision",
+            ApprovalDecisionSignal(
+                decision="approved" if decision == "approve" else "denied",
+                reason=reason,
+                approver_id=approver_sub,  # real human attribution (vs the HMAC link's constant)
+            ),
+        )
+    except Exception as e:
+        # S-6: log full details internally, return a generic message to the caller.
+        log.error("authenticated_approval_signal_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to record decision. Please try again.")
+
+    log.info("authenticated_approval_recorded", decision=decision, agt_audit=True)
+    return JSONResponse(content={"status": "recorded"}, status_code=200)
+
+
 # ── Exception handlers ────────────────────────────────────────────────────────
 
 @app.exception_handler(PermissionError)

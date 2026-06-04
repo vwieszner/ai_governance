@@ -280,16 +280,54 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     # querying and wastes a cross-cluster round-trip the peer will also deny.
     local_results_exist = bool(fused)
     if pending:
-        # Some chunks require human approval — start workflow, don't serve anything yet
         flow = FlowDecision.LOCAL_NEEDS_APPROVAL
     elif allowed:
         flow = FlowDecision.LOCAL_ALLOWED
     elif not local_results_exist and settings.peer_agent_url:
-        # No local data at all — ask the peer cluster
-        flow = FlowDecision.REMOTE
+        # Only route to the peer when Qdrant found zero results locally — meaning
+        # the topic may exist on the peer. Before making the expensive federated
+        # call, do a fast LLM intent check so conversational/off-topic queries
+        # (e.g. "how is your day?") get an instant response instead of a 16s
+        # round-trip through two clusters and two LLM calls.
+        try:
+            llm = await _get_llm()
+            intent_resp = await llm.ainvoke(
+                "You are a classifier. Reply with exactly one word: YES if this question "
+                "could reasonably be answered by a company knowledge base (policies, "
+                "salaries, infrastructure, financials, HR, technical docs, etc), NO if "
+                "it is a general/conversational/personal question unrelated to company data.\n"
+                f"Question: {state['query']}\nAnswer:"
+            )
+            intent_text = (intent_resp.content if hasattr(intent_resp, "content") else str(intent_resp)).strip().upper()
+            flow = FlowDecision.REMOTE if "YES" in intent_text else FlowDecision.LOCAL_DENIED
+        except Exception as exc:
+            log.warning("intent_check_failed", error=str(exc))
+            flow = FlowDecision.REMOTE  # fail open — let the peer decide
     else:
-        # Local data exists but user is denied for all of it
         flow = FlowDecision.LOCAL_DENIED
+
+    # When there are NO results at all (not even denied ones) and no peer, or
+    # when we have local denied results, set a status_message via LLM so the
+    # agent responds helpfully instead of returning a generic empty string.
+    status_message: str | None = None
+    if flow == FlowDecision.LOCAL_DENIED or (not local_results_exist and not settings.peer_agent_url):
+        try:
+            llm = await _get_llm()
+            prompt = (
+                "You are a helpful AI assistant for a company knowledge base. "
+                "A user has asked a question but no relevant information was found "
+                "in the knowledge base, or access was denied.\n\n"
+                f"User's question: {state['query']}\n\n"
+                "Write a short, helpful response (1-2 sentences) acknowledging their question "
+                "and explaining that you don't have relevant information available to answer it. "
+                "If it seems like a general/conversational question not suited for a knowledge base, "
+                "gently clarify that you're specialised for company knowledge queries."
+            )
+            response = await llm.ainvoke(prompt)
+            status_message = response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            log.warning("no_results_llm_message_failed", error=str(exc))
+            status_message = "I couldn't find relevant information in the knowledge base to answer your question."
 
     log.info(
         "auth_decision",
@@ -307,7 +345,7 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     serveable_ids = set(allowed) | set(pending)
     pruned_chunks = [c for c in fused if c.get("chunk_id") in serveable_ids]
 
-    return {
+    result: dict[str, Any] = {
         "flow": flow,
         "fused_chunks": pruned_chunks,
         "qdrant_results": [],
@@ -316,6 +354,9 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         "pending_chunk_ids": pending,
         "denied_chunk_ids": denied,
     }
+    if status_message is not None:
+        result["status_message"] = status_message
+    return result
 
 
 # ── Node: generate_answer ─────────────────────────────────────────────────────
@@ -643,9 +684,26 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
         }
 
     else:
+        # Peer found nothing or errored — respond via LLM rather than a generic string
+        try:
+            llm = await _get_llm()
+            prompt = (
+                "You are a helpful AI assistant for a company knowledge base. "
+                "You searched both local and remote cluster knowledge bases but found no relevant information.\n\n"
+                f"User's question: {state['query']}\n\n"
+                "Write a short, helpful response (1-2 sentences). If this looks like a "
+                "general/conversational question, gently explain you're specialised for "
+                "company knowledge queries. If it looks like a genuine knowledge query, "
+                "acknowledge you couldn't find relevant information."
+            )
+            response = await llm.ainvoke(prompt)
+            status_message = response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            log.warning("remote_denied_llm_message_failed", error=str(exc))
+            status_message = "I searched the federated knowledge base but couldn't find relevant information to answer your question."
         return {
             "flow": FlowDecision.REMOTE_DENIED,
-            "status_message": "The remote cluster could not fulfil your request.",
+            "status_message": status_message,
             "answer": None,
         }
 

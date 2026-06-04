@@ -5,6 +5,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const clusterAUrl  = env.CLUSTER_A_URL   || 'http://localhost:8000'
   const clusterBUrl  = env.CLUSTER_B_URL   || 'http://localhost:8002'
+  const agtAUrl      = env.AGT_A_URL       || 'http://localhost:8010'
   const keycloakAUrl = env.KEYCLOAK_A_URL  || 'http://localhost:8080'
   const keycloakBUrl = env.KEYCLOAK_B_URL  || 'http://localhost:8080'
   // Empty REALM_ = demo mode: auth served by the mock cluster directly at /token
@@ -27,6 +28,11 @@ export default defineConfig(({ mode }) => {
           target: clusterBUrl,
           changeOrigin: true,
           rewrite: (path) => path.replace(/^\/api\/b/, ''),
+        },
+        '/api/agt-a': {
+          target: agtAUrl,
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api\/agt-a/, ''),
         },
         '/auth/a': {
           target: keycloakAUrl,

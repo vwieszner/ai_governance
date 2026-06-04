@@ -347,10 +347,24 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     elif allowed:
         flow = FlowDecision.LOCAL_ALLOWED
     elif not local_results_exist and settings.peer_agent_url:
-        # MED-4: no local data at all — ask peer
-        flow = FlowDecision.REMOTE
+        # MED-4: no local data at all — ask peer, but first check intent so
+        # conversational queries get an instant response instead of a 16s
+        # round-trip through two clusters and two LLM calls.
+        try:
+            llm = await _get_llm()
+            intent_resp = await llm.ainvoke(
+                "You are a classifier. Reply with exactly one word: YES if this question "
+                "could reasonably be answered by a company knowledge base (policies, "
+                "salaries, infrastructure, financials, HR, technical docs, etc), NO if "
+                "it is a general/conversational/personal question unrelated to company data.\n"
+                f"Question: {state['query']}\nAnswer:"
+            )
+            intent_text = (intent_resp.content if hasattr(intent_resp, "content") else str(intent_resp)).strip().upper()
+            flow = FlowDecision.REMOTE if "YES" in intent_text else FlowDecision.LOCAL_DENIED
+        except Exception as exc:
+            log.warning("intent_check_failed", error=str(exc))
+            flow = FlowDecision.REMOTE  # fail open
     else:
-        # Local data exists but user is denied for all of it
         flow = FlowDecision.LOCAL_DENIED
 
     log.info(
@@ -362,15 +376,35 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         agt_audit=True,
     )
 
+    # When no results exist (denied or no data) and there's nowhere else to go,
+    # use the LLM to generate a helpful response rather than a generic empty string.
+    status_message: str | None = None
+    if flow == FlowDecision.LOCAL_DENIED or (not local_results_exist and not settings.peer_agent_url):
+        try:
+            llm = await _get_llm()
+            prompt = (
+                "You are a helpful AI assistant for a company knowledge base. "
+                "A user has asked a question but no relevant information was found "
+                "in the knowledge base, or access was denied.\n\n"
+                f"User's question: {state['query']}\n\n"
+                "Write a short, helpful response (1-2 sentences) acknowledging their question "
+                "and explaining that you don't have relevant information available to answer it. "
+                "If it seems like a general/conversational question not suited for a knowledge base, "
+                "gently clarify that you're specialised for company knowledge queries."
+            )
+            response = await llm.ainvoke(prompt)
+            status_message = response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            log.warning("no_results_llm_message_failed", error=str(exc))
+            status_message = "I couldn't find relevant information in the knowledge base to answer your question."
+
     # Finding #6: drop the *text* of denied chunks from state so unauthorised
     # content is not carried in the AgentState snapshot / Langfuse traces / OTEL
-    # spans. generate_answer needs allowed-chunk text and start_approval needs
-    # pending-chunk IDs — nothing downstream needs denied-chunk content, and the
-    # raw qdrant/graph result lists are no longer used after fusion.
+    # spans.
     serveable_ids = set(allowed) | set(pending)
     pruned_chunks = [c for c in fused if c.get("chunk_id") in serveable_ids]
 
-    return {
+    result: dict[str, Any] = {
         "flow": flow,
         "fused_chunks": pruned_chunks,
         "qdrant_results": [],
@@ -379,6 +413,9 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         "pending_chunk_ids": pending,
         "denied_chunk_ids": denied,
     }
+    if status_message is not None:
+        result["status_message"] = status_message
+    return result
 
 
 # ── Node: generate_answer ─────────────────────────────────────────────────────
@@ -746,9 +783,25 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
         }
 
     else:
+        try:
+            llm = await _get_llm()
+            prompt = (
+                "You are a helpful AI assistant for a company knowledge base. "
+                "You searched both local and remote cluster knowledge bases but found no relevant information.\n\n"
+                f"User's question: {state['query']}\n\n"
+                "Write a short, helpful response (1-2 sentences). If this looks like a "
+                "general/conversational question, gently explain you're specialised for "
+                "company knowledge queries. If it looks like a genuine knowledge query, "
+                "acknowledge you couldn't find relevant information."
+            )
+            response = await llm.ainvoke(prompt)
+            status_message = response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            log.warning("remote_denied_llm_message_failed", error=str(exc))
+            status_message = "I searched the federated knowledge base but couldn't find relevant information to answer your question."
         return {
             "flow": FlowDecision.REMOTE_DENIED,
-            "status_message": "The remote cluster could not fulfil your request.",
+            "status_message": status_message,
             "answer": None,
         }
 
