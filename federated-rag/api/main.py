@@ -500,6 +500,15 @@ async def send_task(
             "data": task.model_dump_json(by_alias=True),
         }
 
+        # Live progress channel: nodes push human-readable lines (incl. the
+        # cross-cluster agent-to-agent conversation) onto this queue; we stream
+        # each one out as an intermediate task_status_update so the UI Monitor
+        # shows the federation happening instead of a single opaque "working".
+        progress_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        async def progress_cb(line: str) -> None:
+            await progress_queue.put(line)
+
         # R-3: wrap run_query in a Task so client disconnect cancels it
         # N3-5: asyncio.create_task() is the preferred API (ensure_future deprecated)
         # GQ-5: parameterize Task with the return type for static analysis
@@ -510,10 +519,22 @@ async def send_task(
                 user_token=user_token,
                 task_id=task_id,
                 context_id=req.context_id or "",
+                progress_cb=progress_cb,
             )
         )
 
         try:
+            # Drain progress lines as they arrive, until the graph finishes.
+            while not run_task.done() or not progress_queue.empty():
+                try:
+                    line = await asyncio.wait_for(progress_queue.get(), timeout=0.3)
+                except asyncio.TimeoutError:
+                    continue
+                task.status = TaskStatus(state=TaskState.WORKING, message=line)
+                yield {
+                    "event": "task_status_update",
+                    "data": task.model_dump_json(by_alias=True),
+                }
             final_state = await run_task
         except asyncio.CancelledError:
             # Client disconnected — cancel background work and stop the stream

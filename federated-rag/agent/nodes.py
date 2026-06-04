@@ -71,6 +71,35 @@ def set_user_token(token: str) -> None:
     _user_token_ctx.set(token)
 
 
+# ── Live progress channel (for the UI Monitor) ────────────────────────────────
+# Nodes emit human-readable progress lines so the front-end can show the agent's
+# reasoning + the inter-agent (cross-cluster) conversation as it happens, instead
+# of a single opaque "working -> done". The callback is an async function set per
+# request; it streams each line out as an SSE event.
+_progress_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "progress_cb", default=None
+)
+
+
+def set_progress_cb(cb: Any) -> None:
+    """Register the async progress callback for this request (set in run_query)."""
+    _progress_ctx.set(cb)
+
+
+async def _emit(message: str) -> None:
+    """Send a progress line to the UI Monitor if a callback is registered.
+
+    Best-effort: a failure here must never break the actual query.
+    """
+    cb = _progress_ctx.get()
+    if cb is None:
+        return
+    try:
+        await cb(message)
+    except Exception as exc:  # pragma: no cover - telemetry must not break the flow
+        log.debug("progress_emit_failed", error=str(exc))
+
+
 # ── Output DLP: credential-leak HARD-DENY (task #10, OWASP ASI-05) ────────────
 #
 # Post-LLM output safety control. Scans the final answer for credential/secret
@@ -249,6 +278,7 @@ async def retrieve_local(state: AgentState) -> dict[str, Any]:
     # L3-2: log query_len only at DEBUG — the query itself may contain PII and
     # would otherwise appear in OTEL/Langfuse telemetry at INFO level.
     log.debug("node_retrieve_local", query_len=len(state["query"]))
+    await _emit(f"🔎 Agent {settings.cluster_id}: searching my local knowledge base…")
     query = state["query"]
 
     qdrant_results = await (await _get_qdrant()).retrieve(query)
@@ -312,6 +342,8 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
                 first = next((ln.strip().upper() for ln in str(raw).splitlines() if ln.strip()), "")
                 empty_flow = FlowDecision.REMOTE if first.startswith("COMPANY") else FlowDecision.LOCAL_DENIED
                 log.info("intent_classified", classification=first[:20], routed=empty_flow.value)
+                if empty_flow == FlowDecision.LOCAL_DENIED:
+                    await _emit(f"💬 Agent {settings.cluster_id}: this isn't a company-data question — answering directly, no delegation needed.")
             except Exception as exc:
                 log.warning("intent_check_failed", error=str(exc))
                 empty_flow = FlowDecision.REMOTE  # fail open — let the peer decide
@@ -451,6 +483,7 @@ async def generate_answer(state: AgentState) -> dict[str, Any]:
     (estimated as budget_tokens × 4) before calling the model.
     """
     log.info("node_generate_answer", user_id=state["user_id"])
+    await _emit(f"✅ Agent {settings.cluster_id}: found data you're authorized to see — generating the answer…")
     allowed_ids = set(state["allowed_chunk_ids"])
     context_chunks = [
         c for c in state["fused_chunks"] if c.get("chunk_id") in allowed_ids
@@ -502,6 +535,7 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
     FIX C-6: reuses the module-level Temporal singleton via _get_temporal().
     """
     log.info("node_start_approval", user_id=state["user_id"])
+    await _emit(f"🔐 Agent {settings.cluster_id}: data found but it's restricted — requesting approval from the data owner…")
     auth = await _get_openfga()
     user_id = state["user_id"]
 
@@ -620,6 +654,10 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     the delegated token is stored in a context var — never in AgentState.
     """
     log.info("node_call_peer_agent", user_id=state["user_id"])
+    await _emit(
+        f"🤝 Agent {settings.cluster_id} → peer: I have no local match for this. "
+        "Asking the peer cluster if it can answer (delegating the user's identity)…"
+    )
     if not settings.peer_agent_url:
         return {
             "error": "No peer agent configured.",
@@ -649,6 +687,7 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
 
     push_url = f"{settings.agent_url}/tasks/{state['task_id']}/callback"
 
+    await _emit("📡 Peer cluster received the delegated query — it is now checking its own knowledge base and this user's authorization…")
     try:
         task = await client.send_task(
             query=state["query"],
@@ -658,6 +697,7 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
         )
     except Exception as e:
         log.error("peer_a2a_call_failed", error=str(e))
+        await _emit("⚠️ Peer cluster could not be reached.")
         return {"error": str(e), "flow": FlowDecision.REMOTE_DENIED}
     finally:
         await client.close()
@@ -704,11 +744,13 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
         raw_answer = state.get("peer_answer") or ""
         if not raw_answer:
             log.warning("handle_peer_result_empty_answer", peer_task_id=state.get("peer_task_id"))
+            await _emit("↩️ Peer cluster ← could not help (it had no answer for this user).")
             return {
                 "flow": FlowDecision.REMOTE_DENIED,
                 "status_message": "Peer agent completed but returned no answer.",
                 "answer": None,
             }
+        await _emit("✅ Peer cluster ← answered. Relaying the federated answer to the user…")
         # LLM on this cluster synthesizes the peer's answer, making the
         # federation visible and confirming cross-cluster retrieval.
         try:
@@ -737,6 +779,7 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
         }
 
     elif peer_status == "input-required":
+        await _emit("🔐 Peer cluster ← it has the data, but its data owner must approve access first.")
         try:
             llm = await _get_llm()
             prompt = (

@@ -36,6 +36,7 @@ from agent.nodes import (
     generate_answer,
     handle_peer_result,
     retrieve_local,
+    set_progress_cb,
     set_user_token,
     start_approval,
 )
@@ -142,6 +143,7 @@ async def run_query(
     user_token: str,
     task_id: str = "",
     context_id: str = "",
+    progress_cb: Any = None,
 ) -> AgentState:
     """
     Run the agent graph for a single query.
@@ -149,12 +151,16 @@ async def run_query(
     FIX C-5: user_token is passed to the nodes via a context var, not stored
     in AgentState. This keeps it out of Langfuse traces and serialised snapshots.
 
+    progress_cb: optional async callable(str) — nodes emit human-readable progress
+    lines through it so the UI can show the live agent / inter-agent conversation.
+
     Returns the final AgentState with `answer` and `status_message` populated.
     """
     # LG-4: uuid is now imported at module top; the local import here is removed
 
     # C-5: inject token into context var — never goes into the state dict
     set_user_token(user_token)
+    set_progress_cb(progress_cb)
 
     initial_state: AgentState = {
         "query": query,
