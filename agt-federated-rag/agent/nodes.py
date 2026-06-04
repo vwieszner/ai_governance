@@ -543,14 +543,41 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
             approval_request_id=approval_request_id,
         )
 
-    return {
-        "approval_request_id": approval_request_id,
-        # L-6: never echo approval_request_id in the user-visible message
-        "status_message": (
+    # LLM generates a contextual message. Only source names from metadata are
+    # passed — never chunk text — so the security boundary is preserved.
+    sources = sorted({
+        c.get("metadata", {}).get("source", "")
+        for c in state.get("fused_chunks", [])
+        if c.get("chunk_id") in set(chunk_ids)
+    } - {""})
+    source_hint = f" (relevant document: {', '.join(sources)})" if sources else ""
+    try:
+        llm = await _get_llm()
+        prompt = (
+            "You are a helpful AI assistant operating within a federated data governance system. "
+            "A user has asked a question that requires access to restricted data. "
+            "An approval request has been submitted to the data owner on their behalf.\n\n"
+            f"User's question: {state['query']}\n"
+            f"Relevant data source{source_hint}\n\n"
+            "Write a single short paragraph (2-3 sentences) to the user that:\n"
+            "1. Acknowledges what they asked about and confirms relevant information exists\n"
+            "2. Explains that access requires approval from the data owner\n"
+            "3. States that a request has been submitted and they will be notified\n"
+            "Do NOT reveal any of the actual data content. Be natural and helpful."
+        )
+        response = await llm.ainvoke(prompt)
+        status_message = response.content if hasattr(response, "content") else str(response)
+    except Exception as exc:
+        log.warning("approval_llm_message_failed", error=str(exc))
+        status_message = (
             "Your request is pending approval. "
             "The data owner has been notified and will review your request. "
             "You will be notified once a decision is made."
-        ),
+        )
+
+    return {
+        "approval_request_id": approval_request_id,
+        "status_message": status_message,
         "answer": None,
     }
 
@@ -663,21 +690,58 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
     log.info("node_handle_peer_result", peer_status=peer_status)
 
     if peer_status == "completed":
-        answer = state.get("peer_answer") or ""
+        raw_answer = state.get("peer_answer") or ""
+        try:
+            llm = await _get_llm()
+            prompt = (
+                "You are a helpful AI assistant in a federated multi-cluster system. "
+                "You asked a peer cluster a question on behalf of the user, and the peer "
+                "has returned an answer. Relay that answer to the user clearly.\n\n"
+                f"User's original question: {state['query']}\n\n"
+                f"Answer from the peer cluster:\n{raw_answer}\n\n"
+                "Write a natural response that:\n"
+                "1. Answers the user's question using the peer's information\n"
+                "2. Briefly notes the answer came from the federated peer cluster\n"
+                "Keep it concise and helpful."
+            )
+            response = await llm.ainvoke(prompt)
+            answer = response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            log.warning("peer_result_llm_synthesis_failed", error=str(exc))
+            answer = raw_answer
         return {
             "answer": answer,
+            "peer_answer": raw_answer,
             "flow": FlowDecision.REMOTE_APPROVED,
             "status_message": "completed",
         }
 
     elif peer_status == "input_required":
-        return {
-            "flow": FlowDecision.REMOTE_NEEDS_APPROVAL,
-            "status_message": (
+        try:
+            llm = await _get_llm()
+            prompt = (
+                "You are a helpful AI assistant in a federated multi-cluster system. "
+                "The user asked a question that requires data from a peer cluster. "
+                "That peer cluster has determined the user needs approval from its data owner "
+                "before the information can be shared.\n\n"
+                f"User's question: {state['query']}\n\n"
+                "Write a short, clear message (2-3 sentences) that:\n"
+                "1. Explains the requested information lives on a remote cluster\n"
+                "2. States that the remote data owner's approval is required\n"
+                "3. Confirms a request has been submitted and they will be notified"
+            )
+            response = await llm.ainvoke(prompt)
+            status_message = response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            log.warning("peer_approval_llm_message_failed", error=str(exc))
+            status_message = (
                 "The requested information is on the remote cluster and requires "
                 "approval from the remote data owner. You will be notified once a "
                 "decision is made."
-            ),
+            )
+        return {
+            "flow": FlowDecision.REMOTE_NEEDS_APPROVAL,
+            "status_message": status_message,
             "answer": None,
         }
 
