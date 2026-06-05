@@ -17,8 +17,9 @@ kill-switch), and — when the data belongs to someone else — opens a human **
 (Temporal) before releasing anything. It runs as **two clusters** of **two parallel
 implementations** (an OAuth RFC 8693 "A2A" variant and a Microsoft-AgentMesh DID "AGT" variant).
 
-The product goal is bigger than what exists: **deploy this across different clouds and different
-company divisions**, where each division is its own governed instance, **users within a division
+The product goal is bigger than what exists: **deploy this anywhere — cloud-agnostic / portable — across different
+company (and potentially partner-organization) divisions**, where each division is its own governed
+instance, **users within a division
 log in to their division**, and **agents in different divisions can collaborate** — so a question
 one division can't answer is answered, with consent, by another. When an owner **approves**, the
 **answer must reach the original requester's account even if that person was offline** at the
@@ -41,18 +42,22 @@ spec and are written as gap-driven requirements, not enhancements:
 
 ### Stated assumptions (correct any that are wrong at review)
 
-- **A-1 — One product, one governance model.** Two implementations (A2A / AGT) exist today; the
-  product **converges on the cryptographic-DID + per-action-policy governance model** (the
-  Microsoft AgentMesh toolkit direction). Requirements below describe **one** product; "pick one
-  federation" is an implementation decision, not a requirements fork.
+- **A-1 — One product, one governance model — DECIDED (AGT).** Two implementations (A2A / AGT)
+  existed; the product **converges on AGT — the cryptographic-DID + per-action-policy governance
+  model** (the Microsoft Agent Governance Toolkit / AgentMesh direction). The A2A (OAuth RFC 8693)
+  variant is **retired as the base**; its federated-user-identity technique is re-used at the *user*
+  layer only (FR-3.6). This is a settled decision, no longer an open assumption.
 - **A-2 — A division is an isolation boundary.** Each division is a self-contained governed
   deployment (its own data, identity, authorization, approvals). Cross-division access happens
   **only** through the federated agent + approval path, never by shared storage. Whether isolation
   is physical (separate stacks) or logical (scoped tenancy) is downstream; the **requirement is
   hard isolation**.
-- **A-3 — Identity is per-division, federated for collaboration.** Users authenticate to their own
-  division's identity provider. Cross-division agent trust is established between divisions, not by
-  putting all users in one realm.
+- **A-3 — Identity is per-division, federated for collaboration — TWO layers.** Users authenticate
+  to their own division's identity provider. Cross-division trust has two distinct layers: (1) a
+  **DID-authenticated, mutually-verified agent channel** between divisions, and (2) the requesting
+  **user's identity**, propagated as a **cryptographically verifiable assertion** and authorized by
+  the *receiving* division against its own store (FR-3.6). Neither layer puts all users in one
+  realm, and the receiving division never takes the peer agent's *word* for who the user is.
 - **A-4 — "Account" means a durable, server-side, per-user destination.** "Deliver to the
   requester's account even if offline" is satisfied by durable server-side storage bound to the
   user identity, surfaced on next login, **plus** an out-of-band notification — not by any
@@ -112,6 +117,20 @@ spec and are written as gap-driven requirements, not enhancements:
   lifecycle.
 - **FR-3.5** The system SHOULD support more than two divisions participating (no assumption of a
   single fixed peer); multi-party / multi-hop discovery is a forward requirement.
+- **FR-3.6** Every cross-division request SHALL carry the **requesting user's verifiable identity** —
+  a cryptographically validatable assertion federated from the user's home division (e.g. OAuth2
+  Token Exchange / RFC 8693, or OIDC federation) — **not** a bare claim the receiver must take on the
+  peer agent's word. The **receiving division SHALL authorize that user identity against its OWN
+  authorization store** (ReBAC, deny-by-default), independent of its trust in the requesting agent
+  beyond channel authentication, yielding one of **allowed / needs-approval / denied**. *(Today: the
+  AGT path forwards `user_id` as a DID-signed claim the peer vouches for — agent-vouched, not
+  user-verifiable; this requirement raises it to a federated, far-side-validated user identity. It is
+  distinct from and does not weaken FR-2.1 — the home-division login token still never leaves its
+  division.)*
+- **FR-3.7** When the propagated user is **already authorized** in the receiving division, the answer
+  SHALL be returned **immediately through the governed pipeline with no approval step**; an approval
+  is required only when the data needs its owner's consent (FR-5). The two cross-division outcomes —
+  directly-authorized vs needs-approval — are **distinct paths**, not one flow.
 
 ### FR-4 — Governance enforcement (the active governance toolkit)
 - **FR-4.1** Every agent action (retrieve, authorize, generate, delegate, send-to-peer,
@@ -187,7 +206,10 @@ spec and are written as gap-driven requirements, not enhancements:
   a division boundary. *(Today: shared datastores violate this.)*
 - **NFR-3 — Security posture (zero-trust).** All service-to-service and cross-division traffic SHALL
   be encrypted (TLS/mTLS); every request re-authorized at the resource; no auth-bypass modes in any
-  build. *(Today: localhost plaintext; mock-auth already removed.)*
+  build. Because cross-division **agent endpoints are internet-facing**, they SHALL use **mutual TLS
+  with certificate-identity validation and revocation (CRL/OCSP)** and SHALL support **periodic
+  DID/credential rotation** — a private-LAN posture is insufficient. *(Today: localhost plaintext;
+  mock-auth already removed.)*
 - **NFR-4 — Secrets management.** No secrets in source or tracked config; secrets centrally managed,
   rotatable, per-division. *(Today: `ui/.env.prod` is gitignored but contains a real NVIDIA key that
   must be rotated; `bootstrap_keycloak.py` carries default credentials.)*
@@ -229,13 +251,16 @@ spec and are written as gap-driven requirements, not enhancements:
   current authorization) is waiting in her account, with an out-of-band notification — no tab needed.
 - **SC-5 — Denied → declined message delivered.** Same as SC-4 but bob **denies**. *Expected:* alice
   receives a clear "declined" message (with reason where allowed) in her account, online or offline.
-- **SC-6 — Cross-division delegation by discovery.** alice (Division A) asks something only Division
-  B can answer; A's agent **does not know B in advance** — it discovers a capable peer, negotiates,
-  and (if B authorizes) returns the answer. *Expected:* answer delivered with consent; the
-  inter-agent conversation is visible in alice's monitor; identity verified both ways.
-- **SC-7 — Cross-division needs approval → offline delivery.** Like SC-6 but B's data needs its
-  owner's consent; alice goes offline. *Expected:* B's owner approves/denies; the outcome reaches
-  alice's **account in Division A** on next login (FR-6.6), cross-machine, no shared client state.
+- **SC-6 — Cross-division delegation by discovery, user authorized in B.** alice (Division A) asks
+  something only Division B can answer; A's agent **does not know B in advance** — it discovers a
+  capable peer and negotiates. alice's **verifiable identity is propagated** and **validated by B**
+  (not vouched for by A's agent); B finds alice **is authorized** for the data. *Expected:* answer
+  returned **immediately, no approval**; both agent identities verified; the inter-agent conversation
+  is visible in alice's monitor.
+- **SC-7 — Cross-division needs approval → offline delivery.** Like SC-6's discovery + identity
+  validation, but alice is **not** pre-authorized — B's data needs its owner's consent; alice goes
+  offline. *Expected:* B's owner approves/denies; the outcome reaches alice's **account in Division
+  A** on next login (FR-6.6), cross-machine, no shared client state.
 - **SC-8 — Time-bound access & revocation.** A previously approved access expires (or B's owner
   revokes it); alice re-asks. *Expected:* access is re-evaluated and re-enters approval — no stale
   reuse.
@@ -259,7 +284,9 @@ spec and are written as gap-driven requirements, not enhancements:
 - **Per-division login (FR-2, SC-2):** a Division-A token is rejected by Division-B services; role
   changes take effect; deny-by-default holds.
 - **Discovery + conversation (FR-3, SC-6):** remove all hardcoded peer URLs; A still finds and
-  negotiates with a capable peer; signatures verified; monitor shows the exchange.
+  negotiates with a capable peer; agent signatures verified; the **requesting user's identity is
+  validated by the receiver** (not agent-vouched) and authorized against B's own ReBAC; the
+  directly-authorized path returns with **no approval**; monitor shows the exchange.
 - **Offline delivery (FR-6, SC-4/SC-5/SC-7) — the headline:** approve/deny **with the requester's
   browser fully closed**; the answer/declined message is present on next login with **no 1-hour
   cap** and an out-of-band notification fired; verified cross-division and cross-machine.
