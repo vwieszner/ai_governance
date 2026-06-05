@@ -3,9 +3,8 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  const clusterAUrl  = env.CLUSTER_A_URL   || 'http://localhost:8000'
-  const clusterBUrl  = env.CLUSTER_B_URL   || 'http://localhost:8002'
   const agtAUrl      = env.AGT_A_URL       || 'http://localhost:8010'
+  const agtBUrl      = env.AGT_B_URL       || 'http://localhost:8012'
   const keycloakAUrl = env.KEYCLOAK_A_URL  || 'http://localhost:8087'
   const keycloakBUrl = env.KEYCLOAK_B_URL  || 'http://localhost:8087'
   // Keycloak realm for OIDC. Authentication is always against a real Keycloak.
@@ -19,23 +18,15 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy: {
-        // NOTE: more-specific prefixes must come first — /api/agt-a before /api/a
-        // otherwise Vite matches /api/a first and strips only that prefix, leaving
-        // "gt-a/..." which the AGT backend doesn't recognise.
         '/api/agt-a': {
           target: agtAUrl,
           changeOrigin: true,
           rewrite: (path) => path.replace(/^\/api\/agt-a/, ''),
         },
-        '/api/a': {
-          target: clusterAUrl,
+        '/api/agt-b': {
+          target: agtBUrl,
           changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/api\/a/, ''),
-        },
-        '/api/b': {
-          target: clusterBUrl,
-          changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/api\/b/, ''),
+          rewrite: (path) => path.replace(/^\/api\/agt-b/, ''),
         },
         '/auth/a': {
           target: keycloakAUrl,

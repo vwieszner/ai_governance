@@ -129,90 +129,6 @@ function blankTask(id: string, query: string): NormalizedTask {
 }
 
 
-// ── Cluster-A: POST /tasks/send → SSE task_status_update events ──────────────
-
-async function submitQueryClusterA(
-  cluster: ClusterConfig,
-  user: string,
-  token: string,
-  query: string,
-  onTask: TaskCallback,
-  onEvent: EventCallback,
-): Promise<void> {
-  const taskId = crypto.randomUUID()
-
-  // Show the query bubble immediately — don't wait for the first SSE event
-  const task = blankTask(taskId, query)
-  onTask({ ...task })
-  onEvent(makeEvent(cluster, user, 'query_sent', taskId, query))
-
-  const res = await fetch(`${cluster.apiBase}/tasks/send`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      Accept: 'text/event-stream',
-    },
-    body: JSON.stringify({
-      id: taskId,
-      message: {
-        role: 'user',
-        parts: [{ type: 'text', text: query }],
-        messageId: crypto.randomUUID(),
-        taskId,
-      },
-    }),
-  })
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    task.state = 'failed'
-    task.statusMessage = `Error ${res.status}: ${text}`
-    onTask({ ...task })
-    const code = res.status === 401 ? '401' : res.status === 429 ? '429' : res.status >= 500 ? '500' : String(res.status)
-    throw new RagError(task.statusMessage, code)
-  }
-
-  task.state = 'working'
-  onTask({ ...task })
-
-  for await (const { event, data } of readSSE(res)) {
-    // The federated-rag backend generates the answer server-side and streams it
-    // inside task_status_update events (answer is in the task history).
-    if (event !== 'task_status_update') continue
-
-    let parsed: Record<string, unknown>
-    try { parsed = JSON.parse(data) } catch { continue }
-
-    const status = (parsed['status'] as Record<string, unknown>) ?? {}
-    const state = (status['state'] as TaskState) ?? 'working'
-    const statusMessage = (status['message'] as string) ?? ''
-    const history = (parsed['history'] as unknown[]) ?? []
-    const metadata = (parsed['metadata'] as Record<string, unknown>) ?? {}
-
-    let answer = ''
-    for (let i = history.length - 1; i >= 0; i--) {
-      const msg = history[i] as Record<string, unknown>
-      if (msg['role'] === 'agent') {
-        const parts = (msg['parts'] as Record<string, unknown>[]) ?? []
-        const textPart = parts.find((p) => p['type'] === 'text')
-        answer = (textPart?.['text'] as string) ?? ''
-        break
-      }
-    }
-
-    task.state = state
-    task.statusMessage = statusMessage
-    task.answer = answer
-    task.flow = (metadata['flow'] as string) ?? task.flow
-    task.approvalRequestId = (metadata['approvalRequestId'] as string | null) ?? task.approvalRequestId
-    task.peerTaskId = (metadata['peerTaskId'] as string | null) ?? task.peerTaskId
-    task.updatedAt = new Date()
-    onTask({ ...task })
-    onEvent(makeEvent(cluster, user, inferKind(statusMessage, state), taskId, statusMessage || state))
-  }
-}
-
 // ── AGT cluster: POST /query → status / result / done SSE events ─────────────
 
 async function submitQueryAGT(
@@ -318,9 +234,7 @@ async function submitQueryAGT(
 
 // ── Unified entry point ───────────────────────────────────────────────────────
 
-// Dispatch by the cluster's wire protocol: AGT clusters speak POST /query with
-// status/result/done SSE events; A2A clusters speak POST /tasks/send with
-// task_status_update events.
+// AGT clusters speak POST /query with status/result/done SSE events.
 export function submitQuery(
   cluster: ClusterConfig,
   user: string,
@@ -329,10 +243,7 @@ export function submitQuery(
   onTask: TaskCallback,
   onEvent: EventCallback,
 ): Promise<void> {
-  if (cluster.protocol === 'agt') {
-    return submitQueryAGT(cluster, user, token, query, onTask, onEvent)
-  }
-  return submitQueryClusterA(cluster, user, token, query, onTask, onEvent)
+  return submitQueryAGT(cluster, user, token, query, onTask, onEvent)
 }
 
 // ── Approval outcome polling (requester side) ────────────────────────────────

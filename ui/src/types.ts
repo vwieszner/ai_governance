@@ -31,14 +31,14 @@ export type EventKind =
 export interface AgentEvent {
   id: string
   timestamp: Date
-  cluster: 'cluster-a' | 'cluster-b' | 'cluster-agt-a'
+  cluster: 'cluster-agt-a' | 'cluster-agt-b'
   user: string
   kind: EventKind
   taskId: string
   message: string
 }
 
-export type ClusterId = 'cluster-a' | 'cluster-b' | 'cluster-agt-a'
+export type ClusterId = 'cluster-agt-a' | 'cluster-agt-b'
 
 export interface ClusterConfig {
   id: ClusterId
@@ -48,40 +48,29 @@ export interface ClusterConfig {
   clientId: string
   apiBase: string
   authBase: string
-  /** Backend wire protocol: 'a2a' = POST /tasks/send; 'agt' = POST /query */
-  protocol: 'a2a' | 'agt'
+  /** Backend wire protocol: 'agt' = POST /query (AgentMesh DID federation) */
+  protocol: 'agt'
 }
 
 // Labels are configurable via VITE_CLUSTER_A_LABEL / VITE_CLUSTER_B_LABEL in the env file.
 // apiBase / authBase are Vite proxy paths — never localhost URLs.
-export const CLUSTER_A: ClusterConfig = {
-  id: 'cluster-a',
-  label: import.meta.env.VITE_CLUSTER_A_LABEL ?? 'Cluster A',
-  defaultUser: 'alice',
-  clientId: 'rag-ui',
-  apiBase: '/api/a',
-  authBase: '/auth/a',
-  protocol: 'a2a',
-}
-
-export const CLUSTER_B: ClusterConfig = {
-  id: 'cluster-b',
-  label: import.meta.env.VITE_CLUSTER_B_LABEL ?? 'Cluster B',
-  defaultUser: 'bob',
-  clientId: 'rag-ui',
-  apiBase: '/api/b',
-  authBase: '/auth/b',
-  protocol: 'a2a',
-}
-
-// The REAL AGT cluster A (:8010) — speaks AGT's /query SSE protocol, not A2A.
 export const CLUSTER_AGT_A: ClusterConfig = {
   id: 'cluster-agt-a',
-  label: 'AGT Federated RAG (Cluster A)',
-  defaultUser: 'bob',
+  label: import.meta.env.VITE_CLUSTER_A_LABEL ?? 'AGT Cluster A',
+  defaultUser: 'alice',
   clientId: 'rag-ui',
   apiBase: '/api/agt-a',
   authBase: '/auth/a',
+  protocol: 'agt',
+}
+
+export const CLUSTER_AGT_B: ClusterConfig = {
+  id: 'cluster-agt-b',
+  label: import.meta.env.VITE_CLUSTER_B_LABEL ?? 'AGT Cluster B',
+  defaultUser: 'bob',
+  clientId: 'rag-ui',
+  apiBase: '/api/agt-b',
+  authBase: '/auth/b',
   protocol: 'agt',
 }
 
@@ -90,4 +79,4 @@ export const CLUSTER_AGT_A: ClusterConfig = {
  * App.tsx maps this array to panes, so adding a cluster is one config entry
  * + one vite proxy entry — no App.tsx edit needed.
  */
-export const CLUSTERS: ClusterConfig[] = [CLUSTER_A, CLUSTER_AGT_A]
+export const CLUSTERS: ClusterConfig[] = [CLUSTER_AGT_A, CLUSTER_AGT_B]
