@@ -1,16 +1,15 @@
-# clusters.ps1 — one place that knows all four backends, so we stop hand-typing
+# clusters.ps1 — one place that knows both AGT backends, so we stop hand-typing
 # the kill-port / Start-Process / poll-health incantation over and over.
 #
-# Both federations run the SAME code per solution, selected by RAG_ENV_FILE:
-#   a2a-a / a2a-b  -> federated-rag      (.env / .env.cluster-b)   ports 8000 / 8002
+# Both clusters run the SAME agt-federated-rag code, selected by RAG_ENV_FILE:
 #   agt-a / agt-b  -> agt-federated-rag  (.env / .env.cluster-b)   ports 8010 / 8012
 #
 # Usage (dot-source NOT required; call directly):
-#   .\scripts\clusters.ps1 status                 # health of all 4 backends + UI
+#   .\scripts\clusters.ps1 status                 # health of both backends + UI
 #   .\scripts\clusters.ps1 restart agt-a          # restart one backend api + its worker
-#   .\scripts\clusters.ps1 start  a2a-a a2a-b     # start one or more
+#   .\scripts\clusters.ps1 start  agt-a agt-b     # start one or more
 #   .\scripts\clusters.ps1 stop   agt-a agt-b     # stop one or more (api + worker)
-#   .\scripts\clusters.ps1 restart all            # restart all four
+#   .\scripts\clusters.ps1 restart all            # restart both
 #   .\scripts\clusters.ps1 stop all               # stop everything (backends + workers)
 #
 # Logs go to logs\<name>-api.out/.err and logs\<name>-worker.out/.err.
@@ -29,12 +28,10 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 # The single source of truth for every backend.
 $CLUSTERS = @{
-    'a2a-a' = @{ dir = 'federated-rag';     env = '.env';            port = 8000 }
-    'a2a-b' = @{ dir = 'federated-rag';     env = '.env.cluster-b';  port = 8002 }
-    'agt-a' = @{ dir = 'agt-federated-rag'; env = '.env';            port = 8010 }
-    'agt-b' = @{ dir = 'agt-federated-rag'; env = '.env.cluster-b';  port = 8012 }
+    'agt-a' = @{ dir = 'agt-federated-rag'; env = '.env';           port = 8010 }
+    'agt-b' = @{ dir = 'agt-federated-rag'; env = '.env.cluster-b'; port = 8012 }
 }
-$ALL = @('a2a-a', 'a2a-b', 'agt-a', 'agt-b')
+$ALL = @('agt-a', 'agt-b')
 
 function Resolve-Targets([string[]]$t) {
     if (-not $t -or $t.Count -eq 0 -or $t -contains 'all') { return $ALL }
