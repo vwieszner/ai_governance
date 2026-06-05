@@ -2,14 +2,14 @@
 #
 # Usage:
 #   .\scripts\logs.ps1 agt-a            # last interesting lines from agt-a's api log
-#   .\scripts\logs.ps1 a2a-a 40         # last 40 matching lines
+#   .\scripts\logs.ps1 agt-a 40         # last 40 matching lines
 #   .\scripts\logs.ps1 agt-b -Raw       # raw tail (no filter)
 #
-# Names: a2a-a a2a-b agt-a agt-b  (matches scripts\clusters.ps1). structlog writes
+# Names: agt-a agt-b  (matches scripts\clusters.ps1). structlog writes
 # the real events (auth_decision, agent_run_failed, peer_call, ...) to the .out file.
 
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('a2a-a', 'a2a-b', 'agt-a', 'agt-b')][string]$Name,
+    [Parameter(Mandatory = $true)][ValidateSet('agt-a', 'agt-b')][string]$Name,
     [int]$Lines = 25,
     [switch]$Raw
 )

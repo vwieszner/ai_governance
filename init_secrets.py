@@ -1,5 +1,5 @@
 """
-Generate the gitignored root .env that docker-compose.yml and setup_all.py read.
+Generate the gitignored root .env that docker-compose.yml and setup_agt.py read.
 
 Run ONCE before `docker compose up -d`:
     python init_secrets.py
@@ -69,7 +69,7 @@ def main() -> None:
     print(f"Wrote {ENV_PATH} with freshly generated credentials.")
     if not nvidia:
         print("WARNING: NVIDIA_API_KEY was not in your environment — set it in .env "
-              "before running setup_all.py (LLM calls will fail without it).")
+              "before running setup_agt.py (LLM calls will fail without it).")
 
 
 if __name__ == "__main__":

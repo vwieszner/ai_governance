@@ -2,9 +2,10 @@
 Idempotent end-to-end setup for the AGT federation: two agt-federated-rag clusters
 (AGT / AgentMesh DID governance) that federate with each other.
 
-Mirrors setup_all.py (the A2A federation) but adds the AgentMesh DID bootstrap:
-each cluster gets a persistent Ed25519 DID identity, and each cluster's .env is
-cross-wired with the PEER's DID + public JWK so the trust handshake succeeds.
+Self-contained: provisions the shared Keycloak realm + rag-ui client + alice/bob
+users AND the AgentMesh DID bootstrap. Each cluster gets a persistent Ed25519 DID
+identity, and each cluster's .env is cross-wired with the PEER's DID + public JWK
+so the trust handshake succeeds.
 
 Run from the repo root with the project venv (NVIDIA_API_KEY must be in ./.env):
     .venv\\Scripts\\python.exe setup_agt.py            # Qdrant + Neo4j
@@ -39,7 +40,7 @@ KEYCLOAK = "http://localhost:8087"
 QDRANT = "http://localhost:16333"
 REALM = "rag"
 
-# Seeded user password — must match setup_all.py. Override with RAG_SEED_PASSWORD.
+# Seeded user password. Override with RAG_SEED_PASSWORD.
 SEED_USER_PASSWORD = os.environ.get("RAG_SEED_PASSWORD", "Rag-User-2026!")
 
 # Documents (reuse the same corpus as the A2A federation).
@@ -148,7 +149,7 @@ def ensure_identity(path: Path, name: str, org: str) -> dict:
     return {"did": str(identity.did), "jwk": json.dumps(identity.to_jwk(include_private=False))}
 
 
-# ── Infra helpers (mirror setup_all.py) ─────────────────────────────────────
+# ── Infra helpers ───────────────────────────────────────────────────────────
 
 async def wait_healthy(c: httpx.AsyncClient) -> None:
     for name, url in {"OpenFGA": f"{OPENFGA}/healthz", "Keycloak": f"{KEYCLOAK}/realms/master",
@@ -193,6 +194,78 @@ async def kc_ensure_agent_client(c: httpx.AsyncClient, h: dict, cid: str, secret
         log(f"client {cid} exists")
     else:
         r.raise_for_status(); log(f"client {cid} created")
+
+
+async def kc_ensure_realm(c: httpx.AsyncClient, h: dict) -> None:
+    r = await c.post(f"{KEYCLOAK}/admin/realms",
+                     json={"realm": REALM, "enabled": True, "displayName": "Federated RAG"}, headers=h)
+    log("realm exists" if r.status_code == 409 else "realm created")
+
+
+async def kc_ensure_ui_client(c: httpx.AsyncClient, h: dict) -> None:
+    """Create the public browser-login client (rag-ui) + audience mappers.
+
+    The AGT backends validate that the token `aud` contains their own client_id
+    (agent-agt-a / agent-agt-b). A browser rag-ui token defaults to aud=account,
+    so attach hardcoded-audience mappers that add both AGT agent client_ids.
+    """
+    body = {
+        "clientId": "rag-ui", "enabled": True, "publicClient": True,
+        "standardFlowEnabled": True, "directAccessGrantsEnabled": True,
+        "redirectUris": ["http://localhost:5173/*"], "webOrigins": ["http://localhost:5173"],
+    }
+    r = await c.post(f"{KEYCLOAK}/admin/realms/{REALM}/clients", json=body, headers=h)
+    log("rag-ui exists" if r.status_code == 409 else "rag-ui created")
+
+    q = await c.get(f"{KEYCLOAK}/admin/realms/{REALM}/clients",
+                    params={"clientId": "rag-ui"}, headers=h)
+    client_uuid = q.json()[0]["id"]
+    existing = await c.get(
+        f"{KEYCLOAK}/admin/realms/{REALM}/clients/{client_uuid}/protocol-mappers/models",
+        headers=h,
+    )
+    existing_names = {m["name"] for m in existing.json()}
+    for aud in ("agent-agt-a", "agent-agt-b"):
+        name = f"aud-{aud}"
+        if name in existing_names:
+            continue
+        mapper = {
+            "name": name,
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {
+                "included.client.audience": aud,
+                "id.token.claim": "false",
+                "access.token.claim": "true",
+            },
+        }
+        mr = await c.post(
+            f"{KEYCLOAK}/admin/realms/{REALM}/clients/{client_uuid}/protocol-mappers/models",
+            json=mapper, headers=h,
+        )
+        log(f"rag-ui audience mapper {aud}: {'ok' if mr.status_code in (201,204) else mr.status_code}")
+
+
+async def kc_ensure_user(c: httpx.AsyncClient, h: dict, username: str, email: str) -> None:
+    body = {
+        "username": username, "enabled": True, "email": email, "emailVerified": True,
+        "firstName": username.capitalize(), "lastName": "User",
+        "credentials": [{"type": "password", "value": SEED_USER_PASSWORD, "temporary": False}],
+    }
+    r = await c.post(f"{KEYCLOAK}/admin/realms/{REALM}/users", json=body, headers=h)
+    log(f"user {username} exists" if r.status_code == 409 else f"user {username} created")
+    # Idempotently (re)set the password so an existing user always matches.
+    lookup = await c.get(f"{KEYCLOAK}/admin/realms/{REALM}/users",
+                         params={"username": username, "exact": "true"}, headers=h)
+    lookup.raise_for_status()
+    users = lookup.json()
+    if users:
+        uid = users[0]["id"]
+        await c.put(
+            f"{KEYCLOAK}/admin/realms/{REALM}/users/{uid}/reset-password",
+            json={"type": "password", "value": SEED_USER_PASSWORD, "temporary": False},
+            headers=h,
+        )
 
 
 async def kc_sub(c: httpx.AsyncClient, username: str) -> str:
@@ -337,11 +410,15 @@ async def main(no_neo4j: bool) -> None:
         b_id = ensure_identity(ID_PATH_B, "rag-agent-agt-cluster-b", "cluster-b")
         log(f"cluster-a DID={a_id['did']}")
         log(f"cluster-b DID={b_id['did']}")
-        log("=== Phase 4: Keycloak agent clients ===")
+        log("=== Phase 4: Keycloak (realm, agent clients, rag-ui, users) ===")
         tok = await kc_admin_token(c)
         h = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+        await kc_ensure_realm(c, h)
         await kc_ensure_agent_client(c, h, "agent-agt-a", AGENT_SECRET_A)
         await kc_ensure_agent_client(c, h, "agent-agt-b", AGENT_SECRET_B)
+        await kc_ensure_ui_client(c, h)
+        await kc_ensure_user(c, h, "alice", "alice@example.com")
+        await kc_ensure_user(c, h, "bob", "bob@example.com")
         alice = await kc_sub(c, "alice"); bob = await kc_sub(c, "bob")
         log(f"alice={alice} bob={bob}")
         log("=== Phase 5: write .env files ==="); write_env(store_id, model_id, a_id, b_id)
