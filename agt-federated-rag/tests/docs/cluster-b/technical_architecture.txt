@@ -1,0 +1,85 @@
+ACME CORP — PLATFORM TECHNICAL ARCHITECTURE
+Document ID: ENG-ARCH-009
+Classification: Internal — Engineering
+Last Revised: 2026-02-20
+Owner: Principal Architect, Platform Team
+
+1. OVERVIEW
+The ACME platform is a cloud-native, microservices architecture deployed across two
+Kubernetes clusters (us-east-1 and eu-west-1) for high availability and data residency
+compliance. All services communicate over mTLS enforced by Istio service mesh.
+
+2. CLUSTER TOPOLOGY
+
+  Cluster A (us-east-1, AWS EKS 1.30):
+    Node pools: 3x m6i.4xlarge (general), 2x g5.2xlarge (ML inference)
+    Availability zones: us-east-1a, 1b, 1c
+    Ingress: AWS ALB + Istio Gateway
+    CNI: Cilium 1.15 with Cluster Mesh enabled
+
+  Cluster B (eu-west-1, AWS EKS 1.30):
+    Node pools: 3x m6i.4xlarge (general), 2x g5.2xlarge (ML inference)
+    Availability zones: eu-west-1a, 1b, 1c
+    Ingress: AWS ALB + Istio Gateway
+    CNI: Cilium 1.15 with Cluster Mesh enabled
+
+  Cross-cluster networking: Cilium Cluster Mesh L3/L4 + Istio multi-primary L7 mTLS
+  SPIFFE trust domain federation: spiffe://acme.internal
+
+3. CORE SERVICES
+
+3.1 API Gateway (Kong 3.6)
+  - Rate limiting: 1000 req/min per authenticated user; 100 req/min unauthenticated
+  - Auth plugin: JWT validation against Keycloak JWKS endpoint
+  - Plugins: CORS, request-transformer, prometheus, opentelemetry
+
+3.2 User Service
+  - Framework: FastAPI 0.115, Python 3.11
+  - Database: PostgreSQL 16 (RDS Multi-AZ, 500GB gp3)
+  - Cache: Redis 7.2 (ElastiCache, 3-node cluster)
+  - Auth: Keycloak OIDC, session tokens 1h TTL, refresh tokens 7d TTL
+
+3.3 Product Catalogue Service
+  - Framework: Spring Boot 3.3, Java 21
+  - Database: PostgreSQL 16 (RDS, read replica in each AZ)
+  - Search: OpenSearch 2.13 (3-node, m6g.large.search)
+  - CDN: CloudFront for static assets
+
+3.4 Order Processing Service
+  - Framework: Go 1.22, gRPC
+  - Message queue: Amazon SQS FIFO for order events
+  - Database: PostgreSQL 16 + DynamoDB for order state machine
+  - Saga orchestration: Temporal 1.22 (self-hosted, 3-node Postgres backend)
+
+3.5 Notification Service
+  - Email: AWS SES (transactional), Klaviyo (marketing)
+  - Push: Firebase Cloud Messaging
+  - SMS: Twilio (fallback for critical alerts)
+  - Slack webhooks: internal operations alerts
+
+4. OBSERVABILITY STACK
+  - Metrics: Prometheus + Grafana (Grafana Cloud for long-term retention)
+  - Logs: Loki + Promtail (30-day retention hot, 1-year cold in S3)
+  - Traces: Tempo + OpenTelemetry collectors (all services instrumented)
+  - Alerting: Grafana OnCall, PagerDuty escalation for P1/P2
+  - Uptime: 99.95% SLO, error budget tracked per service
+
+5. SECURITY
+  - Secrets: AWS Secrets Manager + external-secrets-operator
+  - Image scanning: Trivy in CI, Grype for runtime
+  - Container signing: Sigstore/cosign, Kyverno admission policy enforces signatures
+  - Network policies: Cilium Network Policies (default-deny, allow-listed per service)
+  - WAF: AWS WAF on ALB (OWASP Core Rule Set 3.3)
+
+6. CI/CD
+  - Source: GitHub Enterprise (acmecorp org)
+  - CI: GitHub Actions (self-hosted runners on EKS)
+  - Build: Docker BuildKit, multi-arch (amd64 + arm64)
+  - Deploy: ArgoCD (GitOps), ApplicationSets for multi-cluster fan-out
+  - Environments: dev → staging → production, promotion requires PR approval + passing tests
+
+7. DISASTER RECOVERY
+  - RTO: 4 hours (Tier 1 services), 24 hours (Tier 2)
+  - RPO: 1 hour (continuous WAL shipping to S3), 15 min for critical databases
+  - Runbooks: stored in Confluence under space ENG-OPS
+  - DR drill: quarterly, last completed 2026-01-22, results in DR-REPORT-2026-Q1

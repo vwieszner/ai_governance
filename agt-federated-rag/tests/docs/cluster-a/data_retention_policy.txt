@@ -1,0 +1,61 @@
+ACME CORP — DATA RETENTION POLICY
+Document ID: POL-001
+Classification: Internal — All Staff
+Last Revised: 2026-01-15
+Owner: Legal & Compliance Team
+
+1. PURPOSE
+This policy defines how ACME Corp retains, archives, and destroys data across all
+business systems. It applies to all employees, contractors, and third-party vendors
+who handle company data.
+
+2. RETENTION SCHEDULES
+
+2.1 Customer Data
+  - Active customer records: retained for the duration of the contract plus 7 years.
+  - Inactive customer records: retained for 3 years after last transaction, then deleted.
+  - Customer communications (email, chat): retained for 5 years.
+  - Payment card data: not stored; handled exclusively by PCI-DSS certified processors.
+
+2.2 Employee Data
+  - Payroll records: retained for 7 years after employment ends.
+  - Performance reviews: retained for 5 years after employment ends.
+  - Recruitment records (unsuccessful candidates): retained for 12 months, then deleted.
+  - Health and benefits records: retained for 6 years.
+
+2.3 Financial Records
+  - General ledger, invoices, purchase orders: retained for 7 years.
+  - Tax records: retained for 10 years.
+  - Expense reports: retained for 5 years.
+
+2.4 Technical / Operational Data
+  - Server and application logs: retained for 90 days online, 1 year cold storage.
+  - Security event logs (SIEM): retained for 2 years.
+  - Backup snapshots: daily backups kept for 30 days; monthly snapshots for 1 year.
+  - Source code repositories: retained indefinitely (version-controlled).
+
+3. GDPR / PRIVACY OBLIGATIONS
+Data that falls under GDPR or local privacy regulation must not be retained beyond
+its stated purpose. Upon a verified Subject Access Request or Right to Erasure
+request, personal data must be purged within 30 days from all live systems and
+within 90 days from backup archives.
+
+4. DESTRUCTION PROCEDURES
+  - Digital data: overwritten using NIST 800-88 Rev.1 media sanitisation guidelines.
+  - Physical media (hard drives, USB): cross-cut shredding by certified vendor.
+  - Paper records: cross-cut shredding on-site or via certified off-site service.
+
+5. EXCEPTIONS
+Exceptions to scheduled destruction must be approved in writing by the Chief Legal
+Officer and recorded in the Data Retention Exception Register (DMS-REG-007).
+Legal hold overrides any scheduled destruction for the duration of the hold.
+
+6. RESPONSIBILITIES
+  - Data Owners: ensure their team's data is classified and tagged correctly in the DMS.
+  - IT Operations: enforce automated deletion schedules and maintain audit logs.
+  - Legal & Compliance: maintain the exception register and handle DSARs.
+  - All staff: report suspected violations to compliance@acmecorp.example.
+
+7. REVIEW CYCLE
+This policy is reviewed annually or following a material regulatory change.
+Next scheduled review: 2027-01-15.

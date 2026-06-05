@@ -1,0 +1,66 @@
+ACME CORP — COMPENSATION & SALARY BANDS
+Document ID: HR-CONF-042
+Classification: CONFIDENTIAL — HR and Senior Management Only
+Last Revised: 2026-03-01
+Owner: VP Human Resources
+
+WARNING: This document contains sensitive compensation data. Distribution is restricted
+to HR Business Partners, direct line managers, and C-suite executives only.
+Unauthorised access is a disciplinary offence and may result in termination.
+
+1. SALARY BANDS BY LEVEL (USD, Annual Base)
+
+Level 1 — Associate / Junior
+  Engineering:          $72,000 – $90,000
+  Operations:           $55,000 – $70,000
+  Sales:                $50,000 – $65,000 (+ commission plan OTE 1.5x)
+  Marketing:            $58,000 – $72,000
+
+Level 2 — Mid-Level
+  Engineering:          $95,000 – $130,000
+  Operations:           $75,000 – $95,000
+  Sales:                $70,000 – $90,000 (+ commission plan OTE 2x)
+  Marketing:            $78,000 – $100,000
+
+Level 3 — Senior
+  Engineering:          $135,000 – $180,000
+  Operations:           $100,000 – $130,000
+  Sales:                $95,000 – $125,000 (+ commission plan OTE 2.5x)
+  Marketing:            $105,000 – $140,000
+
+Level 4 — Staff / Lead
+  Engineering:          $185,000 – $230,000
+  Operations:           $135,000 – $165,000
+  Sales (Enterprise):   $130,000 – $160,000 (+ commission plan OTE 3x)
+  Marketing:            $145,000 – $175,000
+
+Level 5 — Principal / Director
+  Engineering:          $235,000 – $295,000
+  Operations:           $170,000 – $210,000
+  Sales (VP):           $170,000 – $210,000 (+ commission plan OTE 3x)
+  Marketing:            $180,000 – $220,000
+
+2. EQUITY GRANTS (RSU SCHEDULE, 4-YEAR VEST / 1-YEAR CLIFF)
+
+  Level 2:    $20,000 – $40,000 total grant
+  Level 3:    $50,000 – $100,000 total grant
+  Level 4:    $120,000 – $200,000 total grant
+  Level 5:    $250,000 – $500,000 total grant
+  VP / C-suite: negotiated individually, board approval required above $1M
+
+3. INDIVIDUAL COMPENSATION — SELECTED EMPLOYEES (Q1 2026)
+
+  Alice Chen (L3 Engineering):   Base $155,000 | RSU $75,000 / 4yr | Bonus target 15%
+  Bob Martinez (L4 Engineering): Base $210,000 | RSU $160,000 / 4yr | Bonus target 20%
+  Carol Singh (L2 Operations):   Base $88,000  | RSU $30,000 / 4yr  | Bonus target 10%
+  David Park (L5 Sales VP):      Base $195,000 | OTE $585,000       | RSU $350,000 / 4yr
+  Emma Liu (L3 Marketing):       Base $128,000 | RSU $60,000 / 4yr  | Bonus target 15%
+
+4. MERIT INCREASE SCHEDULE 2026
+  Performance rating "Meets Expectations": 3.0% base increase
+  Performance rating "Exceeds Expectations": 5.5% base increase
+  Performance rating "Outstanding":         8.0% base increase + accelerated vest
+
+5. CONTACT
+All compensation queries must be directed to hr-compensation@acmecorp.example.
+Do not discuss individual compensation with colleagues outside of approved HR processes.

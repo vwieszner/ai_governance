@@ -1,0 +1,68 @@
+ACME CORP — Q4 2025 FINANCIAL RESULTS
+Document ID: FIN-CONF-2025-Q4
+Classification: STRICTLY CONFIDENTIAL — Finance, C-Suite, Board Only
+Last Revised: 2026-01-28
+Owner: CFO Office
+
+EMBARGO NOTICE: This document contains material non-public financial information.
+Distribution outside of approved recipients is a violation of securities law and
+company policy. Do not forward, print, or discuss outside of authorised channels.
+
+1. EXECUTIVE SUMMARY
+
+Q4 2025 was a record quarter for ACME Corp. Total revenue reached $48.3M, up 34%
+year-over-year and 9% quarter-over-quarter, driven by strong enterprise ARR expansion
+and the successful launch of the ACME Pro tier in October 2025.
+
+Full Year 2025 revenue: $162.7M (guidance was $155-160M — beat at the top end).
+EBITDA margin improved to 18.2% for the full year, up from 11.4% in FY2024.
+
+2. Q4 2025 REVENUE BREAKDOWN
+
+  SaaS Subscriptions (ARR):         $38.4M  (+38% YoY)
+    — Starter tier:                  $6.1M
+    — Growth tier:                   $14.8M
+    — Enterprise tier:               $17.5M  (+51% YoY — key growth driver)
+
+  Professional Services:             $5.9M   (+12% YoY)
+  Marketplace / Integrations rev:    $4.0M   (+89% YoY — new in H2 2025)
+
+  Total Q4 Revenue:                 $48.3M
+
+3. KEY METRICS
+
+  ARR (end of Q4 2025):             $153.6M  (up from $114.9M end of Q4 2024)
+  Net Revenue Retention (NRR):      124%     (up from 118% in Q4 2024)
+  Gross Revenue Retention (GRR):    94%
+  Customer Count:                   3,847    (up from 2,901 in Q4 2024)
+  Enterprise Customers (>$100K ARR): 312     (up from 201 in Q4 2024)
+  Average Contract Value (ACV):     $39,900
+  CAC Payback Period:               18 months (down from 23 months in 2024)
+  LTV:CAC ratio:                    4.8x
+
+4. COSTS & MARGINS (Q4 2025)
+
+  Gross Profit:                     $33.8M   (70.0% gross margin, up from 66.2%)
+  S&M Expense:                      $13.1M   (27.1% of revenue)
+  R&D Expense:                      $9.6M    (19.9% of revenue)
+  G&A Expense:                      $4.2M    (8.7% of revenue)
+  EBITDA:                           $6.9M    (14.3% EBITDA margin for Q4)
+
+5. CASH POSITION
+  Cash and equivalents (Dec 31 2025): $87.4M
+  Runway at current burn: 28 months
+  Series C ($75M) closed November 2024 — fully deployed into GTM and R&D headcount.
+
+6. FY2026 GUIDANCE (PRELIMINARY — SUBJECT TO BOARD APPROVAL)
+  Revenue guidance:                 $210M – $225M  (+29–38% YoY)
+  Gross margin target:              71–73%
+  EBITDA margin target:             20–23%
+  Planned headcount additions:      ~180 FTEs (primarily Engineering and Enterprise Sales)
+
+7. UPCOMING INVESTOR EVENTS
+  Earnings call:          February 18, 2026, 5:00pm ET
+  Investor roadshow:      March 3–7, 2026 (NYC, Boston, SF)
+  Annual shareholder meeting: May 14, 2026
+
+CONTACT: investor-relations@acmecorp.example
+All media inquiries to press@acmecorp.example — do not respond directly.

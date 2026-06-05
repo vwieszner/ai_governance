@@ -43,9 +43,9 @@ REALM = "rag"
 # Seeded user password. Override with RAG_SEED_PASSWORD.
 SEED_USER_PASSWORD = os.environ.get("RAG_SEED_PASSWORD", "Rag-User-2026!")
 
-# Documents (reuse the same corpus as the A2A federation).
-DOCS_A = ROOT / "federated-rag" / "tests" / "docs" / "cluster-a"
-DOCS_B = ROOT / "federated-rag" / "tests" / "docs" / "cluster-b"
+# Documents (bundled in this repo at agt-federated-rag/tests/docs/).
+DOCS_A = AGT / "tests" / "docs" / "cluster-a"
+DOCS_B = AGT / "tests" / "docs" / "cluster-b"
 ALICE_VIEW_A = "data_retention_policy"
 ALICE_PEND_A = "hr_compensation_data"
 ALICE_VIEW_B = "technical_architecture"
