@@ -23,7 +23,7 @@ Fixes applied:
           matching the pattern already used for the Temporal client.
 
 Nodes:
-  retrieve_local      — Qdrant hybrid (Neo4j graph seam RRF-fused but inert in the demo)
+  retrieve_local      — Qdrant hybrid (Neo4j graph seam RRF-fused but currently inert)
   check_auth          — OpenFGA decisions for retrieved chunks
   generate_answer     — LLM answer generation from allowed chunks
   start_approval      — Temporal workflow for local approval
@@ -271,7 +271,7 @@ async def _get_temporal() -> TemporalClient:
 async def retrieve_local(state: AgentState) -> dict[str, Any]:
     """Run hybrid Qdrant retrieval, RRF-fused with the Neo4j graph-retrieval seam (no ACL filter yet).
 
-    The graph retriever is invoked but is inert in the demo (the documented bring-up runs
+    The graph retriever is invoked but is currently inert (the documented bring-up runs
     --no-neo4j, so no Neo4j vector index exists and retrieve_context returns []); retrieval is
     Qdrant-only. Even when Neo4j is populated it does vector+keyword lookup, not graph traversal.
     """

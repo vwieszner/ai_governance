@@ -1,38 +1,40 @@
 # Roadmap — Federated RAG (A2A + AGT) as a Product
 
-_Saved 2026-06-04. This is the durable task list. The system is treated as a **product**, not a
-demo — these items are real, ordered by what unblocks first. Application-layer security is already
+_Saved 2026-06-04. This is the durable task list. The system is treated as a **product** — these
+items are real, ordered by what unblocks first. Application-layer security is already
 hardened (0 red-team bypasses); these are the gaps between "works + secure app layer" and
-"shippable / demonstrable product."_
+"shippable product."_
 
 Status snapshot: both federations work end-to-end (4 governance flows), 0 open security bypasses,
 docs match reality. Committed locally (one commit ahead of `origin/main`, not pushed).
 
 ---
 
-## Tier 0 — Showability (blocks demonstrating the product to a team)
+## Tier 0 — Showability (blocks showing the product to a team)
 
 These prevent a clean end-to-end walkthrough in front of an audience.
 
-- [ ] **T0-1 — Human approval cannot be completed in a demo (the headline governance feature
-  dead-ends at "pending").** The `/approve/{request_id}` endpoint works and is HMAC-secure, and a
+- [ ] **T0-1 — Human approval cannot be completed in a live walkthrough (the headline governance
+  feature dead-ends at "pending").** The `/approve/{request_id}` endpoint works and is HMAC-secure, and a
   Temporal approval workflow waits for the signal — but nothing surfaces the signed approve link:
   `start_approval` passes `approver_slack_id=None` + `approver_email=None`, so `notify_approver`
   hits the `no_notification_channel` branch and emits nothing. The UI has no approve/deny button
   (`ui/src/api/rag.ts` only submits queries + displays state). Net: an audience sees "pending
   approval" and it never resolves unless someone hand-computes the HMAC URL.
   **Fix options (pick one):** (a) quick — have the no-channel fallback LOG the signed approve/deny
-  URLs so a presenter can click them; (b) better for a team demo — add an "approver inbox" +
+  URLs so a presenter can click them; (b) better for a team walkthrough — add an "approver inbox" +
   Approve/Deny buttons in the UI (call `/approve/{id}?...` with the link the backend provides);
   (c) wire Slack (set `slack_bot_token` + a real `approver_slack_id`). Also fix
   `approval_ui_base_url` per solution (AGT default is `:8000`, the A2A port — wrong cluster).
-- [ ] **T0-2 — Drop "demo" framing in the docs.** README title is "…AI Governance **Demo**";
-  SECURITY_AUDIT/STATUS/SCENARIOS say "acceptable for local demo" / "test-enablement". For a
-  product these should read as product status + named gaps, not as a demo disclaimer. (README
-  "What this is" is otherwise clear and good for explaining purpose to a team.)
+- [ ] **T0-2 — Drop disposable-prototype framing in the docs.** The README title still carries
+  prototype wording; some docs say "acceptable for local" use / "test-enablement". For a
+  product these should read as product status + named gaps, not as a disposable-prototype disclaimer.
+  (README "What this is" is otherwise clear and good for explaining purpose to a team.) Note: the
+  audit/status docs (SECURITY_AUDIT/STATUS/SCENARIOS) have been recast; the README title remains and
+  still needs the rename, so this item is not yet fully closed.
 - [ ] **T0-3 — One-command bring-up + a guided walkthrough.** Bring-up is multi-step
   (docker + setup_all + setup_agt + clusters.ps1) and the UI must be started separately (it shows
-  `down` today). A `make demo` / single script + a 5-minute "show this to a team" script in
+  `down` today). A single bring-up script + a 5-minute "show this to a team" script in
   SCENARIOS would make the purpose self-evident.
 
 ## Tier 1 — Production hardening (blocks shipping as a product)
@@ -51,7 +53,7 @@ Ordered by severity. #1 is a hard gate before any real/sensitive data touches th
 - [ ] **P5 — Authenticated approval portal + real approver attribution. 🟠 High.** Replace the
   HMAC deep-link with an authenticated approver UI; today the approver is recorded as the constant
   `"approval-deeplink"` — no human attribution on data-access decisions (audit/compliance gap).
-  (Overlaps T0-1: doing P5 well also solves the demo gap.)
+  (Overlaps T0-1: doing P5 well also solves the live-walkthrough gap.)
 - [ ] **P6 — HA + backups + observability. 🟠 High.** Qdrant is ephemeral, single instances, no
   backups; no metrics/tracing across the federation hop.
 - [ ] **P7 — Per-cluster audience scoping. 🟡 Medium.** One UI token authenticates to all 4

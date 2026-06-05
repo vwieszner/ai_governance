@@ -102,7 +102,7 @@ async def ingest_documents(
 
     Each file is read as UTF-8 text, split into overlapping word-based chunks,
     and upserted into Qdrant.  Neo4j ingestion would require a separate graph-import
-    pipeline and is left as future work — so graph retrieval is inert in the demo.
+    pipeline and is left as future work — so graph retrieval is currently inert.
 
     The Qdrant and Neo4j clients are closed in a try/finally block to ensure
     connections are released even on partial failure.

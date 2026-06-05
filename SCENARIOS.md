@@ -1,6 +1,6 @@
-# Federated RAG — Demo Scenarios
+# Federated RAG — Scenarios
 
-This document maps every demo scenario to the real framework components
+This document maps every scenario to the real framework components
 that execute it. Nothing here is invented — every node, model, and protocol
 reference corresponds to live code in `federated-rag/` and `agt-federated-rag/`.
 
@@ -45,8 +45,8 @@ reference corresponds to live code in `federated-rag/` and `agt-federated-rag/`.
 | **AGT graph-invocation gate** | `agt-federated-rag/agent/graph.py` (`run_query`) | A `govern_action("agent.graph.invoke")` AgentMesh call before the graph compiles — audit + an enforcing operator kill-switch (deny on `kill_switch_engaged`; deploy-time, requires restart). Not a wrapping middleware. |
 | **AgentMesh DID** | `agt-federated-rag/mesh/agent_identity.py` | Ed25519-signed A2A callbacks; trust-score gating |
 | **FastEmbed + Qdrant** | `rag/qdrant_retriever.py` | BGE-M3 dense + BM25 sparse hybrid retrieval with server-side RRF |
-| **neo4j-graphrag** | `rag/neo4j_retriever.py` | Graph-retrieval seam — **scaffolded but inert in the demo** (no Neo4j ingest, no graph traversal / entity-neighbourhood expansion); retrieval is Qdrant-only |
-| **RRF fusion** | `rag/fusion.py` | Reciprocal Rank Fusion merges Qdrant and Neo4j results (in the demo the Neo4j list is empty, so this fuses Qdrant only) |
+| **neo4j-graphrag** | `rag/neo4j_retriever.py` | Graph-retrieval seam — **scaffolded but currently inert** (no Neo4j ingest, no graph traversal / entity-neighbourhood expansion); retrieval is Qdrant-only |
+| **RRF fusion** | `rag/fusion.py` | Reciprocal Rank Fusion merges Qdrant and Neo4j results (the Neo4j list is currently empty, so this fuses Qdrant only) |
 | **Keycloak** | `auth/token_exchange.py` | OIDC issuer; JWT validated via JWKS on every request |
 | **structlog** | throughout | Structured JSON logging with request-ID correlation |
 | **Pydantic v2** | `a2a/models.py`, `config.py` | Runtime type validation of all API payloads |
@@ -81,7 +81,7 @@ check_auth  ──── FlowDecision ────▶ generate_answer ──▶ 
 
 **Who:** Alice on Cluster-A  
 **Trigger:** Query matches data in local Qdrant + OpenFGA grants `viewer` access  
-**Demo query:** `"What is our data retention policy?"`
+**Example query:** `"What is our data retention policy?"`
 
 ### Step-by-step
 
@@ -131,7 +131,7 @@ data: {
 
 **Who:** Alice on Cluster-A  
 **Trigger:** Query matches chunks where Alice has `pending_approval` (not `viewer`) in OpenFGA  
-**Demo query:** `"Show me classified documents"` or `"Show me restricted financial data"`
+**Example query:** `"Show me classified documents"` or `"Show me restricted financial data"`
 
 ### Step-by-step
 
@@ -177,7 +177,7 @@ data: {
 
 **Who:** Alice on Cluster-A; data lives on Cluster-B  
 **Trigger:** No matching chunks in Cluster-A; `PEER_AGENT_URL` is configured  
-**Demo query:** `"What is our compliance framework?"` or `"Explain our GDPR obligations"`
+**Example query:** `"What is our compliance framework?"` or `"Explain our GDPR obligations"`
 
 ### Step-by-step
 
@@ -239,7 +239,7 @@ TaskStatusUpdateEvent(
 
 **Who:** Alice on Cluster-A; data on Cluster-B requires approval  
 **Trigger:** Cluster-B's check_auth returns `pending_approval` for Alice's delegated identity  
-**Demo query:** `"Show me classified compliance reports from cluster-b"`
+**Example query:** `"Show me classified compliance reports from cluster-b"`
 
 This is the most complex flow — two Temporal workflows, two HMAC links, cross-cluster callbacks.
 
@@ -263,7 +263,7 @@ This is the most complex flow — two Temporal workflows, two HMAC links, cross-
 
 **Who:** Alice on Cluster-A  
 **Trigger:** OpenFGA returns denied for all chunks; no peer configured  
-**Demo query:** Any query where alice has no access and no cross-cluster route
+**Example query:** Any query where alice has no access and no cross-cluster route
 
 ```
 FlowDecision = LOCAL_DENIED
@@ -438,7 +438,7 @@ The A2A callback from Cluster-B to Cluster-A uses:
 
 ---
 
-## UI Demo Script (step-by-step)
+## UI Walkthrough (step-by-step)
 
 ### Context
 
@@ -449,13 +449,13 @@ You are the **AI Governance platform** for a financial services firm. Two teams 
 The clusters federate: when the AI Ops team needs a regulatory answer, Cluster-A asks Cluster-B via A2A. Neither team stores the other's data.
 
 ### Setup
-1. `cd demo && .\start.ps1` — starts both clusters and the Vite UI
+1. `.\scripts\clusters.ps1 start all` — starts both clusters and the Vite UI
 2. Open `http://localhost:5173`
-3. Left pane: login as **alice** / any password → AI Operations (Cluster-A)
-4. Right pane: login as **bob** / any password → Regulatory Compliance (Cluster-B)
+3. Left pane: login as **alice** (seeded password from `RAG_SEED_PASSWORD`) → AI Operations (Cluster-A)
+4. Right pane: login as **bob** (same seeded password) → Regulatory Compliance (Cluster-B)
 5. Click **Monitor ⬆** to open the agent communications panel
 
-### Demo sequence
+### Walkthrough sequence
 
 **Act 1 — Local answer (Flow A): AI Ops policy question**
 - Alice types: `What do we need before deploying a new AI model to production?`

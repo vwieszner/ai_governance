@@ -1,12 +1,12 @@
 """
-Bootstrap Keycloak for the real federated-rag demo (local Docker instance).
+Bootstrap Keycloak for the federated-rag deployment (local Docker instance).
 
 Targets the running container http://localhost:8087 (admin/admin) and creates:
   - realm 'rag'
   - confidential clients agent-cluster-a / agent-cluster-b (service accounts +
     direct-access + RFC 8693 token exchange) with fixed secrets
   - public client 'rag-ui' for the browser password-grant login
-  - users alice and bob (password: demo)
+  - users alice and bob (password from RAG_SEED_PASSWORD env var)
 
 Run with the project venv:
     .venv\\Scripts\\python.exe bootstrap_keycloak.py
@@ -16,12 +16,17 @@ from __future__ import annotations
 import asyncio
 import sys
 
+import os
+
 import httpx
 
 KC = "http://localhost:8087"
-ADMIN_USER = "admin"
-ADMIN_PASS = "admin"
+ADMIN_USER = os.environ.get("KEYCLOAK_ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
 REALM = "rag"
+
+# Seeded user password — must match setup_all.py / setup_agt.py.
+SEED_USER_PASSWORD = os.environ.get("RAG_SEED_PASSWORD", "Rag-User-2026!")
 
 AGENT_SECRET_A = "agent-cluster-a-secret"
 AGENT_SECRET_B = "agent-cluster-b-secret"
@@ -97,16 +102,16 @@ async def ensure_user(c: httpx.AsyncClient, h: dict, username: str, email: str) 
         "enabled": True,
         "email": email,
         "firstName": username.capitalize(),
-        "lastName": "Demo",
+        "lastName": "User",
         "emailVerified": True,
-        "credentials": [{"type": "password", "value": "demo", "temporary": False}],
+        "credentials": [{"type": "password", "value": SEED_USER_PASSWORD, "temporary": False}],
     }
     r = await c.post(f"{KC}/admin/realms/{REALM}/users", json=body, headers=h)
     if r.status_code == 409:
         print(f"user '{username}' already exists")
     else:
         r.raise_for_status()
-        print(f"OK user '{username}' created (password: demo)")
+        print(f"OK user '{username}' created")
 
 
 async def main() -> None:

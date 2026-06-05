@@ -14,7 +14,7 @@ Design decisions:
   read anywhere today.)  For query embeddings we reuse the same BGE-M3 model that
   Qdrant uses, embedding synchronously in an executor to stay non-blocking.
 
-NOTE — as built, this retriever is INERT in the demo: the AGT ingest pipeline
+NOTE — as built, this retriever is currently INERT: the AGT ingest pipeline
 (rag/ingest.py) only upserts to Qdrant and never writes Chunk nodes or the
 ``chunk_embedding`` vector index to Neo4j.  With no index, _sync_init() flips
 ``_graph_unavailable`` and retrieve_context() returns [], so retrieval is
@@ -164,7 +164,7 @@ class GraphRAGRetriever:
     async def retrieve_context(self, query: str) -> list[dict]:
         """Retrieve vector-matched chunks from the Neo4j vector index for *query*.
 
-        This is plain vector lookup, NOT graph traversal.  In the demo it returns
+        This is plain vector lookup, NOT graph traversal.  It currently returns
         an empty list (see the module docstring: no Neo4j ingest → no index).
 
         Returns:

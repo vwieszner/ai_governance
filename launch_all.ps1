@@ -103,7 +103,7 @@ if (-not ($aOk -and $bOk)) {
 # ── Start the UI (foreground; Ctrl+C stops just the UI) ───────────────────────
 Write-Host ""
 Write-Host "Backends up. Starting UI at http://localhost:5173 ..." -ForegroundColor Cyan
-Write-Host "Login: alice / demo (left)   bob / demo (right)" -ForegroundColor Gray
+Write-Host "Login: alice (left) / bob (right) — password from RAG_SEED_PASSWORD (default Rag-User-2026!)" -ForegroundColor Gray
 Write-Host "Stop everything later with:  .\launch_all.ps1 -Stop" -ForegroundColor Gray
 Write-Host ""
 

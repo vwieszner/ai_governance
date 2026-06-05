@@ -555,7 +555,13 @@ async def send_task(
         status_msg = final_state.get("status_message", "")
         answer = final_state.get("answer", "")
 
-        if final_state.get("approval_request_id") and not final_state.get("answer"):
+        # A pending approval is signalled by approval_request_id. format_response
+        # copies the (LLM-generated) status_message into `answer`, so we must NOT
+        # gate on `not answer` here — otherwise a pending request looks completed
+        # and the requester's client never polls for the real outcome. After the
+        # approval is granted, the re-run carries no approval_request_id, so it
+        # correctly resolves to COMPLETED.
+        if final_state.get("approval_request_id"):
             task.status = TaskStatus(state=TaskState.INPUT_REQUIRED, message=status_msg)
         elif final_state.get("error"):
             task.status = TaskStatus(state=TaskState.FAILED, message="Processing error")
@@ -825,8 +831,9 @@ async def list_pending_approvals(
     The requester never learns the ``request_id`` (L-6); only the owner can
     enumerate the requests routed to them. Implemented by listing running
     ``ApprovalWorkflow`` executions and keeping those whose designated approver
-    == the caller's ``sub``. (Demo-scale: O(open requests) point queries;
-    production would index the approver as a Temporal search attribute.)
+    == the caller's ``sub``. (This performs O(open requests) point queries and
+    does not scale to large request volumes; indexing the approver as a Temporal
+    search attribute would fix this.)
 
     Returns ``{"pending": [{"request_id", "requester_id", "query"}]}``.
     """

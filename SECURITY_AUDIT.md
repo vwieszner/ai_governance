@@ -9,15 +9,15 @@
 
 This is a genuinely well-secured codebase. It has been through multiple prior review rounds (tags `C-1`, `S-5`, `H-5`, `H-7`, `Finding #1…#8`, `MED-7`, etc.) and the overwhelming majority of those controls are correctly implemented and still hold. The core security model — deny-by-default per-chunk authorization, cryptographic DID verification of cross-cluster callbacks with the public key taken from trusted config, HMAC-signed and time-bound approval links, multi-audience JWT validation that still verifies signature/exp/iss — is sound.
 
-The findings below are dominated by **deployment-hardening items that are fine for a local demo but must be fixed before any real deployment**, plus **one real secrets-hygiene issue** (live credentials hardcoded in setup scripts that are not protected by `.gitignore`) and a couple of **bounded residual Low items** (callback replay).
+The findings below are dominated by **deployment-hardening items that must be fixed before any production deployment**, plus **one real secrets-hygiene issue** (live credentials hardcoded in setup scripts that are not protected by `.gitignore`) and a couple of **bounded residual Low items** (callback replay).
 
 | # | Severity | Area | Location | Issue |
 |---|----------|------|----------|-------|
-| S-1 | **High** | Secrets | `setup_all.py:41,258,299`, `bootstrap_keycloak.py:26-27`, `ui/.env.prod:14`, `.gitignore` | Live NVIDIA API key, approval HMAC signing key, and agent client secrets hardcoded in source/setup files that are **not** covered by `.gitignore` (only `.env` and `ui/.env.demo` are). One `git add .` commits them. |
-| I-1 | **Medium** | Docker/infra | `docker-compose.yml:25-26,56-57,89-90` | Default credentials (Keycloak `admin/admin`, Postgres `openfga/openfga`); OpenFGA HTTP API + playground and Temporal dev server exposed on host ports with no auth. Acceptable for local demo; must be fixed before prod. |
-| I-2 | **Medium** | Infra | `config.py` (`host: 0.0.0.0`), k8s manifests | App binds `0.0.0.0` and OpenFGA is called over plaintext HTTP. Demo-acceptable; prod needs network policy + mTLS/TLS. |
+| S-1 | **High** | Secrets | `setup_all.py`, `bootstrap_keycloak.py`, `ui/.env.prod`, `.gitignore` | Live NVIDIA API key, approval HMAC signing key, and agent client secrets hardcoded in source/setup files. `.gitignore` now covers `.env`, `.env.*`, `*.env.prod`, and `ui/.env.prod`, so the env files are excluded — but secrets still living inside tracked `.py` setup scripts are not. Move all secrets to env/secret-manager (see ROADMAP P4). |
+| I-1 | **Medium** | Docker/infra | `docker-compose.yml:25-26,56-57,89-90` | Default credentials (Keycloak `admin/admin`, Postgres `openfga/openfga`); OpenFGA HTTP API + playground and Temporal dev server exposed on host ports with no auth. Development default; must be fixed before prod. |
+| I-2 | **Medium** | Infra | `config.py` (`host: 0.0.0.0`), k8s manifests | App binds `0.0.0.0` and OpenFGA is called over plaintext HTTP. Development default; prod needs network policy + mTLS/TLS. |
 | R-1 | **Low** → **REMEDIATED** (task #8) | A2A replay | `agt-federated-rag/mesh/agent_identity.py` (`sign_outbound_message` / `verify_signed_message` / `_check_freshness_and_nonce`) | ~~AgentMesh signed envelope has no nonce/timestamp; an identical signed callback re-verifies (replay).~~ Now fixed: signed `ts`+`nonce`, freshness window + bounded seen-nonce cache (fail-closed). See §2. |
-| AUD-1 | **Low** (intentional test-enablement) | Audience isolation / IdP | Keycloak `rag-ui` client audience mappers (IdP config, not app code) | One `rag-ui` user token carries `aud = [all 4 backend client_ids]`, so it authenticates to all four backends of both solutions. **BOUNDED — no privilege gain:** every data/action path re-authorizes on `sub`/`azp`/DID, so authenticating ≠ being authorized (detail in §2). Intentional demo test-enablement; prod fix is IdP audience hygiene (per-cluster aud / RFC 8693 token-exchange). |
+| AUD-1 | **Low** (intentional test-enablement) | Audience isolation / IdP | Keycloak `rag-ui` client audience mappers (IdP config, not app code) | One `rag-ui` user token carries `aud = [all 4 backend client_ids]`, so it authenticates to all four backends of both solutions. **BOUNDED — no privilege gain:** every data/action path re-authorizes on `sub`/`azp`/DID, so authenticating ≠ being authorized (detail in §2). Intentional development-time test-enablement; prod fix is IdP audience hygiene (per-cluster aud / RFC 8693 token-exchange). |
 | R-2 | **Low** | Approval replay | `api/main.py` `/approve` (both clusters) | Approval deep-link can be replayed until its signed `exp`; no single-use nonce. Bounded by short expiry. |
 | O-1 | **Low** | Rate limit | `api/main.py` `_check_rate_limit` (both) | Per-subject rate limiter fails **open** on Redis error. Intentional availability trade-off; document it. |
 | Q-1 | **Info** | Approval audit | `api/main.py` `/approve` (both) | Approver identity recorded as constant `"approval-deeplink"` (no authenticated human attribution). Known/accepted (Finding #8). |
@@ -94,7 +94,7 @@ The endpoint then layers a registry trust-score gate (`verify_peer_identity`), a
 
 ### Cross-cluster audience isolation — Finding AUD-1 (Low; intentional test-enablement)
 
-**Issue.** A single `rag-ui` user token (e.g. alice's) carries `aud = [agent-cluster-a, agent-cluster-b, agent-agt-a, agent-agt-b, account]` — every backend client ID across **both** solutions and **both** clusters. So one user token authenticates to all four backends. The cause is **IdP configuration, not app code:** `setup_agt.py` created the `agent-agt-a/b` Keycloak clients but the demo then added matching `oidc-audience-mapper`s to the public `rag-ui` client (mirroring the pre-existing A2A ones) so the AGT backends would accept the same UI token. This is a deliberate **test-enablement** choice for a single-IdP local demo, recorded as found, not an app vulnerability.
+**Issue.** A single `rag-ui` user token (e.g. alice's) carries `aud = [agent-cluster-a, agent-cluster-b, agent-agt-a, agent-agt-b, account]` — every backend client ID across **both** solutions and **both** clusters. So one user token authenticates to all four backends. The cause is **IdP configuration, not app code:** `setup_agt.py` created the `agent-agt-a/b` Keycloak clients but the current deployment then added matching `oidc-audience-mapper`s to the public `rag-ui` client (mirroring the pre-existing A2A ones) so the AGT backends would accept the same UI token. This is a deliberate **development-time test-enablement** default for a single-IdP local deployment, recorded as found, not an app vulnerability.
 
 **Impact — BOUNDED, no privilege gain (verified by reading the auth path of every endpoint in both solutions).** The discriminating question is: *does any endpoint grant data or perform an action on token-acceptance alone?* The answer is **no** — authenticating to a backend is necessary but never sufficient; every path re-authorizes on a second factor the shared `aud` does not satisfy:
 - **Data reads** (A2A `POST /tasks/send`, AGT `POST /query`): the user flows through `check_auth` → OpenFGA `batch_decide` keyed on the JWT **`sub`**. A user with no `viewer`/`editor`/`owner` tuple for a chunk is `DENIED` regardless of which backends their token's `aud` covers. Per-chunk ReBAC is the real boundary (§3).
@@ -103,7 +103,7 @@ The endpoint then layers a registry trust-score gate (`verify_peer_identity`), a
 
 So the shared audience means *authenticate-everywhere, authorize-nowhere-extra*: it lets a UI token reach more backends, but each backend independently re-checks `sub` (OpenFGA), `azp` (A2A callback allowlist), or DID (AGT peer paths). No endpoint authorizes on token-acceptance alone, so there is no escalation, no cross-tenant read, and no peer-impersonation from the shared `aud`. The app-layer audience checks are themselves correct and deny-by-default (§1); A2A even ships `exchange_token()` with an exact-match audience allowlist, implying direct cross-cluster token reuse was meant to be impossible — which the per-path re-checks above enforce in practice.
 
-**Recommendation (production — IdP config, not app code).** Scope `rag-ui` tokens per cluster so a UI session for cluster A does not carry cluster B's audience: either issue per-cluster public clients with only their own `aud` mapper, or adopt **RFC 8693 token-exchange** (already implemented for A2A in `auth/token_exchange.py`) so the UI obtains a narrowly-scoped token per backend on demand. To revert the demo enablement, delete the `aud-agent-agt-a` / `aud-agent-agt-b` protocol-mappers from the `rag-ui` Keycloak client. No application change is required; the bound above holds either way.
+**Recommendation (production — IdP config, not app code).** Scope `rag-ui` tokens per cluster so a UI session for cluster A does not carry cluster B's audience: either issue per-cluster public clients with only their own `aud` mapper, or adopt **RFC 8693 token-exchange** (already implemented for A2A in `auth/token_exchange.py`) so the UI obtains a narrowly-scoped token per backend on demand. To revert this development-time enablement, delete the `aud-agent-agt-a` / `aud-agent-agt-b` protocol-mappers from the `rag-ui` Keycloak client. No application change is required; the bound above holds either way.
 
 ---
 
@@ -157,7 +157,7 @@ The task framing was "committed `.env` files / `.env` should be gitignored." The
   - `setup_all.py` — real `NVIDIA_KEY = "nvapi-ImQU…QjRR"`, real `APPROVAL_HMAC_SECRET` literals for both clusters (`3f9a2b7c…`, `a1b2c3d4…`), agent client secrets.
   - `bootstrap_keycloak.py` — Keycloak `admin/admin`, agent client secrets.
   - `ui/.env.prod` — real `NVIDIA_API_KEY=nvapi-ImQU…QjRR`.
-  - `.gitignore` covers only `.env` and `ui/.env.demo` — it does **not** match `*.env.prod` or the `.py` setup scripts. These files are currently untracked only because nobody ran `git add`; a single `git add .` would commit all of them.
+  - `.gitignore` now covers `.env`, `.env.*`, `*.env.prod`, and `ui/.env.prod`, so the env files are excluded from commits. Secrets hardcoded inside the tracked `.py` setup scripts are still a concern — move them to env vars / a secret manager (ROADMAP P4).
 
 ### Why High (not just key hygiene)
 The hardcoded `APPROVAL_HMAC_SECRET` literals in `setup_all.py` are the **signing keys for the C-2 approval-link control**. Anyone who obtains that file can forge valid approve/deny deep-links for either cluster, defeating the human-approval gate entirely. Combined with a live, billable NVIDIA API key sitting in plaintext, this is more than cosmetic.
@@ -195,7 +195,7 @@ The hardcoded `APPROVAL_HMAC_SECRET` literals in `setup_all.py` are the **signin
 - **Error hygiene:** internal/Temporal errors not leaked to clients; `jose` error strings (which embed token/claim material) are deliberately not logged.
 
 ### O-1 (Low) — rate limiter fails open
-`_check_rate_limit` returns (allows the request) on any Redis error. This is an intentional availability-over-security choice and is documented in code. **Recommendation:** acceptable for a demo; for production decide explicitly whether the expensive LLM endpoint should fail closed (or degrade to a stricter in-process limiter) when Redis is unavailable, to avoid an unmetered-cost path during a Redis outage.
+`_check_rate_limit` returns (allows the request) on any Redis error. This is an intentional availability-over-security choice and is documented in code. **Recommendation:** for production decide explicitly whether the expensive LLM endpoint should fail closed (or degrade to a stricter in-process limiter) when Redis is unavailable, to avoid an unmetered-cost path during a Redis outage.
 
 ---
 
@@ -203,7 +203,7 @@ The hardcoded `APPROVAL_HMAC_SECRET` literals in `setup_all.py` are the **signin
 
 **File:** `docker-compose.yml`; k8s manifests; `config.py` server defaults.
 
-These are **fine for a local demo** but **must be fixed before any real deployment**:
+These are **development defaults** but **must be fixed before any production deployment**:
 
 - **I-1 Default credentials & exposed admin surfaces:**
   - Keycloak `admin/admin` (`docker-compose.yml:89-90`).

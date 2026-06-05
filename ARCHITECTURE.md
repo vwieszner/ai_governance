@@ -267,10 +267,10 @@ Langfuse + OTel collecting traces.
 #### Sequence diagrams (text)
 
 > **As-designed vs as-built.** This section (like the rest of §10) describes the *reference*
-> architecture — including KServe/vLLM, Istio/SPIFFE mTLS, and Langfuse — not the current demo
+> architecture — including KServe/vLLM, Istio/SPIFFE mTLS, and Langfuse — not the current
 > deployment. In particular, the "Qdrant + Neo4j (subgraph) → chunks + triples" retrieval step is
-> the design target; the **running demo retrieves from Qdrant only**. The Neo4j graph-retrieval seam
-> exists in code but is not exercised (no Neo4j ingest in the demo path) and performs no graph
+> the design target; the **running system retrieves from Qdrant only**. The Neo4j graph-retrieval seam
+> exists in code but is not exercised (no Neo4j ingest in the current retrieval path) and performs no graph
 > traversal / entity-neighbourhood expansion even when populated. See `README.md` (GraphRAG note)
 > for what actually runs.
 

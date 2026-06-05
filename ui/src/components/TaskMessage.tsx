@@ -38,12 +38,10 @@ export function TaskMessage({ task }: Props) {
         )}
 
         {task.state === 'input-required' && !task.answer && (
-          <p className="bubble-agent muted">
-            Waiting for approver — check Slack or email for the approval link.
-            {task.approvalRequestId && (
-              <span className="approval-id"> (id: {task.approvalRequestId})</span>
-            )}
-          </p>
+          <>
+            {task.statusMessage && <p className="bubble-agent">{task.statusMessage}</p>}
+            <p className="status-msg muted">⏳ Waiting for the data owner's decision — the answer will appear here automatically once approved.</p>
+          </>
         )}
 
         {task.peerTaskId && (

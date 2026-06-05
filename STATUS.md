@@ -34,7 +34,7 @@ docker start claude-qdrant claude-neo4j storyteller-redis-1
 NOTE: `setup_*.py` rotate that solution's OpenFGA store id -> after running setup you MUST
 `.\scripts\clusters.ps1 restart a2a-a a2a-b` (or `agt-a agt-b`) so backends pick up the new store.
 
-## The 4 governance flows (type as alice / demo; bob / demo also exists)
+## The 4 governance flows (log in as alice; bob also exists — seeded password from RAG_SEED_PASSWORD, default Rag-User-2026!)
 - A local-authorized: "What is our data retention policy for customer records?" -> grounded answer
 - B local-approval: "What are the salary bands for senior engineers?" -> "pending approval"
 - C cross-cluster answer: "What Kubernetes version are we running and what is the cluster topology?" -> federated answer from the peer
@@ -102,13 +102,13 @@ exec/shell=True/wildcard-CORS/swallowed-except); README rewritten to the two-ind
 
 ## What is TO BE DONE
 _Items 1–3 were RESOLVED this session (2026-06-04 hardening pass — see "Session 2026-06-04" under DONE).
-Only #4 (full productionization) remains genuinely open; it is a separate project, not a demo gap._
+Only #4 (full productionization) remains genuinely open; it is a separate project, not an app-layer gap._
 
 1. **GraphRAG is scaffolded but inert — now documented as such** (quality, task #3). Retrieval in the
-   demo is **Qdrant-only** (hybrid dense + sparse, server-side RRF). The Neo4j graph-retrieval seam exists
+   product is **Qdrant-only** (hybrid dense + sparse, server-side RRF). The Neo4j graph-retrieval seam exists
    in both codebases and is RRF-fused, but: **AGT** ingest never writes Neo4j (only upserts Qdrant), so its
    graph retriever always degrades to empty; **A2A** *can* populate Neo4j (run `setup_all.py` without
-   `--no-neo4j`) and uses a `HybridRetriever`, but the documented demo runs `--no-neo4j`. Neither path does
+   `--no-neo4j`) and uses a `HybridRetriever`, but the documented deployment runs `--no-neo4j`. Neither path does
    graph traversal / entity-neighbourhood expansion (`neo4j_graph_hops` is reserved and unused). Docs
    (README root + federated-rag, SCENARIOS, ARCHITECTURE as-built caveat) and the relevant code docstrings
    now state this precisely. Future work (NOT a gap): add an AGT Neo4j ingest path + a `VectorCypherRetriever`
@@ -132,7 +132,7 @@ Only #4 (full productionization) remains genuinely open; it is a separate projec
    `/tasks/send` + AGT `/query` re-check `sub` via OpenFGA; A2A callback gates on `azp` peer-allowlist —
    `rag-ui` azp is not a peer, rejected; AGT peer paths use DID signature, honor no user token). Production
    fix is IdP config: per-cluster `aud` / RFC 8693 token-exchange (A2A already ships `exchange_token`).
-   Revert demo enablement: delete `aud-agent-agt-a/b` mappers from the `rag-ui` Keycloak client.
+   Revert this development-time enablement: delete `aud-agent-agt-a/b` mappers from the `rag-ui` Keycloak client.
    Documented: `SECURITY_AUDIT.md` AUD-1.
 4. **Deployment readiness for two real company divisions** (from the deployment-gap analysis):
    physical per-division data isolation (own Qdrant/Neo4j/OpenFGA), TLS/mTLS everywhere, cross-org IdP

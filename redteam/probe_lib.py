@@ -35,7 +35,7 @@ AGT_B = "http://localhost:8012"
 TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 
 
-def get_token(username: str = "alice", password: str = "demo",
+def get_token(username: str = "alice", password: str = "Rag-User-2026!",
               client_id: str = "rag-ui", client_secret: str | None = None,
               scope: str = "openid profile") -> str:
     data = {

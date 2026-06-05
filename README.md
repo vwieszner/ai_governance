@@ -1,9 +1,9 @@
-# Federated RAG — Secure Multi-Agent AI Governance Demo
+# Federated RAG — Secure Multi-Agent AI Governance Platform
 
 ## What this is
 
 A production-quality, secure **federated Retrieval-Augmented Generation (RAG)** system that
-demonstrates real AI governance: the same agent codebase runs as **two federated clusters** —
+delivers real AI governance: the same agent codebase runs as **two federated clusters** —
 each with its own knowledge collection and authorization scope — that collaborate to answer a
 user's question **without ever sharing raw data**. Every chunk of knowledge is access-controlled
 per user (relationship-based authorization), sensitive answers are gated behind **human approval**
@@ -59,7 +59,7 @@ NVIDIA-hosted LLM are wired in end to end.
    │  Temporal   :7233   approval workflows  (queues: approval-queue-a / -b)          │
    │  Postgres           durable datastore for OpenFGA (compose volume)               │
    │  Qdrant     :16333  hybrid vectors      (collections: knowledge_base_a / _b)     │
-   │  Neo4j      :17687  graph-retrieval seam (scaffolded; demo runs Qdrant-only)     │
+   │  Neo4j      :17687  graph-retrieval seam (scaffolded; current deployment is Qdrant-only) │
    │  Redis      :6379   task store          (db /1 = cluster-a, db /2 = cluster-b)   │
    └───────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -72,7 +72,7 @@ containers (`claude-qdrant`, `claude-neo4j`, `storyteller-redis-1`) re-seeded by
 
 ## The governance story
 
-This demo exists to make four governance controls concrete and observable:
+The system makes four governance controls concrete and observable:
 
 - **Per-chunk authorization (ReBAC).** Access is not "who can use the app" but "who can read
   *this specific chunk*." OpenFGA holds `viewer` / `owner` / `pending_approval` relationship
@@ -99,9 +99,9 @@ format_response`). A fifth path (local-denied) exists in code for the no-access,
 
 ---
 
-## The 4 demo flows
+## The 4 governance flows
 
-Log in as **alice / demo** in the left (Cluster A) pane and type the query. Open the Monitor
+Log in as **alice** (seeded password from `RAG_SEED_PASSWORD`, default `Rag-User-2026!`) in the left (Cluster A) pane and type the query. Open the Monitor
 panel to watch the agent steps live.
 
 | Flow | Query to type (as alice) | What happens | End state |
@@ -126,8 +126,8 @@ The matching OpenFGA tuples are seeded by `setup_all.py` (its summary prints **6
 | Human approval | **Temporal** | Signal-based approval workflows, 24 h timeout |
 | Identity / OIDC | **Keycloak** | Realm `rag`, JWT issuance, JWKS validation, RFC 8693 token exchange |
 | Cross-cluster identity | **RFC 8693 Token Exchange** | Delegate the user's identity to the peer agent |
-| Vector retrieval | **Qdrant + FastEmbed** | Hybrid `BAAI/bge-large-en-v1.5` dense + `Qdrant/bm25` sparse, server-side RRF — **this is the retrieval the demo actually runs** |
-| Graph retrieval | **Neo4j** (scaffolded, not exercised by the demo) | The `neo4j-graphrag` seam is wired into both codebases and RRF-fused with Qdrant, but **no graph traversal / entity-neighbourhood expansion is performed** and the demo runs Qdrant-only — see the GraphRAG note below |
+| Vector retrieval | **Qdrant + FastEmbed** | Hybrid `BAAI/bge-large-en-v1.5` dense + `Qdrant/bm25` sparse, server-side RRF — **this is the retrieval that actually runs** |
+| Graph retrieval | **Neo4j** (scaffolded, not yet exercised) | The `neo4j-graphrag` seam is wired into both codebases and RRF-fused with Qdrant, but **no graph traversal / entity-neighbourhood expansion is performed** and the current deployment runs Qdrant-only — see the GraphRAG note below |
 | Agent governance | **AGT / AgentMesh** (the `agt-federated-rag/` federation) | DID identity, per-message Ed25519 signing, registry trust, governed actions |
 | Inter-agent protocol | **A2A** | Typed `AgentCard` / `Task` / status-update messaging between clusters |
 | API | **FastAPI** | Both backends; SSE streaming |
@@ -160,8 +160,8 @@ docker start claude-qdrant claude-neo4j storyteller-redis-1
 #    (launch_all.ps1 also starts the A2A backends + workers + UI in one shot.)
 ```
 
-Then open **http://localhost:5173** and log in: **alice / demo** (left, cluster-a `:8000`) and
-**bob / demo** (right, cluster-b `:8002`). The UI drives the **A2A** federation; the **AGT**
+Then open **http://localhost:5173** and log in as **alice** (left, cluster-a `:8000`) and
+**bob** (right, cluster-b `:8002`) — seeded password from `RAG_SEED_PASSWORD` (default `Rag-User-2026!`). The UI drives the **A2A** federation; the **AGT**
 federation (`:8010` / `:8012`) is exercised via its `POST /query` SSE endpoint (see
 `agt-federated-rag/_repro_agt.py`). Stop everything with `.\scripts\clusters.ps1 stop all`.
 
@@ -169,7 +169,7 @@ federation (`:8010` / `:8012`) is exercised via its `POST /query` SSE endpoint (
 > store id), restart that solution's backends so they pick up the new store —
 > `.\scripts\clusters.ps1 restart a2a-a a2a-b` (or `agt-a agt-b`).
 
-> **GraphRAG / Neo4j status (what actually runs).** Retrieval in the demo is **Qdrant-only**
+> **GraphRAG / Neo4j status (what actually runs).** Retrieval is currently **Qdrant-only**
 > (hybrid dense + sparse with server-side RRF). The Neo4j graph-retrieval path is scaffolded but
 > **inert**, and even when populated it does plain vector/keyword lookup of chunks — there is **no
 > graph traversal or entity-neighbourhood expansion** (`neo4j_graph_hops` is reserved and unused):
@@ -177,7 +177,7 @@ federation (`:8010` / `:8012`) is exercised via its `POST /query` SSE endpoint (
 >   so the graph retriever always degrades to empty and contributes nothing to fusion.
 > - **A2A** (`federated-rag/`): the full ingest path *can* populate Neo4j (run `setup_all.py`
 >   **without** `--no-neo4j`; slower, one LLM call per chunk) and the retriever is a `HybridRetriever`
->   (vector + keyword), but the documented demo runs `--no-neo4j`, so the Neo4j path is not exercised.
+>   (vector + keyword), but the documented bring-up runs `--no-neo4j`, so the Neo4j path is not exercised.
 >
 > After any Docker restart that drops Qdrant data, re-run step 2 to re-ingest and re-seed.
 

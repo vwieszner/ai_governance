@@ -6,11 +6,11 @@ export default defineConfig(({ mode }) => {
   const clusterAUrl  = env.CLUSTER_A_URL   || 'http://localhost:8000'
   const clusterBUrl  = env.CLUSTER_B_URL   || 'http://localhost:8002'
   const agtAUrl      = env.AGT_A_URL       || 'http://localhost:8010'
-  const keycloakAUrl = env.KEYCLOAK_A_URL  || 'http://localhost:8080'
-  const keycloakBUrl = env.KEYCLOAK_B_URL  || 'http://localhost:8080'
-  // Empty REALM_ = demo mode: auth served by the mock cluster directly at /token
-  const realmA       = env.REALM_A !== undefined ? env.REALM_A : 'rag'
-  const realmB       = env.REALM_B !== undefined ? env.REALM_B : 'rag'
+  const keycloakAUrl = env.KEYCLOAK_A_URL  || 'http://localhost:8087'
+  const keycloakBUrl = env.KEYCLOAK_B_URL  || 'http://localhost:8087'
+  // Keycloak realm for OIDC. Authentication is always against a real Keycloak.
+  const realmA       = env.REALM_A || 'rag'
+  const realmB       = env.REALM_B || 'rag'
   const nvidiaBaseUrl = env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1'
   const nvidiaKey     = env.NVIDIA_API_KEY  || process.env.NVIDIA_API_KEY || ''
 
@@ -40,12 +40,9 @@ export default defineConfig(({ mode }) => {
         '/auth/a': {
           target: keycloakAUrl,
           changeOrigin: true,
-          // Empty realm = demo mode: /auth/a/token → {host}/token (mock endpoint)
-          // Non-empty realm = production: /auth/a/token → {keycloak}/realms/{realm}/protocol/openid-connect/token
+          // /auth/a/token → {keycloak}/realms/{realm}/protocol/openid-connect/token
           rewrite: (path) =>
-            realmA
-              ? path.replace(/^\/auth\/a/, `/realms/${realmA}/protocol/openid-connect`)
-              : path.replace(/^\/auth\/a/, ''),
+            path.replace(/^\/auth\/a/, `/realms/${realmA}/protocol/openid-connect`),
         },
         // LLM proxy — any OpenAI-compatible endpoint, configured via NVIDIA_BASE_URL
         // Authorization injected server-side; key never appears in browser bundle
@@ -59,9 +56,7 @@ export default defineConfig(({ mode }) => {
           target: keycloakBUrl,
           changeOrigin: true,
           rewrite: (path) =>
-            realmB
-              ? path.replace(/^\/auth\/b/, `/realms/${realmB}/protocol/openid-connect`)
-              : path.replace(/^\/auth\/b/, ''),
+            path.replace(/^\/auth\/b/, `/realms/${realmB}/protocol/openid-connect`),
         },
       },
     },

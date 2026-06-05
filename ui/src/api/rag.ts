@@ -335,6 +335,35 @@ export function submitQuery(
   return submitQueryClusterA(cluster, user, token, query, onTask, onEvent)
 }
 
+// ── Approval outcome polling (requester side) ────────────────────────────────
+//
+// After a request goes 'pending approval', the requester's client polls the
+// server for the outcome. This is the cross-machine delivery channel: the answer
+// (or denial) comes back over the network once the approver decides — the two
+// users do NOT need to share a browser. The server re-checks the requester's
+// authorization before releasing any answer.
+
+export interface ApprovalOutcome {
+  status: 'pending' | 'completed' | 'denied'
+  answer?: string
+  message?: string
+}
+
+export async function pollApprovalResult(
+  cluster: ClusterConfig,
+  token: string,
+  taskId: string,
+): Promise<ApprovalOutcome> {
+  const res = await fetch(
+    `${cluster.apiBase}/tasks/${encodeURIComponent(taskId)}/result`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  )
+  if (!res.ok) {
+    throw new RagError(`Failed to poll approval result (${res.status})`, String(res.status))
+  }
+  return (await res.json()) as ApprovalOutcome
+}
+
 // ── Approval inbox (human-in-the-loop) ───────────────────────────────────────
 //
 // The data owner (this logged-in user) fetches the access requests they are

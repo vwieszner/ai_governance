@@ -39,6 +39,9 @@ KEYCLOAK = "http://localhost:8087"
 QDRANT = "http://localhost:16333"
 REALM = "rag"
 
+# Seeded user password — must match setup_all.py. Override with RAG_SEED_PASSWORD.
+SEED_USER_PASSWORD = os.environ.get("RAG_SEED_PASSWORD", "Rag-User-2026!")
+
 # Documents (reuse the same corpus as the A2A federation).
 DOCS_A = ROOT / "federated-rag" / "tests" / "docs" / "cluster-a"
 DOCS_B = ROOT / "federated-rag" / "tests" / "docs" / "cluster-b"
@@ -195,7 +198,7 @@ async def kc_ensure_agent_client(c: httpx.AsyncClient, h: dict, cid: str, secret
 async def kc_sub(c: httpx.AsyncClient, username: str) -> str:
     r = await c.post(f"{KEYCLOAK}/realms/{REALM}/protocol/openid-connect/token",
                      data={"grant_type": "password", "client_id": "rag-ui",
-                           "username": username, "password": "demo"})
+                           "username": username, "password": SEED_USER_PASSWORD})
     r.raise_for_status()
     import base64
     p = r.json()["access_token"].split(".")[1]

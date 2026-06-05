@@ -954,8 +954,9 @@ async def list_pending_approvals(
     The requester never learns the ``request_id`` (L-6); only the owner can
     enumerate the requests routed to them. Implemented by listing running
     ``ApprovalWorkflow`` executions and keeping those whose designated approver
-    == the caller's ``sub``. (Demo-scale: O(open requests) point queries;
-    production would index the approver as a Temporal search attribute.)
+    == the caller's ``sub``. (This performs O(open requests) point queries and
+    does not scale to large request volumes; indexing the approver as a Temporal
+    search attribute would fix this.)
 
     Returns ``{"pending": [{"request_id", "requester_id", "query"}]}``.
     """

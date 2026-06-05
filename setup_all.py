@@ -39,6 +39,10 @@ KEYCLOAK = "http://localhost:8087"
 QDRANT = "http://localhost:16333"
 REALM = "rag"
 
+# Seeded user password. Configurable via env for real deployments; the default is
+# a strong non-trivial value (never a weak shared word). Override with RAG_SEED_PASSWORD.
+SEED_USER_PASSWORD = os.environ.get("RAG_SEED_PASSWORD", "Rag-User-2026!")
+
 
 def _load_root_env() -> dict[str, str]:
     """Load the gitignored root .env (created by init_secrets.py) as a dict.
@@ -283,18 +287,31 @@ async def kc_ensure_ui_client(c: httpx.AsyncClient, h: dict) -> None:
 async def kc_ensure_user(c: httpx.AsyncClient, h: dict, username: str, email: str) -> None:
     body = {
         "username": username, "enabled": True, "email": email, "emailVerified": True,
-        "firstName": username.capitalize(), "lastName": "Demo",
-        "credentials": [{"type": "password", "value": "demo", "temporary": False}],
+        "firstName": username.capitalize(), "lastName": "User",
+        "credentials": [{"type": "password", "value": SEED_USER_PASSWORD, "temporary": False}],
     }
     r = await c.post(f"{KEYCLOAK}/admin/realms/{REALM}/users", json=body, headers=h)
     log(f"user {username} exists" if r.status_code == 409 else f"user {username} created")
+    # Idempotently (re)set the password so an existing user always matches the
+    # configured value — otherwise a previously-created user keeps its old password.
+    lookup = await c.get(f"{KEYCLOAK}/admin/realms/{REALM}/users",
+                         params={"username": username, "exact": "true"}, headers=h)
+    lookup.raise_for_status()
+    users = lookup.json()
+    if users:
+        uid = users[0]["id"]
+        await c.put(
+            f"{KEYCLOAK}/admin/realms/{REALM}/users/{uid}/reset-password",
+            json={"type": "password", "value": SEED_USER_PASSWORD, "temporary": False},
+            headers=h,
+        )
 
 
 async def kc_sub(c: httpx.AsyncClient, username: str) -> str:
     r = await c.post(
         f"{KEYCLOAK}/realms/{REALM}/protocol/openid-connect/token",
         data={"grant_type": "password", "client_id": "rag-ui",
-              "username": username, "password": "demo"},
+              "username": username, "password": SEED_USER_PASSWORD},
     )
     r.raise_for_status()
     tok = r.json()["access_token"]

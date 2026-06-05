@@ -65,7 +65,7 @@ class AgentState(TypedDict):
     # ── RAG retrieval ─────────────────────────────────────────────────────────
     fused_chunks: list[dict[str, Any]]      # RRF-fused output from both retrievers
     qdrant_results: list[dict[str, Any]]    # raw hybrid Qdrant results
-    graph_results: list[dict[str, Any]]     # raw Neo4j graph-seam results (inert in the demo → empty)
+    graph_results: list[dict[str, Any]]     # raw Neo4j graph-seam results (currently inert → empty)
 
     # ── Authorization ─────────────────────────────────────────────────────────
     flow: FlowDecision | None               # set by check_auth; None before that node

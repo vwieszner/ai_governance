@@ -13,7 +13,6 @@ __pycache__/
 .env.*
 *.env.prod
 *.env.local
-ui/.env.demo
 ui/.env.prod
 ui/.env.local
 # Un-ignore the example templates so they STAY tracked

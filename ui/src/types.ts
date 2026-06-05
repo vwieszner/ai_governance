@@ -52,7 +52,7 @@ export interface ClusterConfig {
   protocol: 'a2a' | 'agt'
 }
 
-// Labels are configurable via VITE_CLUSTER_A_LABEL / VITE_CLUSTER_B_LABEL in .env.demo.
+// Labels are configurable via VITE_CLUSTER_A_LABEL / VITE_CLUSTER_B_LABEL in the env file.
 // apiBase / authBase are Vite proxy paths — never localhost URLs.
 export const CLUSTER_A: ClusterConfig = {
   id: 'cluster-a',
@@ -78,7 +78,7 @@ export const CLUSTER_B: ClusterConfig = {
 export const CLUSTER_AGT_A: ClusterConfig = {
   id: 'cluster-agt-a',
   label: 'AGT Federated RAG (Cluster A)',
-  defaultUser: 'alice',
+  defaultUser: 'bob',
   clientId: 'rag-ui',
   apiBase: '/api/agt-a',
   authBase: '/auth/a',
@@ -86,7 +86,7 @@ export const CLUSTER_AGT_A: ClusterConfig = {
 }
 
 /**
- * Ordered list of all clusters in the demo.
+ * Ordered list of all clusters shown in the UI.
  * App.tsx maps this array to panes, so adding a cluster is one config entry
  * + one vite proxy entry — no App.tsx edit needed.
  */

@@ -170,7 +170,7 @@ re-verified by team-lead (restart + empirical re-test), not taken on report.
 
 ## R2-E — Audience confusion — BOUNDED, documented (production hardening, not an app bypass)
 - One `rag-ui` token carries `aud=[all 4 backend client_ids]`, so it authenticates to every cluster
-  of both solutions (root cause: the test-enablement Keycloak audience mappers added so the demo
+  of both solutions (root cause: the test-enablement Keycloak audience mappers added so the UI
   login can reach AGT). **No privilege gain** — every endpoint re-enforces authorization on `sub`
   (OpenFGA), `azp` (A2A callback allowlist), or DID signature (AGT peer paths); token acceptance
   alone grants nothing. App-layer audience checks are correct. **Production fix = IdP audience

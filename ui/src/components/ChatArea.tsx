@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, type KeyboardEvent } from 'react'
 import { TaskMessage } from './TaskMessage'
-import { submitQuery } from '../api/rag'
+import { submitQuery, pollApprovalResult } from '../api/rag'
 import type { AgentEvent, ClusterConfig, NormalizedTask } from '../types'
 
 interface Props {
@@ -32,6 +32,43 @@ export function ChatArea({ cluster, user, token, onEvent, onLogout }: Props) {
       return next
     })
   }
+
+  // Requester-side approval polling. When a question is parked on 'input-required'
+  // (pending a data owner's approval), poll the server for the outcome. The answer
+  // (or denial) arrives over the network once the approver decides — the two users
+  // never share a browser. The server re-checks THIS user's authorization before
+  // releasing any answer.
+  const tasksRef = useRef(tasks)
+  useEffect(() => { tasksRef.current = tasks }, [tasks])
+  const hasPending = tasks.some((t) => t.state === 'input-required')
+  useEffect(() => {
+    if (!hasPending) return
+    const id = setInterval(() => {
+      const pending = tasksRef.current.filter((t) => t.state === 'input-required')
+      for (const t of pending) {
+        pollApprovalResult(cluster, token, t.id)
+          .then((r) => {
+            if (r.status === 'completed') {
+              upsertTask({ ...t, state: 'completed', answer: r.answer || '', statusMessage: 'Approved', updatedAt: new Date() })
+              onEvent({
+                id: crypto.randomUUID(), timestamp: new Date(), cluster: cluster.id,
+                user, kind: 'completed', taskId: t.id,
+                message: '✅ Data owner approved — answer delivered to requester',
+              })
+            } else if (r.status === 'denied') {
+              upsertTask({ ...t, state: 'failed', answer: '', statusMessage: r.message || 'Your request was declined by the data owner.', updatedAt: new Date() })
+              onEvent({
+                id: crypto.randomUUID(), timestamp: new Date(), cluster: cluster.id,
+                user, kind: 'failed', taskId: t.id,
+                message: '⛔ Data owner declined the request',
+              })
+            }
+          })
+          .catch(() => { /* transient — keep polling */ })
+      }
+    }, 4000)
+    return () => clearInterval(id)
+  }, [hasPending, cluster, token, user, onEvent])
 
   async function handleSubmit() {
     const query = input.trim()
