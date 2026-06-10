@@ -4,7 +4,7 @@
 # port_base (see scripts/onboard_division.py: derive_ports) so divisions never clash.
 division_id: alpha
 display_name: Division Alpha
-port_base: 8100          # agent 8100, openfga 8101, keycloak 8102, temporal 8103/8104, qdrant 8105, redis 8106
+port_base: 8400          # agent 8400, openfga 8401, keycloak 8402, temporal 8403/8404, qdrant 8405, redis 8406 (moved off 8100: foreign stack story-8-4-backend squats 8101)
 trusted_peers: [beta]    # peer divisions this one federates with (used by M2/M3)
 docs_dir: tests/docs/cluster-a
 residency_mode: external

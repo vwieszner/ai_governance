@@ -85,4 +85,7 @@ def test_onboard_no_source_edit():
     assert stack_env.exists()
     assert GENERATED_DIR in stack_env.parents, "generated output must live under infra/generated/"
     body = stack_env.read_text(encoding="utf-8")
-    assert "DIV_ID=alpha" in body and "DIV_OPENFGA_PORT=8101" in body
+    # Derive the expected port from the manifest (don't hardcode) so re-homing a
+    # division to a free port slot doesn't break this test.
+    exp_ofga = derive_ports(load_manifest(DIVISIONS_DIR / "alpha.yml").port_base)["openfga"]
+    assert "DIV_ID=alpha" in body and f"DIV_OPENFGA_PORT={exp_ofga}" in body
