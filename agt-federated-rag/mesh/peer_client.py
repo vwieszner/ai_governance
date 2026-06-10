@@ -164,6 +164,9 @@ async def call_peer_agent(
         "context_id": context_id,
         "callback_url": callback_url,
         "source_cluster": settings.cluster_id,
+        # M0 tenancy: the originating division, carried (and signed) in the A2A
+        # envelope so the receiver can attribute + audit the cross-division call.
+        "source_division": settings.division_id,
     }
     signed_payload = await sign_outbound_message(payload)
 

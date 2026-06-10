@@ -158,6 +158,9 @@ class OpenFGAAuth:
             chunk_id=chunk_id,
             relation=relation.value,
             allowed=allowed,
+            # M0 tenancy: attribute every authorization decision to its division
+            # so audit/evidence is division-scoped (FR-8 / NFR-9).
+            division_id=settings.division_id,
             # AGT audit tag — collected by the audit event sink
             agt_audit=True,
         )

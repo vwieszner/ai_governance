@@ -14,10 +14,32 @@ _ENV_FILE = os.environ.get("RAG_ENV_FILE", ".env")
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
-    # ── Cluster identity ──────────────────────────────────────────────────────
+    # ── Cluster / division identity ───────────────────────────────────────────
     cluster_id: str = "cluster-a"
+    # M0 (multi-division tenancy): the division this agent belongs to. Each
+    # division is a physically-isolated stack (own OpenFGA store, Qdrant, Redis,
+    # Keycloak realm, Temporal). division_id is threaded into token-claim audit,
+    # OpenFGA audit records, and the cross-division A2A envelope (source_division)
+    # so every action is attributable to a division and isolation is provable.
+    # Defaults to cluster_id when unset (back-compat with single-cluster .env).
+    division_id: str = ""
+    # Comma-separated set of peer division ids this division federates with /
+    # trusts (used by later milestones for multi-peer discovery + trusted-issuer
+    # validation). Empty = no configured peers.
+    trusted_peers: str = ""
     agent_name: str = "AGT RAG Agent"
     agent_url: AnyHttpUrl = Field(default="http://localhost:8000")  # type: ignore[assignment]
+
+    # ── Data residency / inference egress (M6, NFR-1) ─────────────────────────
+    # "external" = LLM/embeddings may egress to a hosted endpoint (e.g. NVIDIA).
+    # "local"    = inference must stay within the division boundary (no external
+    # egress); a self-hosted backend is required. Threaded now so M6 can enforce.
+    residency_mode: str = "external"
+
+    # ── Transport security (M7, NFR-3) ────────────────────────────────────────
+    # When true, internet-facing agent/discovery calls require mTLS with cert
+    # identity validation + revocation. Threaded now; enforced in M7.
+    require_mtls: bool = False
 
     # ── Peer cluster ──────────────────────────────────────────────────────────
     peer_agent_url: AnyHttpUrl | None = None  # type: ignore[assignment]
@@ -158,6 +180,18 @@ class Settings(BaseSettings):
     @property
     def allowed_jwt_algorithms_list(self) -> list[str]:
         return [s.strip() for s in self.allowed_jwt_algorithms.split(",") if s.strip()]
+
+    @property
+    def trusted_peers_list(self) -> list[str]:
+        return [s.strip() for s in self.trusted_peers.split(",") if s.strip()]
+
+    @model_validator(mode="after")
+    def default_division_id(self) -> "Settings":
+        # Back-compat: a single-cluster .env that sets only CLUSTER_ID still gets a
+        # division_id (so tenancy threading never sees an empty division).
+        if not self.division_id:
+            object.__setattr__(self, "division_id", self.cluster_id)
+        return self
 
     @model_validator(mode="after")
     def warn_peer_missing_did(self) -> "Settings":

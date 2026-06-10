@@ -702,12 +702,17 @@ async def a2a_query(request: Request) -> JSONResponse:
 
     context_id = str(payload.get("context_id", "")) or str(uuid.uuid4())
     task_id = str(uuid.uuid4())
+    # M0 tenancy: the originating division (from the SIGNED envelope) is recorded
+    # so cross-division requests are attributable in this division's audit.
+    source_division = str(payload.get("source_division", "")) or "unknown"
 
     log.info(
         "a2a_query_received",
         signer_did=signer_did,
         trust_score=trust_score,
         user_id=user_id,
+        source_division=source_division,
+        division_id=settings.division_id,
     )
 
     # ── Run the SAME governed pipeline as /query ─────────────────────────────
