@@ -16,6 +16,11 @@ import pytest
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+# Also expose the repo root so tests can import `scripts.onboard_division`
+# (the M0 division generator lives at repo-root/scripts/, outside this package).
+_REPO_ROOT = _ROOT.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 # Minimal set of REQUIRED settings so Settings() constructs without a .env.

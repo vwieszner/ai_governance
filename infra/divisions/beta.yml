@@ -1,0 +1,7 @@
+# Division manifest (IMPLEMENTATION_PLAN.md M0). See alpha.yml for field docs.
+division_id: beta
+display_name: Division Beta
+port_base: 8200          # agent 8200, openfga 8201, keycloak 8202, temporal 8203/8204, qdrant 8205, redis 8206
+trusted_peers: [alpha]
+docs_dir: tests/docs/cluster-b
+residency_mode: external

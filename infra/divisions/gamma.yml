@@ -1,0 +1,9 @@
+# Division manifest (IMPLEMENTATION_PLAN.md M0). See alpha.yml for field docs.
+# Third division — proves N divisions (N>2) onboard from config with no collisions
+# (test_onboarding::test_three_divisions_from_config) and supports the >=3-division e2e.
+division_id: gamma
+display_name: Division Gamma
+port_base: 8300          # agent 8300, openfga 8301, keycloak 8302, temporal 8303/8304, qdrant 8305, redis 8306
+trusted_peers: [alpha, beta]
+docs_dir: tests/docs/cluster-a
+residency_mode: external

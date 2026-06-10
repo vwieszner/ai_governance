@@ -1,0 +1,119 @@
+# Per-division PHYSICAL stack template (IMPLEMENTATION_PLAN.md M0, decision D-3).
+#
+# Each division is its OWN isolated stack — own Postgres+OpenFGA store, Keycloak
+# realm host, Temporal, Qdrant, Redis — on its own compose project + network +
+# volumes, with division-scoped published ports. NFR-2: there is no shared point
+# whose loss crosses a division boundary, and one division's agent (configured
+# with its own OpenFGA store) cannot read another division's store.
+#
+# Brought up by scripts/onboard_division.py (NOT hand-run) which renders the
+# port/secret env from a division manifest and runs:
+#   docker compose -p div-<id> --env-file <generated>/div-<id>.env \
+#       -f infra/division-stack.template.yml up -d
+# Compose namespaces container_name (via ${DIV_ID}), volumes, and the network per
+# project, so N divisions coexist with zero collisions.
+#
+# Every published port binds to 127.0.0.1 (loopback) — nothing is network-reachable
+# in dev. A real multi-cloud deployment publishes the internet-facing agent +
+# discovery behind mTLS (M7); the per-division stack itself is unchanged.
+
+name: agt-div-${DIV_ID}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: div-${DIV_ID}-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in division env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in division env}
+      POSTGRES_DB: openfga
+    volumes:
+      - div-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  openfga-migrate:
+    image: openfga/openfga:latest
+    container_name: div-${DIV_ID}-openfga-migrate
+    command: migrate
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/openfga?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  openfga:
+    image: openfga/openfga:latest
+    container_name: div-${DIV_ID}-openfga
+    command: run
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/openfga?sslmode=disable
+      OPENFGA_LOG_LEVEL: warn
+      OPENFGA_AUTHN_METHOD: preshared
+      OPENFGA_AUTHN_PRESHARED_KEYS: ${OPENFGA_API_TOKEN:?set in division env}
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+    ports:
+      - "127.0.0.1:${DIV_OPENFGA_PORT}:8080"
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=:8081"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  temporal:
+    image: temporalio/temporal:latest
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--log-level", "warn"]
+    container_name: div-${DIV_ID}-temporal
+    ports:
+      - "127.0.0.1:${DIV_TEMPORAL_PORT}:7233"
+      - "127.0.0.1:${DIV_TEMPORAL_UI_PORT}:8233"
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    command: ["start-dev", "--features=token-exchange,admin-fine-grained-authz"]
+    container_name: div-${DIV_ID}-keycloak
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:?set in division env}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in division env}
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - div-keycloak-data:/opt/keycloak/data
+    ports:
+      - "127.0.0.1:${DIV_KEYCLOAK_PORT}:8080"
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: div-${DIV_ID}-qdrant
+    volumes:
+      - div-qdrant-data:/qdrant/storage
+    ports:
+      - "127.0.0.1:${DIV_QDRANT_PORT}:6333"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: div-${DIV_ID}-redis
+    volumes:
+      - div-redis-data:/data
+    ports:
+      - "127.0.0.1:${DIV_REDIS_PORT}:6379"
+    restart: unless-stopped
+
+volumes:
+  div-postgres-data:
+  div-keycloak-data:
+  div-qdrant-data:
+  div-redis-data:
