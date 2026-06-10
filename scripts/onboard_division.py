@@ -198,6 +198,9 @@ def render_agent_env(
         f"LLM_MODEL=meta/llama-3.3-70b-instruct\nEMBEDDING_MODEL=nvidia/nv-embedqa-e5-v5\n"
         f"QDRANT_URL=http://localhost:{ports['qdrant']}\n"
         f"QDRANT_COLLECTION=knowledge_base\n"
+        # Neo4j/GraphRAG is optional + inert in --no-neo4j mode (retrieval degrades to
+        # Qdrant-only); config still requires the fields, so set harmless defaults.
+        f"NEO4J_URI=bolt://localhost:7687\nNEO4J_USER=neo4j\nNEO4J_PASSWORD=none\n"
         f"REDIS_URL=redis://localhost:{ports['redis']}/0\n"
         f"OPENFGA_API_URL=http://localhost:{ports['openfga']}\n"
         f"OPENFGA_STORE_ID={store_id}\nOPENFGA_MODEL_ID={model_id}\n"
@@ -317,11 +320,12 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
                      json={"clientId": "rag-ui", "enabled": True, "publicClient": True,
                            "standardFlowEnabled": True, "directAccessGrantsEnabled": True,
                            "redirectUris": ["http://localhost:5173/*"]}, headers=h)
+        # rag-ui browser tokens must carry THIS division's agent client_id in `aud`
+        # (the agent's token_validator enforces audience). Single-division audience
+        # only — NO cross-division mapper (that was AUD-1; M1 keeps it single).
+        await _kc_add_ui_audience(c, kc, h, f"agent-{manifest.division_id}")
         for u, em in [("alice", "alice@example.com"), ("bob", "bob@example.com")]:
-            await c.post(f"{kc}/admin/realms/{REALM}/users",
-                         json={"username": u, "enabled": True, "email": em, "emailVerified": True,
-                               "credentials": [{"type": "password", "value": SEED_USER_PASSWORD,
-                                                "temporary": False}]}, headers=h)
+            await _kc_ensure_user(c, kc, h, u, em)
         log("Keycloak realm + clients + users ready")
 
     # DID identity (per division) + agent .env.
@@ -394,6 +398,46 @@ def _run_division_ingest(env_file: str, docs_dir: str) -> None:
         print(r.stdout[-2000:]); print(r.stderr[-2000:])
         raise RuntimeError("division ingest failed")
     log(f"ingest: {r.stdout.strip().splitlines()[-1] if r.stdout.strip() else 'done'}")
+
+
+async def _kc_add_ui_audience(c, kc: str, h: dict, agent_client_id: str) -> None:
+    """Add an oidc-audience-mapper to rag-ui so its access tokens include
+    agent_client_id in `aud` (the agent's token_validator requires it). Idempotent."""
+    q = await c.get(f"{kc}/admin/realms/{REALM}/clients", params={"clientId": "rag-ui"}, headers=h)
+    rows = q.json() if q.status_code == 200 else []
+    if not rows:
+        return
+    uuid = rows[0]["id"]
+    existing = await c.get(f"{kc}/admin/realms/{REALM}/clients/{uuid}/protocol-mappers/models", headers=h)
+    names = {m["name"] for m in (existing.json() if existing.status_code == 200 else [])}
+    name = f"aud-{agent_client_id}"
+    if name in names:
+        return
+    await c.post(f"{kc}/admin/realms/{REALM}/clients/{uuid}/protocol-mappers/models",
+                 json={"name": name, "protocol": "openid-connect",
+                       "protocolMapper": "oidc-audience-mapper",
+                       "config": {"included.client.audience": agent_client_id,
+                                  "id.token.claim": "false", "access.token.claim": "true"}},
+                 headers=h)
+
+
+async def _kc_ensure_user(c, kc: str, h: dict, username: str, email: str) -> None:
+    """Create a realm user and RELIABLY set its password (create + lookup + force
+    reset + clear required actions), so the direct-access-grant login works — a
+    bare create can leave a required-action that 400s the password grant."""
+    body = {"username": username, "enabled": True, "email": email, "emailVerified": True,
+            "firstName": username.capitalize(), "lastName": "User", "requiredActions": [],
+            "credentials": [{"type": "password", "value": SEED_USER_PASSWORD, "temporary": False}]}
+    await c.post(f"{kc}/admin/realms/{REALM}/users", json=body, headers=h)  # 201 or 409
+    lk = await c.get(f"{kc}/admin/realms/{REALM}/users",
+                     params={"username": username, "exact": "true"}, headers=h)
+    users = lk.json() if lk.status_code == 200 else []
+    if users:
+        uid = users[0]["id"]
+        await c.put(f"{kc}/admin/realms/{REALM}/users/{uid}",
+                    json={"enabled": True, "emailVerified": True, "requiredActions": []}, headers=h)
+        await c.put(f"{kc}/admin/realms/{REALM}/users/{uid}/reset-password",
+                    json={"type": "password", "value": SEED_USER_PASSWORD, "temporary": False}, headers=h)
 
 
 async def _kc_user_sub(c, kc: str, username: str, password: str) -> str:
