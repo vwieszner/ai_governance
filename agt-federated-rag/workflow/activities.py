@@ -54,16 +54,14 @@ from config import settings
 log = structlog.get_logger(__name__)
 
 # ── OpenFGA singleton (TM-2) ──────────────────────────────────────────────────
-# Created once per worker process; never re-created per activity call.
-_openfga_singleton: "OpenFGAAuth | None" = None  # noqa: F821 — forward ref
-
-
-def _get_openfga() -> "OpenFGAAuth":  # noqa: F821
-    global _openfga_singleton
-    if _openfga_singleton is None:
-        from auth.openfga import OpenFGAAuth  # deferred to avoid circular import at module init
-        _openfga_singleton = OpenFGAAuth()
-    return _openfga_singleton
+# Created (and INITIALISED) once per worker process; never re-created per activity
+# call. Must go through OpenFGAAuth.get_instance() — it runs the async _init() that
+# actually opens the SDK client. The previous bare OpenFGAAuth() left _client=None,
+# so every grant/revoke activity failed `assert self._client is not None` and an
+# APPROVED user never actually received access (Temporal silently retried forever).
+async def _get_openfga() -> "OpenFGAAuth":  # noqa: F821
+    from auth.openfga import OpenFGAAuth  # deferred to avoid circular import at module init
+    return await OpenFGAAuth.get_instance()
 
 
 # ── Input dataclasses ─────────────────────────────────────────────────────────
@@ -260,7 +258,7 @@ async def grant_access_in_openfga(inp: GrantAccessInput) -> None:
         chunk_count=len(inp.chunk_ids),
         agt_audit=True,
     )
-    auth = _get_openfga()
+    auth = await _get_openfga()
     for chunk_id in inp.chunk_ids:
         await auth.grant_viewer(inp.user_id, chunk_id)
         await auth.revoke_pending_approval(inp.user_id, chunk_id)
@@ -285,7 +283,7 @@ async def revoke_pending_in_openfga(inp: RevokeApprovalInput) -> None:
         chunk_count=len(inp.chunk_ids),
         agt_audit=True,
     )
-    auth = _get_openfga()
+    auth = await _get_openfga()
     for chunk_id in inp.chunk_ids:
         await auth.revoke_pending_approval(inp.user_id, chunk_id)
     log.info(
