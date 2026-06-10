@@ -346,6 +346,8 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
             model_id = r.json()["authorization_model_id"]
             _save_state(manifest.division_id, store_id=store_id, model_id=model_id)
             log(f"OpenFGA store={store_id}")
+        # Both branches guarantee str here; narrow for the typed render_* below.
+        assert isinstance(store_id, str) and isinstance(model_id, str)
 
         # Keycloak realm + clients + users (this division's OWN Keycloak).
         tr = await c.post(f"{kc}/realms/master/protocol/openid-connect/token",
