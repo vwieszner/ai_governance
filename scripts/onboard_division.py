@@ -75,31 +75,35 @@ class Manifest:
     seed_approval: str = ""  # doc title that needs the owner's approval (bob owns)
 
 
-def _parse_simple_yaml(text: str) -> dict:
-    """Tiny YAML subset parser for the flat division manifest (key: value + [list]).
-
-    Avoids a hard PyYAML dependency for a trivially-simple manifest format. Supports
-    `key: scalar`, `key: [a, b]`, and ignores blank/comment lines.
-    """
-    out: dict[str, object] = {}
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line or ":" not in line:
-            continue
-        key, _, val = line.partition(":")
-        key, val = key.strip(), val.strip()
-        if not key:
-            continue
-        if val.startswith("[") and val.endswith("]"):
-            inner = val[1:-1].strip()
-            out[key] = [v.strip() for v in inner.split(",") if v.strip()] if inner else []
-        elif val:
-            out[key] = val
-    return out
+def _parse_manifest_text(text: str) -> dict:
+    """Parse a division manifest. Uses PyYAML (already a transitive dependency via
+    agentmesh/agent-sre) for correctness — it handles #-in-value, quoting, and
+    nested keys, which a hand-rolled parser does not. Falls back to a minimal
+    key:value/[list] reader only if PyYAML is somehow unavailable."""
+    try:
+        import yaml
+        data = yaml.safe_load(text)
+        return data if isinstance(data, dict) else {}
+    except ImportError:
+        out: dict[str, object] = {}
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].rstrip()
+            if not line or ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            key, val = key.strip(), val.strip()
+            if not key:
+                continue
+            if val.startswith("[") and val.endswith("]"):
+                inner = val[1:-1].strip()
+                out[key] = [v.strip() for v in inner.split(",") if v.strip()] if inner else []
+            elif val:
+                out[key] = val
+        return out
 
 
 def load_manifest(path: str | Path) -> Manifest:
-    data = _parse_simple_yaml(Path(path).read_text(encoding="utf-8"))
+    data = _parse_manifest_text(Path(path).read_text(encoding="utf-8"))
     div = str(data.get("division_id", "")).strip()
     if not div:
         raise ValueError(f"{path}: manifest missing required 'division_id'")
@@ -275,11 +279,25 @@ async def _wait(c, url: str, name: str) -> None:
     for _ in range(60):
         try:
             if (await c.get(url, timeout=3)).status_code < 500:
-                log(f"{name} healthy"); return
+                log(f"{name} healthy")
+                return
         except Exception:
             pass
         await asyncio.sleep(3)
     raise RuntimeError(f"{name} not healthy ({url})")
+
+
+async def _wait_tcp(host: str, port: int, name: str) -> None:
+    """Readiness for a non-HTTP service (Redis): a successful TCP connect (M-2)."""
+    import socket
+    for _ in range(60):
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                log(f"{name} healthy")
+                return
+        except OSError:
+            await asyncio.sleep(3)
+    raise RuntimeError(f"{name} not reachable ({host}:{port})")
 
 
 async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str, str],
@@ -296,13 +314,18 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
         await _wait(c, f"{ofga}/healthz", f"{manifest.division_id} OpenFGA")
         await _wait(c, f"{kc}/realms/master", f"{manifest.division_id} Keycloak")
         await _wait(c, f"http://localhost:{ports['qdrant']}/collections", f"{manifest.division_id} Qdrant")
+        # M-2: gate on ALL stateful deps before provisioning, incl. Temporal (Web UI
+        # HTTP) and Redis (TCP) — otherwise approval/worker wiring can race startup.
+        await _wait(c, f"http://localhost:{ports['temporal_ui']}/", f"{manifest.division_id} Temporal")
+        await _wait_tcp("localhost", ports["redis"], f"{manifest.division_id} Redis")
 
         # OpenFGA store + model (this division's OWN store). Reuse the persisted
         # store on re-run (idempotency) — create fresh only if missing or forced —
         # so we don't orphan a new store every run and the agent .env store_id stays
         # stable.
         st = _load_state(manifest.division_id)
-        store_id = st.get("store_id"); model_id = st.get("model_id")
+        store_id = st.get("store_id")
+        model_id = st.get("model_id")
         reuse = False
         if store_id and model_id and not force:
             sr = await c.get(f"{ofga}/stores/{store_id}", headers=ofga_h)
@@ -311,9 +334,11 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
             log(f"OpenFGA store reused={store_id}")
         else:
             r = await c.post(f"{ofga}/stores", json={"name": f"div-{manifest.division_id}"}, headers=ofga_h)
-            r.raise_for_status(); store_id = r.json()["id"]
+            r.raise_for_status()
+            store_id = r.json()["id"]
             r = await c.post(f"{ofga}/stores/{store_id}/authorization-models", json=AUTH_MODEL, headers=ofga_h)
-            r.raise_for_status(); model_id = r.json()["authorization_model_id"]
+            r.raise_for_status()
+            model_id = r.json()["authorization_model_id"]
             _save_state(manifest.division_id, store_id=store_id, model_id=model_id)
             log(f"OpenFGA store={store_id}")
 
@@ -343,7 +368,8 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
     # DID identity (per division) + agent .env.
     did = ensure_identity(AGT / f"agent_identity_{manifest.division_id}.json",
                           f"rag-agent-{manifest.division_id}", manifest.division_id)
-    gdir = generated_dir(manifest.division_id); gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    gdir = generated_dir(manifest.division_id)
+    gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     agent_env = render_agent_env(manifest, ports, secretz, store_id, model_id, nvidia_key)
     env_path = AGT / f".env.{manifest.division_id}"
     _write_secret(env_path, agent_env)                         # holds NVIDIA key + secrets
@@ -381,7 +407,8 @@ def _run_division_ingest(env_file: str, docs_dir: str) -> None:
     r = subprocess.run([str(VENV_PY), "-c", QDRANT_INGEST_SNIPPET, docs_dir],
                        cwd=str(AGT), env=env, capture_output=True, text=True, timeout=900)
     if r.returncode != 0:
-        print(r.stdout[-2000:]); print(r.stderr[-2000:])
+        print(r.stdout[-2000:])
+        print(r.stderr[-2000:])
         raise RuntimeError("division ingest failed")
     log(f"ingest: {r.stdout.strip().splitlines()[-1] if r.stdout.strip() else 'done'}")
 
@@ -486,7 +513,8 @@ def onboard(manifest_path: str | Path, no_neo4j: bool = False, dry_run: bool = F
     manifest = load_manifest(manifest_path)
     ports = derive_ports(manifest.port_base)
     secretz = _load_or_make_secrets(manifest.division_id, force=force)
-    gdir = generated_dir(manifest.division_id); gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    gdir = generated_dir(manifest.division_id)
+    gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     stack_env = render_stack_env(manifest, ports, secretz)
     stack_env_path = gdir / f"div-{manifest.division_id}.env"
     _write_secret(stack_env_path, stack_env)   # Postgres/OpenFGA/Keycloak secrets — owner-only

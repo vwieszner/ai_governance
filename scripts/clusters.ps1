@@ -33,15 +33,28 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 # (no edit here). Onboard a division first: scripts/onboard_division.py infra/divisions/<id>.yml
 $divDir = Join-Path $root 'infra\divisions'
 $CLUSTERS = @{}
+$seenPorts = @{}
 if (Test-Path $divDir) {
     foreach ($mf in (Get-ChildItem -Path $divDir -Filter *.yml -File | Sort-Object Name)) {
         $text = Get-Content $mf.FullName -Raw
         $id = $null; $base = $null
         if ($text -match '(?m)^\s*division_id:\s*(\S+)') { $id = $matches[1] }
         if ($text -match '(?m)^\s*port_base:\s*(\d+)') { $base = [int]$matches[1] }
-        if ($id -and $base) {
-            $CLUSTERS[$id] = @{ dir = 'agt-federated-rag'; env = ".env.$id"; port = $base }
+        # M-1: validate instead of silently overwriting on a clash.
+        if (-not $id -or -not $base) {
+            Write-Host "  WARN: $($mf.Name) malformed (missing division_id/port_base) -- skipped" -ForegroundColor Yellow
+            continue
         }
+        if ($CLUSTERS.ContainsKey($id)) {
+            Write-Host "  WARN: duplicate division_id '$id' in $($mf.Name) -- skipped" -ForegroundColor Yellow
+            continue
+        }
+        if ($seenPorts.ContainsKey($base)) {
+            Write-Host "  WARN: port_base $base in $($mf.Name) collides with division '$($seenPorts[$base])' -- skipped" -ForegroundColor Red
+            continue
+        }
+        $seenPorts[$base] = $id
+        $CLUSTERS[$id] = @{ dir = 'agt-federated-rag'; env = ".env.$id"; port = $base }
     }
 }
 $ALL = @($CLUSTERS.Keys | Sort-Object)
