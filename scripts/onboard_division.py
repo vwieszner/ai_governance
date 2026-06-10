@@ -45,34 +45,15 @@ PORT_OFFSETS = {
 REALM = "rag"  # one realm per division (each division has its OWN Keycloak host)
 SEED_USER_PASSWORD = os.environ.get("RAG_SEED_PASSWORD", "Rag-User-2026!")
 
-AUTH_MODEL = {
-    "schema_version": "1.1",
-    "type_definitions": [
-        {"type": "user"},
-        {
-            "type": "group",
-            "relations": {"member": {"this": {}}},
-            "metadata": {"relations": {"member": {"directly_related_user_types": [{"type": "user"}]}}},
-        },
-        {
-            "type": "chunk",
-            "relations": {
-                "owner": {"this": {}},
-                "editor": {"union": {"child": [{"this": {}}, {"computedUserset": {"relation": "owner"}}]}},
-                "viewer": {"union": {"child": [{"this": {}}, {"computedUserset": {"relation": "editor"}}]}},
-                "pending_approval": {"this": {}},
-            },
-            "metadata": {
-                "relations": {
-                    "owner": {"directly_related_user_types": [{"type": "user"}]},
-                    "editor": {"directly_related_user_types": [{"type": "user"}]},
-                    "viewer": {"directly_related_user_types": [{"type": "user"}]},
-                    "pending_approval": {"directly_related_user_types": [{"type": "user"}]},
-                }
-            },
-        },
-    ],
-}
+# Shared single-source-of-truth provisioning bits (quality B-1). Ensure repo root is
+# importable whether this file is run as a script (sys.path[0]=scripts/) or imported
+# as scripts.onboard_division (tests).
+sys.path.insert(0, str(ROOT))
+from scripts._provisioning import (  # noqa: E402
+    AUTH_MODEL,
+    QDRANT_INGEST_SNIPPET,
+    load_root_env,
+)
 
 
 def log(msg: str) -> None:
@@ -279,18 +260,6 @@ def _save_state(division_id: str, **kv) -> None:
     _write_secret(_state_path(division_id), json.dumps(st))
 
 
-def _load_root_env() -> dict[str, str]:
-    env: dict[str, str] = {}
-    p = ROOT / ".env"
-    if p.exists():
-        for line in p.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip()
-    return env
-
-
 # ── Live orchestration (docker + network) ────────────────────────────────────
 
 
@@ -316,7 +285,7 @@ async def _wait(c, url: str, name: str) -> None:
 async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str, str],
                     no_neo4j: bool, force: bool = False) -> None:
     import httpx
-    nvidia_key = (_load_root_env().get("NVIDIA_API_KEY") or os.environ.get("NVIDIA_API_KEY", ""))
+    nvidia_key = (load_root_env(ROOT).get("NVIDIA_API_KEY") or os.environ.get("NVIDIA_API_KEY", ""))
     if not nvidia_key:
         raise SystemExit("NVIDIA_API_KEY not in ./.env or environment.")
     ofga = f"http://localhost:{ports['openfga']}"
@@ -406,36 +375,10 @@ def ensure_identity(path: Path, name: str, org: str) -> dict:
     return {"did": str(identity.did), "jwk": json.dumps(identity.to_jwk(include_private=False))}
 
 
-_DIV_INGEST_SNIPPET = '''
-import truststore; truststore.inject_into_ssl()
-import asyncio, sys, hashlib
-from pathlib import Path
-from rag.ingest import split_text
-from rag.qdrant_retriever import HybridQdrantRetriever
-def cid(src,i): return hashlib.sha256(f"{src}:{i}".encode()).hexdigest()[:16]
-async def get_ret():
-    if hasattr(HybridQdrantRetriever,"get_instance"): return await HybridQdrantRetriever.get_instance()
-    q=HybridQdrantRetriever(); await q.ensure_collection(); return q
-async def go(folder):
-    files=list(Path(folder).rglob("*.txt"))+list(Path(folder).rglob("*.md"))
-    q=await get_ret()
-    try:
-        chunks=[]
-        for f in files:
-            for i,ct in enumerate(split_text(f.read_text(encoding="utf-8",errors="replace"))):
-                chunks.append({"chunk_id":cid(str(f),i),"text":ct,"metadata":{"source":str(f),"chunk_index":i,"title":f.stem}})
-        for i in range(0,len(chunks),100): await q.upsert_chunks(chunks[i:i+100])
-        print(f"upserted {len(chunks)} chunks from {len(files)} files")
-    finally:
-        await q.close()
-asyncio.run(go(sys.argv[1]))
-'''
-
-
 def _run_division_ingest(env_file: str, docs_dir: str) -> None:
     """Ingest docs_dir into THIS division's Qdrant (selected by RAG_ENV_FILE=.env.<id>)."""
     env = {**os.environ, "RAG_ENV_FILE": env_file}
-    r = subprocess.run([str(VENV_PY), "-c", _DIV_INGEST_SNIPPET, docs_dir],
+    r = subprocess.run([str(VENV_PY), "-c", QDRANT_INGEST_SNIPPET, docs_dir],
                        cwd=str(AGT), env=env, capture_output=True, text=True, timeout=900)
     if r.returncode != 0:
         print(r.stdout[-2000:]); print(r.stderr[-2000:])

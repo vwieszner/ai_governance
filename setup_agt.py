@@ -35,6 +35,15 @@ ROOT = Path(__file__).parent
 VENV_PY = ROOT / ".venv" / "Scripts" / "python.exe"
 AGT = ROOT / "agt-federated-rag"
 
+# Shared single-source-of-truth provisioning bits (quality B-1) — same OpenFGA auth
+# model + ingest snippet + root-.env loader used by scripts/onboard_division.py.
+sys.path.insert(0, str(ROOT))
+from scripts._provisioning import (  # noqa: E402
+    AUTH_MODEL,
+    QDRANT_INGEST_SNIPPET,
+    load_root_env,
+)
+
 OPENFGA = "http://localhost:8089"
 KEYCLOAK = "http://localhost:8087"
 QDRANT = "http://localhost:16333"
@@ -54,53 +63,14 @@ ALICE_PEND_B = "q4_financial_results"
 ID_PATH_A = AGT / "agent_identity_agt_a.json"
 ID_PATH_B = AGT / "agent_identity_agt_b.json"
 
-AUTH_MODEL = {
-    "schema_version": "1.1",
-    "type_definitions": [
-        {"type": "user"},
-        {
-            "type": "group",
-            "relations": {"member": {"this": {}}},
-            "metadata": {"relations": {"member": {"directly_related_user_types": [{"type": "user"}]}}},
-        },
-        {
-            "type": "chunk",
-            "relations": {
-                "owner": {"this": {}},
-                "editor": {"union": {"child": [{"this": {}}, {"computedUserset": {"relation": "owner"}}]}},
-                "viewer": {"union": {"child": [{"this": {}}, {"computedUserset": {"relation": "editor"}}]}},
-                "pending_approval": {"this": {}},
-            },
-            "metadata": {
-                "relations": {
-                    "owner": {"directly_related_user_types": [{"type": "user"}]},
-                    "editor": {"directly_related_user_types": [{"type": "user"}]},
-                    "viewer": {"directly_related_user_types": [{"type": "user"}]},
-                    "pending_approval": {"directly_related_user_types": [{"type": "user"}]},
-                }
-            },
-        },
-    ],
-}
+# AUTH_MODEL now imported from scripts._provisioning (single source of truth).
 
 
 def log(msg: str) -> None:
     print(f"[setup-agt] {msg}", flush=True)
 
 
-def _load_root_env() -> dict[str, str]:
-    env: dict[str, str] = {}
-    p = ROOT / ".env"
-    if p.exists():
-        for line in p.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip()
-    return env
-
-
-_ENV = _load_root_env()
+_ENV = load_root_env(ROOT)
 
 
 def _need(key: str) -> str:
@@ -334,34 +304,8 @@ def write_env(store_id: str, model_id: str, a_id: dict, b_id: dict) -> None:
     log("wrote agt-federated-rag/.env and .env.cluster-b (peer DID+JWK cross-wired)")
 
 
-_QDRANT_INGEST = '''
-import truststore; truststore.inject_into_ssl()
-import asyncio, sys, hashlib
-from pathlib import Path
-from rag.ingest import split_text
-from rag.qdrant_retriever import HybridQdrantRetriever
-def cid(src,i): return hashlib.sha256(f"{src}:{i}".encode()).hexdigest()[:16]
-async def get_ret():
-    if hasattr(HybridQdrantRetriever,"get_instance"): return await HybridQdrantRetriever.get_instance()
-    q=HybridQdrantRetriever(); await q.ensure_collection(); return q
-async def go(folder):
-    files=list(Path(folder).rglob("*.txt"))+list(Path(folder).rglob("*.md"))
-    q=await get_ret()
-    try:
-        chunks=[]
-        for f in files:
-            for i,ct in enumerate(split_text(f.read_text(encoding="utf-8",errors="replace"))):
-                chunks.append({"chunk_id":cid(str(f),i),"text":ct,"metadata":{"source":str(f),"chunk_index":i,"title":f.stem}})
-        for i in range(0,len(chunks),100): await q.upsert_chunks(chunks[i:i+100])
-        print(f"upserted {len(chunks)} chunks from {len(files)} files")
-    finally:
-        await q.close()
-asyncio.run(go(sys.argv[1]))
-'''
-
-
 def run_ingest(label: str, docs: Path, no_neo4j: bool, env_file: str) -> None:
-    args = [str(VENV_PY), "-c", _QDRANT_INGEST, str(docs)] if no_neo4j else \
+    args = [str(VENV_PY), "-c", QDRANT_INGEST_SNIPPET, str(docs)] if no_neo4j else \
            [str(VENV_PY), "-m", "rag.ingest", "--path", str(docs)]
     env = {**os.environ, "RAG_ENV_FILE": env_file}
     log(f"ingest {label} ({env_file}) ...")
