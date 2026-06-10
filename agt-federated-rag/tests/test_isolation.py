@@ -13,7 +13,28 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from scripts.onboard_division import AUTH_MODEL, GENERATED_DIR
+from scripts.onboard_division import AUTH_MODEL, DIVISIONS_DIR, GENERATED_DIR, onboard
+
+
+def _read_env_file(path) -> dict[str, str]:
+    return {k.strip(): v.strip() for k, _, v in
+            (ln.partition("=") for ln in path.read_text(encoding="utf-8").splitlines() if "=" in ln)}
+
+
+def test_division_config_isolation_invariant():
+    """Hermetic (no live stacks, runs by default): each division renders a DISTINCT
+    endpoint + credential set — own OpenFGA port+token, Keycloak port, Postgres &
+    KC-admin passwords. This is the config-level physical-isolation invariant that
+    backs test_division_cannot_read_peer_store (which needs live stacks). Together
+    they prove NFR-2 both statically (here) and at runtime (there)."""
+    cfg = {}
+    for div in ("alpha", "beta"):
+        onboard(DIVISIONS_DIR / f"{div}.yml", dry_run=True)   # renders only; no docker/network
+        cfg[div] = _read_env_file(GENERATED_DIR / div / f"div-{div}.env")
+    a, b = cfg["alpha"], cfg["beta"]
+    for key in ("DIV_OPENFGA_PORT", "DIV_KEYCLOAK_PORT", "DIV_TEMPORAL_PORT",
+                "OPENFGA_API_TOKEN", "POSTGRES_PASSWORD", "KEYCLOAK_ADMIN_PASSWORD"):
+        assert a[key] != b[key], f"divisions share {key} -> not isolated"
 
 _TUPLE = {"user": "user:alice", "relation": "viewer", "object": "chunk:secret-A"}
 

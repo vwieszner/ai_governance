@@ -303,7 +303,6 @@ def compose_up(env_file: Path, project: str) -> None:
 
 
 async def _wait(c, url: str, name: str) -> None:
-    import httpx  # local import so --dry-run / unit tests need no httpx
     for _ in range(60):
         try:
             if (await c.get(url, timeout=3)).status_code < 500:
