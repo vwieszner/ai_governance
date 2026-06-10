@@ -59,8 +59,12 @@ class Settings(BaseSettings):
     llm_model: str = "meta/llama-3.3-70b-instruct"
     llm_temperature: float = 0.0
     llm_max_tokens: int = 2048
-    # Generous timeout + retries for the slow NVIDIA cold-connect (see federated-rag).
-    llm_timeout_seconds: float = 60.0
+    # NVIDIA NIM (the default endpoint) cold-starts: the FIRST request after idle can
+    # hang 60-120s while the model loads, then warm requests are ~2-3s. The timeout must
+    # exceed a cold load so a (warming) first attempt + a fast retry can complete rather
+    # than the retry-storm timing out at exactly the wrong moment. Production with a
+    # reliable/self-hosted endpoint (M6) can safely lower this.
+    llm_timeout_seconds: float = 120.0
     llm_max_retries: int = 2
     llm_context_token_budget: int = 6000
     max_query_length: int = 4096

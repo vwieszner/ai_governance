@@ -45,7 +45,7 @@ PORT_OFFSETS = {
 
 REALM = "rag"  # one realm per division (each division has its OWN Keycloak host)
 # Seed-user (alice/bob) password is per-division random (see make_division_secrets);
-# set RAG_SEED_PASSWORD to pin a known value for the demo / _repro_div.py.
+# set RAG_SEED_PASSWORD to pin a known value for reproducible provisioning / tests.
 
 # Shared single-source-of-truth provisioning bits (quality B-1). Ensure repo root is
 # importable whether this file is run as a script (sys.path[0]=scripts/) or imported
