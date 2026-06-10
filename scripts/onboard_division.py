@@ -75,6 +75,10 @@ class Manifest:
     trusted_peers: list[str] = field(default_factory=list)
     seed_viewer: str = ""    # doc title alice may view directly
     seed_approval: str = ""  # doc title that needs the owner's approval (bob owns)
+    # Cross-division pre-authorizations (FR-3.7): grant a named EXTERNAL user (from a
+    # peer division) a relation on one of THIS division's docs, applied by
+    # scripts/federate_divisions.py. Each item: {user_email, home_division, relation, doc}.
+    cross_grants: list[dict] = field(default_factory=list)
 
 
 def _parse_manifest_text(text: str) -> dict:
@@ -127,6 +131,7 @@ def load_manifest(path: str | Path) -> Manifest:
         trusted_peers=list(peers),
         seed_viewer=str(data.get("seed_viewer", "")),
         seed_approval=str(data.get("seed_approval", "")),
+        cross_grants=[g for g in (data.get("cross_grants") or []) if isinstance(g, dict)],
     )
 
 

@@ -7,3 +7,12 @@ docs_dir: tests/docs/cluster-b
 residency_mode: external
 seed_viewer: technical_architecture
 seed_approval: q4_financial_results
+# Cross-division pre-authorization (FR-3.7): alice (home division: alpha) may view
+# beta's technical_architecture directly. scripts/federate_divisions.py writes this
+# grant to beta's OpenFGA keyed by alice's namespaced (alpha-issuer, email) principal,
+# so a verifiable cross-division request from her is answered immediately — no approval.
+cross_grants:
+  - user_email: alice@example.com
+    home_division: alpha
+    relation: viewer
+    doc: technical_architecture

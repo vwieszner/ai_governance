@@ -45,12 +45,20 @@ def _div_openfga(div: str) -> tuple[str, str]:
         pytest.skip(f"division '{div}' not onboarded (run scripts/onboard_division.py {div})")
     env = {k.strip(): v.strip() for k, _, v in
            (ln.partition("=") for ln in env_path.read_text(encoding="utf-8").splitlines() if "=" in ln)}
-    return f"http://localhost:{env['DIV_OPENFGA_PORT']}", env["OPENFGA_API_TOKEN"]
+    # Address the loopback boundary as 127.0.0.1, NOT "localhost". The stacks bind
+    # 127.0.0.1:<port> (loopback only — NFR-2). "localhost" resolves to ::1 first on
+    # Windows, where WSL2 mirrored networking (wslrelay) can squat the IPv6 loopback
+    # and shadow the real service — testing the wrong endpoint. 127.0.0.1 pins IPv4.
+    return f"http://127.0.0.1:{env['DIV_OPENFGA_PORT']}", env["OPENFGA_API_TOKEN"]
 
 
 def _reachable(url: str) -> bool:
+    """True only if this is genuinely an OpenFGA server (SERVING health), so an HTML
+    404 from an unrelated squatter is treated as 'not running' and the test skips
+    rather than failing on a false-positive endpoint."""
     try:
-        return httpx.get(f"{url}/healthz", timeout=3).status_code < 500
+        r = httpx.get(f"{url}/healthz", timeout=3)
+        return r.status_code == 200 and r.json().get("status") == "SERVING"
     except Exception:
         return False
 
