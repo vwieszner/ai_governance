@@ -31,6 +31,7 @@ JWKS cache:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from typing import Any
 
@@ -318,6 +319,56 @@ def extract_user_id(claims: dict) -> str:
             "Ensure the Keycloak client is configured to include the subject claim."
         )
     return str(sub)
+
+
+def issuer_namespace(iss: str) -> str:
+    """Stable, OpenFGA-safe namespace derived from the *verified* issuer.
+
+    SECURITY (federated trust): the authorization principal is namespaced by the
+    issuer that signed the token so trusting one issuer can NEVER let it vouch for
+    another issuer's users. Without this, a single compromised/malicious trusted
+    issuer could mint ``email=ceo@other-division`` and impersonate anyone in the
+    federation — ``email_verified`` does NOT close this (the receiver cannot check
+    that the *home* issuer truly verified the email; it only attests it did).
+
+    Derived from a hash so it needs no cross-division label-agreement config and
+    contains only OpenFGA-safe characters. Issuer is normalised (trailing slash
+    stripped) so the seed-time and runtime forms match byte-for-byte.
+    """
+    return hashlib.sha256(iss.rstrip("/").encode("utf-8")).hexdigest()[:16]
+
+
+def principal(claims: dict) -> str:
+    """Canonical federated authorization principal for OpenFGA.
+
+    Format: ``<email>|<issuer-namespace>`` — e.g.
+    ``alice@example.com|56b707f1d1087268``. The lower-cased email is the stable,
+    human-readable, cross-division subject; the issuer-namespace (see
+    :func:`issuer_namespace`) scopes it so a trusted issuer can only vouch for ITS
+    OWN users. Requires a *verified* email (``email_verified == true``) and the
+    cryptographically-verified ``iss`` claim — callers MUST pass claims returned by
+    :func:`validate_token` or :func:`validate_peer_user_assertion`, never the raw
+    envelope's ``source_division``/``user_id``.
+
+    Raises:
+        ValueError: if ``iss`` or a verified ``email`` is absent.
+    """
+    iss = claims.get("iss")
+    if not iss:
+        raise ValueError("token missing 'iss' claim — cannot namespace principal")
+    email = claims.get("email")
+    if not email:
+        raise ValueError(
+            "token missing 'email' claim — the federated authorization principal "
+            "requires a verified email. Configure the Keycloak client to include "
+            "the 'email' scope/mapper."
+        )
+    if claims.get("email_verified") is not True:
+        raise ValueError(
+            "token 'email' is not verified (email_verified != true) — refusing to "
+            "build an authorization principal from an unverified email."
+        )
+    return f"{str(email).strip().lower()}|{issuer_namespace(str(iss))}"
 
 
 def extract_client_id(claims: dict) -> str | None:

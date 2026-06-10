@@ -53,7 +53,7 @@ import agent.nodes as agent_nodes
 import mesh.agent_identity as agent_identity
 from auth.token_validator import (
     AuthServiceUnavailable,
-    extract_user_id,
+    principal,
     validate_peer_user_assertion,
     validate_token,
 )
@@ -543,7 +543,18 @@ async def query(
         log.warning("agt_policy_denial_query", error=str(exc))
         raise HTTPException(status_code=403, detail="Request denied by governance policy")
 
-    user_id: str = claims.get("sub", "")
+    # Authorization principal = verified (issuer, email), NOT the bare sub. This is
+    # the same namespaced identity used for cross-division calls (see /a2a/query), so
+    # a local user and "the same user arriving from a peer division" are DISTINCT
+    # principals unless explicitly granted — least-privilege federated trust.
+    try:
+        user_id = principal(claims)
+    except ValueError as exc:
+        log.warning("query_principal_unbuildable", error=str(exc))
+        raise HTTPException(
+            status_code=401,
+            detail="Token lacks a verified email required for authorization",
+        )
     task_id = str(uuid.uuid4())
     context_id = str(uuid.uuid4())
 
@@ -715,7 +726,10 @@ async def a2a_query(request: Request) -> JSONResponse:
         )
     try:
         assertion_claims = await validate_peer_user_assertion(assertion)
-        user_id = extract_user_id(assertion_claims)
+        # Principal is namespaced by the assertion's VERIFIED issuer (the peer's home
+        # Keycloak), so a peer can only present its OWN users — a malicious trusted
+        # issuer cannot forge another division's user even with email_verified=true.
+        user_id = principal(assertion_claims)
     except HTTPException:
         raise
     except Exception as exc:

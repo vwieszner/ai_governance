@@ -89,3 +89,59 @@ def test_expired_assertion_rejected(make_settings, monkeypatch):
     token = _mint(priv, issuer=PEER_ISS, ttl=-10)  # already expired
     with pytest.raises(JWTError):
         asyncio.run(tv.validate_peer_user_assertion(token))
+
+
+# ── Namespaced authorization principal (the federated-trust security boundary) ──
+#
+# The OpenFGA principal is (verified-issuer, email), NOT a bare email/sub. Without
+# the issuer namespace, trusting ANY issuer would let it mint email=<anyone> and
+# impersonate every user in the federation (email_verified does not help — the
+# receiver can't check the home realm actually verified it). These tests pin that
+# property: same (iss,email) is stable; a DIFFERENT trusted issuer claiming the same
+# email yields a DIFFERENT principal (no impersonation); unverified email is refused.
+
+ALPHA_ISS = "http://localhost:8102/realms/rag"
+GAMMA_ISS = "http://localhost:8302/realms/rag"
+
+
+def _claims(iss, email="alice@example.com", verified=True):
+    return {"iss": iss, "email": email, "email_verified": verified, "sub": "x"}
+
+
+def test_principal_is_namespaced_by_issuer():
+    from auth.token_validator import principal
+    p = principal(_claims(ALPHA_ISS))
+    assert p.startswith("alice@example.com|")
+    assert len(p.split("|")[1]) == 16            # 16-hex issuer namespace
+
+
+def test_principal_stable_for_same_issuer_and_email():
+    from auth.token_validator import principal
+    assert principal(_claims(ALPHA_ISS)) == principal(_claims(ALPHA_ISS))
+
+
+def test_trusted_issuer_cannot_impersonate_another_divisions_user():
+    # THE security property: gamma is a trusted issuer, but a gamma-signed token
+    # claiming alice's email must NOT resolve to alice's alpha principal.
+    from auth.token_validator import principal
+    alice_at_alpha = principal(_claims(ALPHA_ISS, "alice@example.com"))
+    alice_forged_by_gamma = principal(_claims(GAMMA_ISS, "alice@example.com"))
+    assert alice_at_alpha != alice_forged_by_gamma  # impersonation blocked
+
+
+def test_principal_requires_verified_email():
+    from auth.token_validator import principal
+    with pytest.raises(ValueError):
+        principal(_claims(ALPHA_ISS, verified=False))     # email_verified=false
+    with pytest.raises(ValueError):
+        principal({"iss": ALPHA_ISS, "sub": "x"})         # no email at all
+
+
+def test_seed_principal_matches_runtime_principal():
+    # onboard seeds tuples; the agent looks them up at runtime — the two MUST agree
+    # byte-for-byte or every authorization silently fails closed.
+    from auth.token_validator import principal
+    from scripts.onboard_division import _seed_principal
+    seeded = _seed_principal("Alice@Example.com", ALPHA_ISS)   # note casing/normalise
+    runtime = principal(_claims(ALPHA_ISS, "alice@example.com"))
+    assert seeded == runtime

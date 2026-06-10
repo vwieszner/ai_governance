@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -494,27 +495,27 @@ async def _kc_ensure_user(c, kc: str, h: dict, username: str, email: str, passwo
                     json={"type": "password", "value": password, "temporary": False}, headers=h)
 
 
-async def _kc_user_sub(c, kc: str, username: str, password: str) -> str:
-    import base64
-    r = await c.post(f"{kc}/realms/{REALM}/protocol/openid-connect/token",
-                     data={"grant_type": "password", "client_id": "rag-ui",
-                           "username": username, "password": password})
-    r.raise_for_status()
-    p = r.json()["access_token"].split(".")[1]
-    p += "=" * (-len(p) % 4)
-    return json.loads(base64.urlsafe_b64decode(p))["sub"]
+def _seed_principal(email: str, issuer: str) -> str:
+    """The OpenFGA authorization principal for a seeded user — MUST be byte-identical
+    to auth.token_validator.principal() so seed-time tuples match runtime lookups.
+    Format: ``<email-lower>|<sha256(issuer)[:16]>``, namespaced by the issuer so a
+    division only authorizes its OWN users (test_principal_parity guards the drift)."""
+    ns = hashlib.sha256(issuer.rstrip("/").encode("utf-8")).hexdigest()[:16]
+    return f"{email.strip().lower()}|{ns}"
 
 
 async def _seed_division_tuples(c, manifest: Manifest, ports: dict[str, int],
                                 secretz: dict[str, str], store_id: str) -> None:
     """Seed default per-chunk authz: alice viewer on seed_viewer doc; alice
-    pending_approval + bob owner on seed_approval doc (the demo's local-answer and
-    needs-approval flows). Tuples land in THIS division's OWN OpenFGA store."""
+    pending_approval + bob owner on seed_approval doc (the local-answer and
+    needs-approval flows). Tuples land in THIS division's OWN OpenFGA store and are
+    keyed by the namespaced (issuer,email) principal — matching what the agent
+    derives from a validated token at runtime."""
     ofga = f"http://localhost:{ports['openfga']}"
-    kc = f"http://localhost:{ports['keycloak']}"
     ofga_h = {"Authorization": f"Bearer {secretz['openfga_api_token']}"}
-    alice = await _kc_user_sub(c, kc, "alice", secretz["seed_user_password"])
-    bob = await _kc_user_sub(c, kc, "bob", secretz["seed_user_password"])
+    issuer = f"http://localhost:{ports['keycloak']}/realms/{REALM}"
+    alice = _seed_principal("alice@example.com", issuer)
+    bob = _seed_principal("bob@example.com", issuer)
 
     # chunk ids grouped by doc title, from this division's Qdrant.
     qd = f"http://localhost:{ports['qdrant']}"
