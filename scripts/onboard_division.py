@@ -248,6 +248,37 @@ def _write_secret(path: Path, data: str) -> None:
         f.write(data)
 
 
+def _load_or_make_secrets(division_id: str, force: bool = False) -> dict[str, str]:
+    """Per-division secrets persisted at infra/generated/<id>/secrets.json so a
+    re-run REUSES them (idempotency, prod B-1 / sec F1): the durable Postgres volume
+    was initialised with the original password, so minting a fresh one would lock
+    OpenFGA out of its datastore -> never healthy. force=True rotates (only safe
+    after `--teardown`, which wipes the volumes too)."""
+    gdir = generated_dir(division_id)
+    gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    sp = gdir / "secrets.json"
+    if sp.exists() and not force:
+        return json.loads(sp.read_text(encoding="utf-8"))
+    sec = make_division_secrets()
+    _write_secret(sp, json.dumps(sec))
+    return sec
+
+
+def _state_path(division_id: str) -> Path:
+    return generated_dir(division_id) / "state.json"
+
+
+def _load_state(division_id: str) -> dict:
+    p = _state_path(division_id)
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def _save_state(division_id: str, **kv) -> None:
+    st = _load_state(division_id)
+    st.update(kv)
+    _write_secret(_state_path(division_id), json.dumps(st))
+
+
 def _load_root_env() -> dict[str, str]:
     env: dict[str, str] = {}
     p = ROOT / ".env"
@@ -284,7 +315,7 @@ async def _wait(c, url: str, name: str) -> None:
 
 
 async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str, str],
-                    no_neo4j: bool) -> None:
+                    no_neo4j: bool, force: bool = False) -> None:
     import httpx
     nvidia_key = (_load_root_env().get("NVIDIA_API_KEY") or os.environ.get("NVIDIA_API_KEY", ""))
     if not nvidia_key:
@@ -298,12 +329,25 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
         await _wait(c, f"{kc}/realms/master", f"{manifest.division_id} Keycloak")
         await _wait(c, f"http://localhost:{ports['qdrant']}/collections", f"{manifest.division_id} Qdrant")
 
-        # OpenFGA store + model (this division's OWN store).
-        r = await c.post(f"{ofga}/stores", json={"name": f"div-{manifest.division_id}"}, headers=ofga_h)
-        r.raise_for_status(); store_id = r.json()["id"]
-        r = await c.post(f"{ofga}/stores/{store_id}/authorization-models", json=AUTH_MODEL, headers=ofga_h)
-        r.raise_for_status(); model_id = r.json()["authorization_model_id"]
-        log(f"OpenFGA store={store_id}")
+        # OpenFGA store + model (this division's OWN store). Reuse the persisted
+        # store on re-run (idempotency) — create fresh only if missing or forced —
+        # so we don't orphan a new store every run and the agent .env store_id stays
+        # stable.
+        st = _load_state(manifest.division_id)
+        store_id = st.get("store_id"); model_id = st.get("model_id")
+        reuse = False
+        if store_id and model_id and not force:
+            sr = await c.get(f"{ofga}/stores/{store_id}", headers=ofga_h)
+            reuse = sr.status_code == 200
+        if reuse:
+            log(f"OpenFGA store reused={store_id}")
+        else:
+            r = await c.post(f"{ofga}/stores", json={"name": f"div-{manifest.division_id}"}, headers=ofga_h)
+            r.raise_for_status(); store_id = r.json()["id"]
+            r = await c.post(f"{ofga}/stores/{store_id}/authorization-models", json=AUTH_MODEL, headers=ofga_h)
+            r.raise_for_status(); model_id = r.json()["authorization_model_id"]
+            _save_state(manifest.division_id, store_id=store_id, model_id=model_id)
+            log(f"OpenFGA store={store_id}")
 
         # Keycloak realm + clients + users (this division's OWN Keycloak).
         tr = await c.post(f"{kc}/realms/master/protocol/openid-connect/token",
@@ -489,14 +533,17 @@ async def _seed_division_tuples(c, manifest: Manifest, ports: dict[str, int],
         await grant(f"user:{bob}", "owner", manifest.seed_approval)
 
 
-def onboard(manifest_path: str | Path, no_neo4j: bool = False, dry_run: bool = False) -> dict:
+def onboard(manifest_path: str | Path, no_neo4j: bool = False, dry_run: bool = False,
+            force: bool = False) -> dict:
     """Render (+ optionally stand up & provision) a division. Returns the render plan.
 
-    dry_run=True does ONLY pure rendering to infra/generated/<id>/ (no docker/network)
-    — safe in CI / tests; proves the generator never edits source."""
+    IDEMPOTENT: secrets persist under infra/generated/<id>/ and are reused on re-run
+    (so the durable Postgres volume password matches); the OpenFGA store is reused.
+    dry_run=True does ONLY pure rendering (no docker/network) — safe in CI/tests.
+    force=True rotates secrets + recreates the store (use after --teardown)."""
     manifest = load_manifest(manifest_path)
     ports = derive_ports(manifest.port_base)
-    secretz = make_division_secrets()
+    secretz = _load_or_make_secrets(manifest.division_id, force=force)
     gdir = generated_dir(manifest.division_id); gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     stack_env = render_stack_env(manifest, ports, secretz)
     stack_env_path = gdir / f"div-{manifest.division_id}.env"
@@ -508,18 +555,45 @@ def onboard(manifest_path: str | Path, no_neo4j: bool = False, dry_run: bool = F
         return plan
     log(f"=== onboarding division '{manifest.division_id}' (ports {ports['agent']}..{ports['redis']}) ===")
     compose_up(stack_env_path, compose_project(manifest.division_id))
-    asyncio.run(provision(manifest, ports, secretz, no_neo4j))
+    asyncio.run(provision(manifest, ports, secretz, no_neo4j, force=force))
     return plan
 
 
+def teardown(manifest_path: str | Path) -> None:
+    """Offboard a division: docker compose down -v (containers + volumes) + remove
+    generated artifacts, agent .env, and identity (prod B-2)."""
+    import shutil
+    manifest = load_manifest(manifest_path)
+    project = compose_project(manifest.division_id)
+    log(f"=== tearing down division '{manifest.division_id}' (project {project}) ===")
+    cmd = ["docker", "compose", "-p", project]
+    senv = generated_dir(manifest.division_id) / f"div-{manifest.division_id}.env"
+    if senv.exists():
+        cmd += ["--env-file", str(senv)]   # satisfy ${VAR:?} substitution during down
+    cmd += ["-f", str(TEMPLATE), "down", "-v"]
+    subprocess.run(cmd, cwd=str(ROOT), check=False)
+    shutil.rmtree(generated_dir(manifest.division_id), ignore_errors=True)
+    for p in (AGT / f".env.{manifest.division_id}",
+              AGT / f"agent_identity_{manifest.division_id}.json"):
+        p.unlink(missing_ok=True)
+    log(f"division '{manifest.division_id}' torn down (containers, volumes, generated artifacts removed)")
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Onboard a division as an isolated stack.")
+    ap = argparse.ArgumentParser(description="Onboard (or tear down) a division as an isolated stack.")
     ap.add_argument("manifest", help="path to a division manifest (infra/divisions/<id>.yml)")
     ap.add_argument("--no-neo4j", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="render configs only; no docker/network")
+    ap.add_argument("--force", action="store_true",
+                    help="rotate secrets + recreate the OpenFGA store (use after --teardown)")
+    ap.add_argument("--teardown", action="store_true",
+                    help="docker compose down -v + remove this division's generated artifacts")
     args = ap.parse_args()
     t0 = time.time()
-    onboard(args.manifest, no_neo4j=args.no_neo4j, dry_run=args.dry_run)
+    if args.teardown:
+        teardown(args.manifest)
+    else:
+        onboard(args.manifest, no_neo4j=args.no_neo4j, dry_run=args.dry_run, force=args.force)
     log(f"done in {time.time()-t0:.0f}s")
 
 

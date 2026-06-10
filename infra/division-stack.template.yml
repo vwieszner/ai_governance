@@ -73,8 +73,14 @@ services:
 
   temporal:
     image: temporalio/temporal:latest
-    command: ["server", "start-dev", "--ip", "0.0.0.0", "--log-level", "warn"]
+    # --db-filename persists to a SQLite file on a named volume so in-flight APPROVAL
+    # workflows survive restart/reboot (the product's offline-approval headline).
+    # Without it, start-dev is in-memory and approvals are lost. (prod B-3)
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--log-level", "warn",
+              "--db-filename", "/home/temporal/temporal.db"]
     container_name: div-${DIV_ID}-temporal
+    volumes:
+      - div-temporal-data:/home/temporal   # uid 1000 (temporal) owns this path
     ports:
       - "127.0.0.1:${DIV_TEMPORAL_PORT}:7233"
       - "127.0.0.1:${DIV_TEMPORAL_UI_PORT}:8233"
@@ -115,5 +121,6 @@ services:
 volumes:
   div-postgres-data:
   div-keycloak-data:
+  div-temporal-data:
   div-qdrant-data:
   div-redis-data:
