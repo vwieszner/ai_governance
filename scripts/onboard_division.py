@@ -43,7 +43,8 @@ PORT_OFFSETS = {
 }
 
 REALM = "rag"  # one realm per division (each division has its OWN Keycloak host)
-SEED_USER_PASSWORD = os.environ.get("RAG_SEED_PASSWORD", "Rag-User-2026!")
+# Seed-user (alice/bob) password is per-division random (see make_division_secrets);
+# set RAG_SEED_PASSWORD to pin a known value for the demo / _repro_div.py.
 
 # Shared single-source-of-truth provisioning bits (quality B-1). Ensure repo root is
 # importable whether this file is run as a script (sys.path[0]=scripts/) or imported
@@ -215,6 +216,10 @@ def make_division_secrets() -> dict[str, str]:
         "keycloak_admin_password": secrets.token_urlsafe(18),
         "agent_client_secret": secrets.token_urlsafe(24),
         "approval_hmac_secret": secrets.token_hex(32),
+        # Per-division seed-user (alice/bob) password — random, persisted, NOT a
+        # hardcoded constant (sec F2). Printed at onboard end; _repro_div reads it
+        # from secrets.json. RAG_SEED_PASSWORD overrides for a known dev value.
+        "seed_user_password": os.environ.get("RAG_SEED_PASSWORD") or secrets.token_urlsafe(16),
     }
 
 
@@ -362,7 +367,7 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
         # only — NO cross-division mapper (that was AUD-1; M1 keeps it single).
         await _kc_add_ui_audience(c, kc, h, f"agent-{manifest.division_id}")
         for u, em in [("alice", "alice@example.com"), ("bob", "bob@example.com")]:
-            await _kc_ensure_user(c, kc, h, u, em)
+            await _kc_ensure_user(c, kc, h, u, em, secretz["seed_user_password"])
         log("Keycloak realm + clients + users ready")
 
     # DID identity (per division) + agent .env.
@@ -434,13 +439,13 @@ async def _kc_add_ui_audience(c, kc: str, h: dict, agent_client_id: str) -> None
                  headers=h)
 
 
-async def _kc_ensure_user(c, kc: str, h: dict, username: str, email: str) -> None:
+async def _kc_ensure_user(c, kc: str, h: dict, username: str, email: str, password: str) -> None:
     """Create a realm user and RELIABLY set its password (create + lookup + force
     reset + clear required actions), so the direct-access-grant login works — a
     bare create can leave a required-action that 400s the password grant."""
     body = {"username": username, "enabled": True, "email": email, "emailVerified": True,
             "firstName": username.capitalize(), "lastName": "User", "requiredActions": [],
-            "credentials": [{"type": "password", "value": SEED_USER_PASSWORD, "temporary": False}]}
+            "credentials": [{"type": "password", "value": password, "temporary": False}]}
     await c.post(f"{kc}/admin/realms/{REALM}/users", json=body, headers=h)  # 201 or 409
     lk = await c.get(f"{kc}/admin/realms/{REALM}/users",
                      params={"username": username, "exact": "true"}, headers=h)
@@ -450,7 +455,7 @@ async def _kc_ensure_user(c, kc: str, h: dict, username: str, email: str) -> Non
         await c.put(f"{kc}/admin/realms/{REALM}/users/{uid}",
                     json={"enabled": True, "emailVerified": True, "requiredActions": []}, headers=h)
         await c.put(f"{kc}/admin/realms/{REALM}/users/{uid}/reset-password",
-                    json={"type": "password", "value": SEED_USER_PASSWORD, "temporary": False}, headers=h)
+                    json={"type": "password", "value": password, "temporary": False}, headers=h)
 
 
 async def _kc_user_sub(c, kc: str, username: str, password: str) -> str:
@@ -472,8 +477,8 @@ async def _seed_division_tuples(c, manifest: Manifest, ports: dict[str, int],
     ofga = f"http://localhost:{ports['openfga']}"
     kc = f"http://localhost:{ports['keycloak']}"
     ofga_h = {"Authorization": f"Bearer {secretz['openfga_api_token']}"}
-    alice = await _kc_user_sub(c, kc, "alice", SEED_USER_PASSWORD)
-    bob = await _kc_user_sub(c, kc, "bob", SEED_USER_PASSWORD)
+    alice = await _kc_user_sub(c, kc, "alice", secretz["seed_user_password"])
+    bob = await _kc_user_sub(c, kc, "bob", secretz["seed_user_password"])
 
     # chunk ids grouped by doc title, from this division's Qdrant.
     qd = f"http://localhost:{ports['qdrant']}"

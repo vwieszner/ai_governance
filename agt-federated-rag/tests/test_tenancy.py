@@ -37,6 +37,36 @@ def test_residency_and_transport_defaults(make_settings):
     assert s.require_mtls is False          # M7 will enforce True
 
 
+def test_openfga_audit_carries_division_id(make_settings, monkeypatch):
+    """FR-1.4: every OpenFGA authorization decision is attributed to its division in
+    the audit log. Asserts the openfga.check structured event includes division_id
+    (previously only verified by reading the diff)."""
+    import asyncio
+
+    import structlog
+
+    from auth import openfga as ofga
+
+    s = make_settings(division_id="division-alpha")
+    monkeypatch.setattr(ofga, "settings", s)
+
+    auth = ofga.OpenFGAAuth()
+
+    class _Resp:
+        allowed = True
+
+    class _Client:
+        async def check(self, _body):
+            return _Resp()
+
+    auth._client = _Client()
+    with structlog.testing.capture_logs() as logs:
+        asyncio.run(auth.check("user:alice", "chunkx", ofga.Relation.VIEWER))
+    checks = [e for e in logs if e.get("event") == "openfga.check"]
+    assert checks, "no openfga.check audit event emitted"
+    assert checks[0]["division_id"] == "division-alpha"
+
+
 def test_division_id_threaded_into_a2a_envelope(make_settings, monkeypatch):
     """The outbound A2A payload carries source_division == settings.division_id.
 

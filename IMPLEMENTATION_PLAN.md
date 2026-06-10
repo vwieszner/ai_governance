@@ -45,7 +45,10 @@ email vs push); mTLS cert authority + CRL/OCSP source.
 `M-GOV` is cross-cutting (writes the missing proving tests for governance that already works).
 **Each milestone ends with the 3-perspective adversarial review gate (see "Review gates").**
 
-### M0 — Tenancy foundation + parameterized onboarding (FR-1.1–1.4, NFR-2, NFR-8, NFR-10)
+### M0 — Tenancy foundation + parameterized onboarding (FR-1.1–1.4, NFR-2, NFR-8)
+<!-- NFR-10 (no hardcoded localhost / portability) is proven in M7 by
+test_portability::test_no_hardcoded_localhost, not M0 — M0's render_agent_env still
+emits localhost endpoints. Removed from M0's Proves set (m0-quality review). -->
 - `config.py`: add `division_id` (+ trusted-peer set, residency, transport settings used later).
 - New `scripts/onboard_division.py` + `infra/division-stack.template.yml`: generalize the hardcoded
   `setup_agt.py write_env` into a parameterized **physical stack** generator (own OpenFGA store,
