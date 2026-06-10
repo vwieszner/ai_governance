@@ -233,6 +233,73 @@ async def validate_token(token: str) -> dict:
     return claims
 
 
+# ── Cross-division user assertion (M2, FR-3.6) ─────────────────────────────────
+
+
+async def _fetch_jwks_for(jwks_uri: str) -> dict[str, Any]:
+    """Fetch a JWKS from an arbitrary (trusted peer) JWKS URI."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(jwks_uri)
+    except httpx.RequestError as exc:
+        raise AuthServiceUnavailable(f"peer JWKS unreachable: {jwks_uri}") from exc
+    if resp.status_code != 200:
+        raise AuthServiceUnavailable(f"peer JWKS HTTP {resp.status_code}: {jwks_uri}")
+    try:
+        return dict(resp.json())
+    except Exception as exc:
+        raise AuthServiceUnavailable("peer JWKS response is not valid JSON") from exc
+
+
+async def validate_peer_user_assertion(token: str) -> dict:
+    """Validate a CROSS-DIVISION user assertion (M2 / FR-3.6 — verifiable identity).
+
+    The assertion is the user's home-division Keycloak token, forwarded inside the
+    DID-signed peer envelope. Unlike validate_token (local users), it is verified
+    against the TRUSTED-ISSUER SET (settings.trusted_issuers) — the issuer's own
+    JWKS — and does NOT enforce this division's audience: a cross-division token
+    cannot carry the receiver's audience (the spike showed Keycloak cannot mint it),
+    and the binding to THIS exchange is provided by the DID-signed, replay-protected
+    envelope (see api/main.py /a2a/query) plus the trusted-issuer allow-list.
+
+    Signature, issuer (must be in the trusted set), expiry, and `sub` are all
+    enforced — the identity is cryptographically proven by the home Keycloak, NOT
+    vouched by the calling agent. The receiver still re-authorizes `sub` via its OWN
+    OpenFGA. Raises JWTError on any failure (callers fail closed).
+    """
+    try:
+        header: dict = jwt.get_unverified_header(token)
+        unverified: dict = jwt.get_unverified_claims(token)
+    except JWTError as exc:
+        raise JWTError(f"cannot decode peer assertion: {exc}") from exc
+
+    kid = header.get("kid")
+    header_alg = header.get("alg", "")
+    if not kid or not header_alg:
+        raise JWTError("peer assertion header missing 'kid'/'alg'")
+    if header_alg not in settings.allowed_jwt_algorithms_list:
+        raise JWTError(f"peer assertion algorithm {header_alg!r} not permitted")
+
+    iss = unverified.get("iss")
+    if not iss or iss not in settings.trusted_issuers_list:
+        raise JWTError(f"peer assertion issuer {iss!r} not in trusted-issuer set")
+
+    jwks = await _fetch_jwks_for(f"{str(iss).rstrip('/')}/protocol/openid-connect/certs")
+    key = _find_key(jwks, kid, header_alg)
+    try:
+        claims: dict = jwt.decode(
+            token, key, algorithms=[header_alg], issuer=iss,
+            options={"verify_aud": False, "verify_exp": True, "verify_iat": True},
+        )
+    except JWTError:
+        log.warning("peer_assertion.validation_failed", iss=iss)
+        raise
+    if not claims.get("sub"):
+        raise JWTError("peer assertion missing required 'sub' claim")
+    log.debug("peer_assertion.validated", iss=iss, sub=claims.get("sub"))
+    return claims
+
+
 # ── Claim extraction helpers ───────────────────────────────────────────────────
 
 

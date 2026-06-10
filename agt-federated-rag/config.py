@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     # trusts (used by later milestones for multi-peer discovery + trusted-issuer
     # validation). Empty = no configured peers.
     trusted_peers: str = ""
+    # M2: trusted peer-division OIDC issuer URLs (CSV). A cross-division user
+    # assertion (the user's home-Keycloak token, forwarded in the DID-signed peer
+    # envelope) is accepted only if its `iss` is in this set, and its signature is
+    # verified against that issuer's JWKS (derived as <issuer>/protocol/openid-connect/certs).
+    # This is the verifiable-cross-division-identity trust anchor (the spike showed
+    # cross-realm token-exchange audience is unsupported, so the receiver validates
+    # the home assertion directly against the home issuer).
+    trusted_issuers: str = ""
     agent_name: str = "AGT RAG Agent"
     agent_url: AnyHttpUrl = Field(default="http://localhost:8000")  # type: ignore[assignment]
 
@@ -184,6 +192,10 @@ class Settings(BaseSettings):
     @property
     def trusted_peers_list(self) -> list[str]:
         return [s.strip() for s in self.trusted_peers.split(",") if s.strip()]
+
+    @property
+    def trusted_issuers_list(self) -> list[str]:
+        return [s.strip() for s in self.trusted_issuers.split(",") if s.strip()]
 
     @model_validator(mode="after")
     def default_division_id(self) -> "Settings":
