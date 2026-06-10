@@ -90,6 +90,8 @@ class Manifest:
     docs_dir: str
     residency_mode: str = "external"
     trusted_peers: list[str] = field(default_factory=list)
+    seed_viewer: str = ""    # doc title alice may view directly
+    seed_approval: str = ""  # doc title that needs the owner's approval (bob owns)
 
 
 def _parse_simple_yaml(text: str) -> dict:
@@ -136,6 +138,8 @@ def load_manifest(path: str | Path) -> Manifest:
         docs_dir=str(data.get("docs_dir", "")),
         residency_mode=str(data.get("residency_mode", "external")),
         trusted_peers=list(peers),
+        seed_viewer=str(data.get("seed_viewer", "")),
+        seed_approval=str(data.get("seed_approval", "")),
     )
 
 
@@ -329,6 +333,15 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
     _write_secret(env_path, agent_env)                         # holds NVIDIA key + secrets
     _write_secret(gdir / "did.json", json.dumps(did))          # DID + public JWK (kept owner-only for uniformity)
     log(f"wrote {env_path.relative_to(ROOT)} + DID {did['did']}")
+
+    # Make the division FUNCTIONAL: ingest its docs into its own Qdrant + seed the
+    # default authz tuples (alice may view one doc; the other needs bob's approval),
+    # so the demo flows work immediately after onboarding.
+    if manifest.docs_dir and (AGT / manifest.docs_dir).is_dir():
+        _run_division_ingest(env_path.name, manifest.docs_dir)
+        async with httpx.AsyncClient(timeout=30) as c2:
+            await _seed_division_tuples(c2, manifest, ports, secretz, store_id)
+        log(f"ingested docs + seeded authz for '{manifest.division_id}'")
     log(f"division '{manifest.division_id}' onboarded. Launch: RAG_ENV_FILE=.env.{manifest.division_id} -> :{ports['agent']}")
 
 
@@ -344,6 +357,92 @@ def ensure_identity(path: Path, name: str, org: str) -> dict:
         # Ed25519 PRIVATE key — atomically owner-only (no write-then-chmod window).
         _write_secret(path, json.dumps(identity.to_jwks(include_private=True)))
     return {"did": str(identity.did), "jwk": json.dumps(identity.to_jwk(include_private=False))}
+
+
+_DIV_INGEST_SNIPPET = '''
+import truststore; truststore.inject_into_ssl()
+import asyncio, sys, hashlib
+from pathlib import Path
+from rag.ingest import split_text
+from rag.qdrant_retriever import HybridQdrantRetriever
+def cid(src,i): return hashlib.sha256(f"{src}:{i}".encode()).hexdigest()[:16]
+async def get_ret():
+    if hasattr(HybridQdrantRetriever,"get_instance"): return await HybridQdrantRetriever.get_instance()
+    q=HybridQdrantRetriever(); await q.ensure_collection(); return q
+async def go(folder):
+    files=list(Path(folder).rglob("*.txt"))+list(Path(folder).rglob("*.md"))
+    q=await get_ret()
+    try:
+        chunks=[]
+        for f in files:
+            for i,ct in enumerate(split_text(f.read_text(encoding="utf-8",errors="replace"))):
+                chunks.append({"chunk_id":cid(str(f),i),"text":ct,"metadata":{"source":str(f),"chunk_index":i,"title":f.stem}})
+        for i in range(0,len(chunks),100): await q.upsert_chunks(chunks[i:i+100])
+        print(f"upserted {len(chunks)} chunks from {len(files)} files")
+    finally:
+        await q.close()
+asyncio.run(go(sys.argv[1]))
+'''
+
+
+def _run_division_ingest(env_file: str, docs_dir: str) -> None:
+    """Ingest docs_dir into THIS division's Qdrant (selected by RAG_ENV_FILE=.env.<id>)."""
+    env = {**os.environ, "RAG_ENV_FILE": env_file}
+    r = subprocess.run([str(VENV_PY), "-c", _DIV_INGEST_SNIPPET, docs_dir],
+                       cwd=str(AGT), env=env, capture_output=True, text=True, timeout=900)
+    if r.returncode != 0:
+        print(r.stdout[-2000:]); print(r.stderr[-2000:])
+        raise RuntimeError("division ingest failed")
+    log(f"ingest: {r.stdout.strip().splitlines()[-1] if r.stdout.strip() else 'done'}")
+
+
+async def _kc_user_sub(c, kc: str, username: str, password: str) -> str:
+    import base64
+    r = await c.post(f"{kc}/realms/{REALM}/protocol/openid-connect/token",
+                     data={"grant_type": "password", "client_id": "rag-ui",
+                           "username": username, "password": password})
+    r.raise_for_status()
+    p = r.json()["access_token"].split(".")[1]
+    p += "=" * (-len(p) % 4)
+    return json.loads(base64.urlsafe_b64decode(p))["sub"]
+
+
+async def _seed_division_tuples(c, manifest: Manifest, ports: dict[str, int],
+                                secretz: dict[str, str], store_id: str) -> None:
+    """Seed default per-chunk authz: alice viewer on seed_viewer doc; alice
+    pending_approval + bob owner on seed_approval doc (the demo's local-answer and
+    needs-approval flows). Tuples land in THIS division's OWN OpenFGA store."""
+    ofga = f"http://localhost:{ports['openfga']}"
+    kc = f"http://localhost:{ports['keycloak']}"
+    ofga_h = {"Authorization": f"Bearer {secretz['openfga_api_token']}"}
+    alice = await _kc_user_sub(c, kc, "alice", SEED_USER_PASSWORD)
+    bob = await _kc_user_sub(c, kc, "bob", SEED_USER_PASSWORD)
+
+    # chunk ids grouped by doc title, from this division's Qdrant.
+    qd = f"http://localhost:{ports['qdrant']}"
+    r = await c.post(f"{qd}/collections/knowledge_base/points/scroll",
+                     json={"limit": 256, "with_payload": True, "with_vector": False})
+    r.raise_for_status()
+    by_title: dict[str, list[str]] = {}
+    for pt in r.json()["result"]["points"]:
+        pl = pt["payload"]
+        title = pl.get("title") or (pl.get("metadata") or {}).get("title", "")
+        cid = pl.get("chunk_id", "")
+        if title and cid:
+            by_title.setdefault(title, []).append(cid)
+
+    async def grant(user: str, rel: str, title: str) -> None:
+        for cid in by_title.get(title, []):
+            await c.post(f"{ofga}/stores/{store_id}/write",
+                         json={"writes": {"tuple_keys": [{"user": user, "relation": rel,
+                                                          "object": f"chunk:{cid}"}]}},
+                         headers=ofga_h)
+
+    if manifest.seed_viewer:
+        await grant(f"user:{alice}", "viewer", manifest.seed_viewer)
+    if manifest.seed_approval:
+        await grant(f"user:{alice}", "pending_approval", manifest.seed_approval)
+        await grant(f"user:{bob}", "owner", manifest.seed_approval)
 
 
 def onboard(manifest_path: str | Path, no_neo4j: bool = False, dry_run: bool = False) -> dict:

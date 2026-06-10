@@ -7,3 +7,5 @@ port_base: 8300          # agent 8300, openfga 8301, keycloak 8302, temporal 830
 trusted_peers: [alpha, beta]
 docs_dir: tests/docs/cluster-a
 residency_mode: external
+seed_viewer: data_retention_policy
+seed_approval: hr_compensation_data

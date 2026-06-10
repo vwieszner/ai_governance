@@ -5,3 +5,5 @@ port_base: 8200          # agent 8200, openfga 8201, keycloak 8202, temporal 820
 trusted_peers: [alpha]
 docs_dir: tests/docs/cluster-b
 residency_mode: external
+seed_viewer: technical_architecture
+seed_approval: q4_financial_results
