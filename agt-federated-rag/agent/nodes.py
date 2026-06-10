@@ -748,6 +748,11 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
             user_id=state["user_id"],
             context_id=state.get("context_id", ""),
             callback_url=callback_url,
+            # M2 (FR-3.6): forward the user's VERIFIABLE home-division assertion (their
+            # Keycloak token, from the security ContextVar) so the peer cryptographically
+            # validates the user's identity against our issuer's JWKS and re-authorizes
+            # — instead of trusting a bare user_id string.
+            user_assertion=_user_token_ctx.get(),
         )
     except Exception as exc:
         log.error("peer_call_failed", error=str(exc))

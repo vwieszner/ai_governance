@@ -51,7 +51,12 @@ from temporalio.client import Client as TemporalClient
 import agent.graph as agent_graph
 import agent.nodes as agent_nodes
 import mesh.agent_identity as agent_identity
-from auth.token_validator import AuthServiceUnavailable, validate_token
+from auth.token_validator import (
+    AuthServiceUnavailable,
+    extract_user_id,
+    validate_peer_user_assertion,
+    validate_token,
+)
 from config import settings
 from sre import SREMiddleware
 from workflow.approval import ApprovalDecisionSignal
@@ -695,10 +700,27 @@ async def a2a_query(request: Request) -> JSONResponse:
             detail=f"Query exceeds maximum length of {settings.max_query_length} characters",
         )
 
-    # user_id is trusted because the message is DID-signed by the verified peer.
-    user_id = str(payload.get("user_id", "")).strip()
-    if not user_id:
-        raise HTTPException(status_code=400, detail="Signed payload missing 'user_id'")
+    # M2 (FR-3.6): derive the AUTHORITATIVE user identity from the VERIFIABLE
+    # assertion (the user's home-division Keycloak token), validated against this
+    # division's trusted-issuer set — NOT a bare user_id string the caller asserts.
+    # The DID signature proves the message came from a trusted peer agent; the
+    # assertion proves WHICH user, cryptographically (home Keycloak), so identity is
+    # not agent-vouched. Fail closed if the assertion is absent or invalid. The bare
+    # user_id field (if present) is diagnostic only.
+    assertion = str(payload.get("user_assertion", "")).strip()
+    if not assertion:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing verifiable user assertion — cross-division identity required",
+        )
+    try:
+        assertion_claims = await validate_peer_user_assertion(assertion)
+        user_id = extract_user_id(assertion_claims)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.warning("a2a_query_assertion_invalid", error=str(exc))
+        raise HTTPException(status_code=401, detail="Invalid cross-division user assertion")
 
     context_id = str(payload.get("context_id", "")) or str(uuid.uuid4())
     task_id = str(uuid.uuid4())

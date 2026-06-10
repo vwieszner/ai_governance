@@ -104,6 +104,7 @@ async def call_peer_agent(
     user_id: str,
     context_id: str,
     callback_url: str | None = None,
+    user_assertion: str = "",
 ) -> PeerResponse:
     """
     Send a governed, DID-signed query to the peer agent over HTTP.
@@ -160,7 +161,13 @@ async def call_peer_agent(
     # ── Step 4: build + sign the outbound message ────────────────────────────
     payload: dict[str, Any] = {
         "query": query,
-        "user_id": user_id,        # signed claim — the peer can trust this
+        # M2: user_id is now diagnostic only — the receiver derives the authoritative
+        # identity from the VERIFIABLE user_assertion below, not this string.
+        "user_id": user_id,
+        # M2 (FR-3.6): the user's home-division Keycloak token. The receiver validates
+        # it against its trusted-issuer set (cryptographic, not agent-vouched) and
+        # re-authorizes the verified sub via its own OpenFGA.
+        "user_assertion": user_assertion,
         "context_id": context_id,
         "callback_url": callback_url,
         "source_cluster": settings.cluster_id,
