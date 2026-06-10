@@ -226,6 +226,21 @@ def make_division_secrets() -> dict[str, str]:
     }
 
 
+def _write_secret(path: Path, data: str) -> None:
+    """Write a secret-bearing file owner-only (0o600), with no world-readable window.
+
+    Uses os.open(O_CREAT, 0o600) so the mode is applied atomically at creation
+    (closing the gap a write-then-chmod leaves). On POSIX the mode is enforced; on
+    Windows the mode arg is largely ignored (NTFS ACLs govern) but the call is safe.
+    The per-division .env / stack-env / identity files hold Postgres + OpenFGA +
+    agent + HMAC secrets and the Ed25519 private key — they must never be group/
+    world-readable (NFR-4).
+    """
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(data)
+
+
 def _load_root_env() -> dict[str, str]:
     env: dict[str, str] = {}
     p = ROOT / ".env"
@@ -308,11 +323,11 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
     # DID identity (per division) + agent .env.
     did = ensure_identity(AGT / f"agent_identity_{manifest.division_id}.json",
                           f"rag-agent-{manifest.division_id}", manifest.division_id)
-    gdir = generated_dir(manifest.division_id); gdir.mkdir(parents=True, exist_ok=True)
+    gdir = generated_dir(manifest.division_id); gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     agent_env = render_agent_env(manifest, ports, secretz, store_id, model_id, nvidia_key)
     env_path = AGT / f".env.{manifest.division_id}"
-    env_path.write_text(agent_env, encoding="utf-8")
-    (gdir / "did.json").write_text(json.dumps(did), encoding="utf-8")
+    _write_secret(env_path, agent_env)                         # holds NVIDIA key + secrets
+    _write_secret(gdir / "did.json", json.dumps(did))          # DID + public JWK (kept owner-only for uniformity)
     log(f"wrote {env_path.relative_to(ROOT)} + DID {did['did']}")
     log(f"division '{manifest.division_id}' onboarded. Launch: RAG_ENV_FILE=.env.{manifest.division_id} -> :{ports['agent']}")
 
@@ -326,11 +341,8 @@ def ensure_identity(path: Path, name: str, org: str) -> dict:
         identity = AgentIdentity.create(name=name, sponsor="admin@example.com",
                                         capabilities=["rag.query", "a2a.federate"],
                                         organization=org, description=f"AGT RAG agent for {org}")
-        path.write_text(json.dumps(identity.to_jwks(include_private=True)), encoding="utf-8")
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        # Ed25519 PRIVATE key — atomically owner-only (no write-then-chmod window).
+        _write_secret(path, json.dumps(identity.to_jwks(include_private=True)))
     return {"did": str(identity.did), "jwk": json.dumps(identity.to_jwk(include_private=False))}
 
 
@@ -342,10 +354,10 @@ def onboard(manifest_path: str | Path, no_neo4j: bool = False, dry_run: bool = F
     manifest = load_manifest(manifest_path)
     ports = derive_ports(manifest.port_base)
     secretz = make_division_secrets()
-    gdir = generated_dir(manifest.division_id); gdir.mkdir(parents=True, exist_ok=True)
+    gdir = generated_dir(manifest.division_id); gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     stack_env = render_stack_env(manifest, ports, secretz)
     stack_env_path = gdir / f"div-{manifest.division_id}.env"
-    stack_env_path.write_text(stack_env, encoding="utf-8")
+    _write_secret(stack_env_path, stack_env)   # Postgres/OpenFGA/Keycloak secrets — owner-only
     plan = {"division_id": manifest.division_id, "project": compose_project(manifest.division_id),
             "ports": ports, "stack_env": str(stack_env_path), "generated_dir": str(gdir)}
     if dry_run:
