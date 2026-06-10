@@ -53,3 +53,7 @@ ui/.vite/
 Thumbs.db
 .idea/
 *.swp
+
+# M0: per-division generated stacks (secrets: stack env, agent .env, DID)
+infra/generated/
+agt-federated-rag/.env.*
