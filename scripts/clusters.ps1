@@ -26,12 +26,25 @@ $py = Join-Path $root '.venv\Scripts\python.exe'
 $logDir = Join-Path $root 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
-# The single source of truth for every backend.
-$CLUSTERS = @{
-    'agt-a' = @{ dir = 'agt-federated-rag'; env = '.env';           port = 8010 }
-    'agt-b' = @{ dir = 'agt-federated-rag'; env = '.env.cluster-b'; port = 8012 }
+# The single source of truth for every backend is now the set of DIVISION
+# MANIFESTS under infra/divisions/*.yml (M0). Each division runs the same
+# agt-federated-rag code selected by RAG_ENV_FILE=.env.<division_id>, on the agent
+# port derived from the manifest's port_base. Adding a division = adding a manifest
+# (no edit here). Onboard a division first: scripts/onboard_division.py infra/divisions/<id>.yml
+$divDir = Join-Path $root 'infra\divisions'
+$CLUSTERS = @{}
+if (Test-Path $divDir) {
+    foreach ($mf in (Get-ChildItem -Path $divDir -Filter *.yml -File | Sort-Object Name)) {
+        $text = Get-Content $mf.FullName -Raw
+        $id = $null; $base = $null
+        if ($text -match '(?m)^\s*division_id:\s*(\S+)') { $id = $matches[1] }
+        if ($text -match '(?m)^\s*port_base:\s*(\d+)') { $base = [int]$matches[1] }
+        if ($id -and $base) {
+            $CLUSTERS[$id] = @{ dir = 'agt-federated-rag'; env = ".env.$id"; port = $base }
+        }
+    }
 }
-$ALL = @('agt-a', 'agt-b')
+$ALL = @($CLUSTERS.Keys | Sort-Object)
 
 function Resolve-Targets([string[]]$t) {
     if (-not $t -or $t.Count -eq 0 -or $t -contains 'all') { return $ALL }
@@ -72,6 +85,11 @@ function Stop-Worker([string]$name, [string]$dir, [string]$env) {
 function Start-One([string]$name) {
     $c = $CLUSTERS[$name]
     $dir = Join-Path $root $c.dir
+    $envPath = Join-Path $dir $c.env
+    if (-not (Test-Path $envPath)) {
+        Write-Host "  $name not onboarded ($($c.env) missing) -- run scripts/onboard_division.py infra/divisions/$name.yml" -ForegroundColor Red
+        return
+    }
     $env:PYTHONUNBUFFERED = '1'
     $env:RAG_ENV_FILE = $c.env
     Start-Process $py -ArgumentList '-m', 'api.main' -WorkingDirectory $dir `
@@ -108,14 +126,22 @@ function Wait-Health([string]$name) {
 }
 
 function Show-Status {
-    Write-Host "=== backends ===" -ForegroundColor Cyan
+    Write-Host "=== divisions ===" -ForegroundColor Cyan
+    if ($ALL.Count -eq 0) {
+        Write-Host "  (no division manifests in infra/divisions/)" -ForegroundColor DarkGray
+    }
     foreach ($name in $ALL) {
         $port = $CLUSTERS[$name].port
+        $envPath = Join-Path (Join-Path $root $CLUSTERS[$name].dir) $CLUSTERS[$name].env
+        if (-not (Test-Path $envPath)) {
+            Write-Host ("  {0,-8} :{1}  not onboarded (run: onboard_division.py infra/divisions/{0}.yml)" -f $name, $port) -ForegroundColor DarkGray
+            continue
+        }
         try {
             $r = Invoke-WebRequest "http://localhost:$port/health" -UseBasicParsing -TimeoutSec 3
-            Write-Host ("  {0,-6} :{1}  UP   {2}" -f $name, $port, $r.Content) -ForegroundColor Green
+            Write-Host ("  {0,-8} :{1}  UP   {2}" -f $name, $port, $r.Content) -ForegroundColor Green
         } catch {
-            Write-Host ("  {0,-6} :{1}  down" -f $name, $port) -ForegroundColor DarkGray
+            Write-Host ("  {0,-8} :{1}  down" -f $name, $port) -ForegroundColor DarkGray
         }
     }
     try {
