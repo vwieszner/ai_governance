@@ -1,4 +1,16 @@
 """
+DEPRECATED (M1): legacy single-host AGT setup — two clusters SHARING one Keycloak
+realm + one OpenFGA store + one Qdrant. Its rag-ui client carries a DUAL audience
+mapper (agent-agt-a AND agent-agt-b on one token) — that dual audience IS the AUD-1
+finding (one token authenticates to both clusters). It is inherent to the
+shared-realm model and cannot be removed without breaking it.
+
+USE INSTEAD: scripts/onboard_division.py, which gives each division its OWN
+physically-isolated stack + Keycloak realm + SINGLE-division audience, so a token is
+scoped to exactly one division (no AUD-1). setup_agt.py is kept only for the simple
+2-cluster local demo and will be retired once the UI/e2e move to the division model.
+
+----
 Idempotent end-to-end setup for the AGT federation: two agt-federated-rag clusters
 (AGT / AgentMesh DID governance) that federate with each other.
 
@@ -346,6 +358,8 @@ async def check(c, store, user, rel, obj) -> bool:
 
 
 async def main(no_neo4j: bool) -> None:
+    log("DEPRECATED: shared-realm 2-cluster setup (carries AUD-1 dual audience). "
+        "For isolated divisions use scripts/onboard_division.py instead.")
     async with httpx.AsyncClient(timeout=30) as c:
         log("=== Phase 1: wait for services ==="); await wait_healthy(c)
         log("=== Phase 2: OpenFGA store ==="); store_id, model_id = await create_openfga_store(c)

@@ -248,7 +248,14 @@ def _load_or_make_secrets(division_id: str, force: bool = False) -> dict[str, st
     gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     sp = gdir / "secrets.json"
     if sp.exists() and not force:
-        return json.loads(sp.read_text(encoding="utf-8"))
+        existing = json.loads(sp.read_text(encoding="utf-8"))
+        # BACKFILL newly-added secret keys (schema evolution) WITHOUT rotating the
+        # existing ones — rotating postgres_password would desync the durable volume.
+        missing = {k: v for k, v in make_division_secrets().items() if k not in existing}
+        if missing:
+            existing.update(missing)
+            _write_secret(sp, json.dumps(existing))
+        return existing
     sec = make_division_secrets()
     _write_secret(sp, json.dumps(sec))
     return sec
@@ -370,7 +377,11 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
         await _kc_add_ui_audience(c, kc, h, f"agent-{manifest.division_id}")
         for u, em in [("alice", "alice@example.com"), ("bob", "bob@example.com")]:
             await _kc_ensure_user(c, kc, h, u, em, secretz["seed_user_password"])
-        log("Keycloak realm + clients + users ready")
+        # M1: division RBAC realm roles + assignments (FR-2.3). data-owner approves
+        # access to data they own; division-admin manages the division (revoke/audit,
+        # enforced in M5/M8); member is a regular querying user.
+        await _kc_setup_roles(c, kc, h, {"alice": ["member"], "bob": ["data-owner", "division-admin"]})
+        log("Keycloak realm + clients + users + roles ready")
 
     # DID identity (per division) + agent .env.
     did = ensure_identity(AGT / f"agent_identity_{manifest.division_id}.json",
@@ -439,6 +450,29 @@ async def _kc_add_ui_audience(c, kc: str, h: dict, agent_client_id: str) -> None
                        "config": {"included.client.audience": agent_client_id,
                                   "id.token.claim": "false", "access.token.claim": "true"}},
                  headers=h)
+
+
+async def _kc_setup_roles(c, kc: str, h: dict, assignments: dict[str, list[str]]) -> None:
+    """Create the division RBAC realm roles and assign them to seeded users (FR-2.3).
+    Idempotent: role create 409s are fine; assignment is additive."""
+    roles = {"member", "data-owner", "division-admin"}
+    for role in sorted(roles):
+        await c.post(f"{kc}/admin/realms/{REALM}/roles", json={"name": role}, headers=h)  # 201 or 409
+    for username, want in assignments.items():
+        lk = await c.get(f"{kc}/admin/realms/{REALM}/users",
+                         params={"username": username, "exact": "true"}, headers=h)
+        users = lk.json() if lk.status_code == 200 else []
+        if not users:
+            continue
+        uid = users[0]["id"]
+        reps = []
+        for rn in want:
+            rr = await c.get(f"{kc}/admin/realms/{REALM}/roles/{rn}", headers=h)
+            if rr.status_code == 200:
+                reps.append(rr.json())
+        if reps:
+            await c.post(f"{kc}/admin/realms/{REALM}/users/{uid}/role-mappings/realm",
+                         json=reps, headers=h)
 
 
 async def _kc_ensure_user(c, kc: str, h: dict, username: str, email: str, password: str) -> None:

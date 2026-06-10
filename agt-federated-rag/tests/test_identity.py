@@ -99,3 +99,41 @@ def test_foreign_division_token_rejected_on_unknown_signing_key(make_settings, m
     tv = _configure(monkeypatch, make_settings, b_jwks, issuer=DIV_A_ISS, audience=DIV_A_AUD)
     with pytest.raises(JWTError):
         asyncio.run(tv.validate_token(a_token))
+
+
+def test_admin_user_lifecycle():
+    """FR-2.3 (live; skips if alpha not onboarded/up): the division RBAC realm roles
+    exist and are assigned — alice=member, bob=data-owner+division-admin."""
+    import json
+
+    import httpx
+
+    from scripts.onboard_division import GENERATED_DIR
+
+    gd = GENERATED_DIR / "alpha"
+    sp, ep = gd / "secrets.json", gd / "div-alpha.env"
+    if not (sp.exists() and ep.exists()):
+        pytest.skip("alpha not onboarded")
+    sec = json.loads(sp.read_text(encoding="utf-8"))
+    env = {k.strip(): v.strip() for k, _, v in
+           (ln.partition("=") for ln in ep.read_text(encoding="utf-8").splitlines() if "=" in ln)}
+    kc = f"http://localhost:{env['DIV_KEYCLOAK_PORT']}"
+    try:
+        tok = httpx.post(f"{kc}/realms/master/protocol/openid-connect/token",
+                         data={"grant_type": "password", "client_id": "admin-cli",
+                               "username": "admin", "password": sec["keycloak_admin_password"]},
+                         timeout=5).json()["access_token"]
+    except Exception:
+        pytest.skip("alpha keycloak not reachable")
+    h = {"Authorization": f"Bearer {tok}"}
+
+    def _user_roles(username: str) -> set[str]:
+        uid = httpx.get(f"{kc}/admin/realms/rag/users",
+                        params={"username": username, "exact": "true"}, headers=h).json()[0]["id"]
+        return {r["name"] for r in
+                httpx.get(f"{kc}/admin/realms/rag/users/{uid}/role-mappings/realm", headers=h).json()}
+
+    all_roles = {r["name"] for r in httpx.get(f"{kc}/admin/realms/rag/roles", headers=h).json()}
+    assert {"member", "data-owner", "division-admin"} <= all_roles
+    assert "member" in _user_roles("alice")
+    assert {"data-owner", "division-admin"} <= _user_roles("bob")
