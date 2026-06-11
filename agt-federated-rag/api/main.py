@@ -1178,12 +1178,14 @@ async def revoke_access(
         raise HTTPException(status_code=404, detail=f"document '{doc}' not found in this division")
 
     auth = await agent_nodes._get_openfga()
-    owner = await auth.get_chunk_owner(chunk_ids[0])
-    if owner != caller:
-        # Authorization-bypass attempt — high-signal audit.
-        log.warning("access_revoke_forbidden_not_owner", doc=doc, agt_audit=True)
-        raise HTTPException(status_code=403,
-                            detail="Only the data owner may revoke access to this document")
+    # IDOR guard: the caller must own EVERY chunk before we mutate ANY of them. Checking
+    # only chunk[0] would let a cross-owner title collision revoke chunks the caller does
+    # not own; verifying all-first also avoids a partial mutation on rejection.
+    for cid in chunk_ids:
+        if await auth.get_chunk_owner(cid) != caller:
+            log.warning("access_revoke_forbidden_not_owner", doc=doc, chunk_id=cid, agt_audit=True)
+            raise HTTPException(status_code=403,
+                                detail="Only the data owner may revoke access to this document")
 
     for cid in chunk_ids:
         await auth.revoke_viewer(target, cid)
