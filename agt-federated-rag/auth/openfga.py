@@ -133,12 +133,18 @@ class OpenFGAAuth:
         # flat user/relation/object fields — NOT the protocol-level CheckRequest
         # wrapping a TupleKey (the SDK reads body.user directly, which a
         # CheckRequest does not expose -> "'CheckRequest' object has no attribute 'user'").
+        from datetime import datetime, timezone
+
         from openfga_sdk.client.models import ClientCheckRequest  # type: ignore[import]
 
         body = ClientCheckRequest(
             user=self._user_id(user_id),
             relation=relation.value,
             object=self._object_id(chunk_id),
+            # M5/FR-7.1: supply current_time so a time-bound (non_expired) viewer grant is
+            # evaluated per request. Unconditioned tuples ignore it; REQUIRED once any
+            # conditioned tuple exists, so we always pass it.
+            context={"current_time": datetime.now(timezone.utc).isoformat()},
         )
         try:
             resp = await self._client.check(body)
@@ -330,6 +336,32 @@ class OpenFGAAuth:
         no-op. After revocation the user has no standing access; a re-ask re-enters the
         governed pipeline (and approval if the doc is owner-gated) — no stale reuse (D-6)."""
         await self._delete_tuple(user_id, chunk_id, Relation.VIEWER)
+
+    async def grant_viewer_until(self, user_id: str, chunk_id: str, expiry_iso: str) -> None:
+        """Grant a TIME-BOUND viewer grant (M5/FR-7.1): a viewer tuple carrying the
+        ``non_expired`` condition with ``expiry``. OpenFGA stops treating it as access
+        once current_time >= expiry (enforced at check time — no sweeper). ``expiry_iso``
+        is an RFC3339/ISO-8601 timestamp."""
+        assert self._client is not None
+        from openfga_sdk.client.models import ClientTuple, ClientWriteRequest  # type: ignore[import]
+        from openfga_sdk.models.relationship_condition import RelationshipCondition  # type: ignore[import]
+
+        try:
+            await self._client.write(
+                ClientWriteRequest(writes=[ClientTuple(
+                    user=self._user_id(user_id),
+                    relation=Relation.VIEWER.value,
+                    object=self._object_id(chunk_id),
+                    condition=RelationshipCondition(name="non_expired", context={"expiry": expiry_iso}),
+                )])
+            )
+        except ApiException as exc:
+            detail = (getattr(exc, "body", "") or str(exc)).lower()
+            if exc.status == 400 and "already exist" in detail:
+                return
+            raise
+        log.info("openfga.grant_viewer_until", user_id=user_id, chunk_id=chunk_id,
+                 expiry=expiry_iso, agt_audit=True)
 
     async def set_pending_approval(self, user_id: str, chunk_id: str) -> None:
         """Set PENDING_APPROVAL relation for user_id on chunk_id."""

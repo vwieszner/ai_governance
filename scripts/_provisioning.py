@@ -41,12 +41,32 @@ AUTH_MODEL = {
                 "relations": {
                     "owner": {"directly_related_user_types": [{"type": "user"}]},
                     "editor": {"directly_related_user_types": [{"type": "user"}]},
-                    "viewer": {"directly_related_user_types": [{"type": "user"}]},
+                    # M5/FR-7.1: a viewer grant may be UNCONDITIONED (permanent) OR carry
+                    # the non_expired condition (a time-bound grant). OpenFGA stops
+                    # treating a conditioned tuple as granting access once current_time
+                    # >= expiry — expiry is enforced at check time, no sweeper needed.
+                    "viewer": {"directly_related_user_types": [
+                        {"type": "user"},
+                        {"type": "user", "condition": "non_expired"},
+                    ]},
                     "pending_approval": {"directly_related_user_types": [{"type": "user"}]},
                 }
             },
         },
     ],
+    # M5/FR-7.1: time-bound access. grant_viewer_until() writes a viewer tuple with this
+    # condition + an `expiry`; check() passes `current_time`, so OpenFGA evaluates
+    # current_time < expiry per request. Unconditioned viewer tuples ignore the context.
+    "conditions": {
+        "non_expired": {
+            "name": "non_expired",
+            "expression": "current_time < expiry",
+            "parameters": {
+                "current_time": {"type_name": "TYPE_NAME_TIMESTAMP"},
+                "expiry": {"type_name": "TYPE_NAME_TIMESTAMP"},
+            },
+        },
+    },
 }
 
 # Qdrant-only ingest, run as a subprocess with RAG_ENV_FILE pointing at the target
