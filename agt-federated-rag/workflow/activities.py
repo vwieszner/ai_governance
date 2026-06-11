@@ -332,21 +332,27 @@ async def send_a2a_callback(inp: A2ACallbackInput) -> None:
         agt_audit=True,
     )
 
-    # SSRF guard — only allow callbacks to the configured peer origin
-    allowed = str(settings.peer_agent_url or "").rstrip("/")
-    if not allowed:
+    # SSRF guard (M3 multi-peer) — only allow callbacks to a TRUSTED peer's agent_url.
+    # The allowlist is the trusted-peers map (every peer's agent_url), not just the single
+    # legacy peer_agent_url — so a callback to any of N trusted peers is allowed, but never
+    # an attacker-chosen host. (The originating_agent_url was itself derived from this map
+    # in /a2a/query, so this is defence-in-depth on the worker side.)
+    allowed_urls = {str(e.get("agent_url", "")).rstrip("/")
+                    for e in settings.peer_trust.values() if e.get("agent_url")}
+    if not allowed_urls:
         log.error("a2a_callback_no_peer_configured")
-        raise ValueError("No peer_agent_url configured — cannot send callback")
+        raise ValueError("No trusted peer configured — cannot send callback")
 
     normalised = inp.peer_agent_url.rstrip("/")
-    if normalised != allowed and not normalised.startswith(allowed + "/"):
+    if not any(normalised == a or normalised.startswith(a + "/") for a in allowed_urls):
         log.error(
             "a2a_callback_ssrf_blocked",
             peer_agent_url=inp.peer_agent_url,
-            allowed=allowed,
+            allowed=sorted(allowed_urls),
+            agt_audit=True,
         )
         raise ValueError(
-            f"Callback URL '{inp.peer_agent_url}' is not in the peer agent allowlist"
+            f"Callback URL '{inp.peer_agent_url}' is not in the trusted-peer allowlist"
         )
 
     # Build the signed callback payload via AgentMesh

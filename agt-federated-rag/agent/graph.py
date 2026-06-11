@@ -203,6 +203,8 @@ async def run_query(
     task_id: str = "",
     context_id: str = "",
     allow_remote: bool = True,
+    originating_agent_url: str | None = None,
+    originating_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Run the governed agent graph for a single query.
 
@@ -248,6 +250,10 @@ async def run_query(
         # to another peer — that would forward empty claims (-> downstream 401) and allow
         # A->B->A loops. Suppress the REMOTE branch in check_auth for such queries.
         "allow_remote": allow_remote,
+        # M4 (FR-6): originating division's callback target (SSRF-validated upstream),
+        # threaded to start_approval so a cross-division approval notifies the caller.
+        "originating_agent_url": originating_agent_url,
+        "originating_task_id": originating_task_id,
     }
 
     log.info("agent_graph_invoked", user_id=user_id, task_id=initial_state["task_id"])

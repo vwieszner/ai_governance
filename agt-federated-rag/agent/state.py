@@ -89,5 +89,10 @@ class AgentState(TypedDict):
     # to another peer (no A->B->A loops, no forward-empty-claims 401).
     allow_remote: bool
 
+    # M4 (FR-6): originating division's callback agent_url + task_id (SSRF-validated) so a
+    # cross-division approval can notify the caller; None for local requests.
+    originating_agent_url: str | None
+    originating_task_id: str | None
+
     # ── Diagnostics ───────────────────────────────────────────────────────────
     error: str | None                       # internal error — never surfaced raw to user

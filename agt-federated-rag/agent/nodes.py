@@ -642,6 +642,13 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
                 approver_id=approver_id,
                 approver_slack_id=None,
                 approver_email=None,
+                # M4 (FR-6): cross-division callback target. For a peer-originated request
+                # these carry the ORIGINATING division's agent + task so the workflow
+                # send_a2a_callback notifies it on the decision (D-6: "approved, re-send"
+                # → the user re-runs the governed pipeline and the far side regenerates).
+                # SSRF-validated in /a2a/query before reaching here; absent for local requests.
+                originating_agent_url=state.get("originating_agent_url"),
+                originating_task_id=state.get("originating_task_id"),
                 # Snapshot timeout at start — deterministic for Temporal replay
                 timeout_seconds=settings.approval_timeout_seconds,
             ),
@@ -752,7 +759,9 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     callback_url: str | None = None
     task_id = state.get("task_id")
     if task_id:
-        callback_url = f"{settings.agent_url}/tasks/{task_id}/callback"
+        # rstrip so a trailing slash on agent_url doesn't produce "//tasks/" (which would
+        # fail the receiver's SSRF prefix check and silently drop the callback — M4).
+        callback_url = f"{str(settings.agent_url).rstrip('/')}/tasks/{task_id}/callback"
 
     try:
         peer_response = await _mesh_call_peer(

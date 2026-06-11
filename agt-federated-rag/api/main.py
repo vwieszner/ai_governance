@@ -754,6 +754,21 @@ async def a2a_query(request: Request) -> JSONResponse:
         division_id=settings.division_id,
     )
 
+    # M4 (FR-6): cross-division callback target. The caller sends callback_url = its OWN
+    # agent's /tasks/<id>/callback. SSRF guard: accept it ONLY if it targets the SIGNING
+    # peer's known agent_url (from the trust map) and has the expected /tasks/<id>/callback
+    # shape — never an attacker-chosen host. If approval is needed, the workflow calls back
+    # this target ("approved, re-send"); the user then re-runs the governed pipeline (D-6).
+    orig_agent_url = orig_task_id = None
+    raw_cb = str(payload.get("callback_url", "")).strip()
+    if raw_cb:
+        peer_url = str(settings.peer_trust.get(signer_did, {}).get("agent_url", "")).rstrip("/")
+        if peer_url and raw_cb.startswith(peer_url + "/tasks/") and raw_cb.endswith("/callback"):
+            orig_agent_url = peer_url
+            orig_task_id = raw_cb[len(peer_url) + len("/tasks/"):-len("/callback")]
+        else:
+            log.warning("a2a_callback_url_untrusted", signer_did=signer_did, agt_audit=True)
+
     # ── Run the SAME governed pipeline as /query ─────────────────────────────
     # The peer's DID-signed claims established user_id; OpenFGA on THIS division
     # re-authorizes that principal. No onward forwarding here (single-hop), so no
@@ -766,6 +781,8 @@ async def a2a_query(request: Request) -> JSONResponse:
             allow_remote=False,   # M3 loop guard: a peer-originated query must not re-delegate
             task_id=task_id,
             context_id=context_id,
+            originating_agent_url=orig_agent_url,   # M4: SSRF-validated callback target
+            originating_task_id=orig_task_id,
         )
     except PermissionError as exc:
         log.warning("a2a_query_governance_denied", task_id=task_id, error=str(exc))
