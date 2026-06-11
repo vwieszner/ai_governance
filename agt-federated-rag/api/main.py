@@ -583,10 +583,12 @@ async def query(
             detail=f"Query exceeds maximum length of {settings.max_query_length} characters",
         )
 
-    # Persist initial task record
+    # Persist initial task record. `query` is truncated for display/logs; `query_full`
+    # (bounded by max_query_length) is kept so GET /tasks/{id}/result can RE-RUN the
+    # exact query to re-check authorization once a data owner has approved.
     await _store_task(
         task_id,
-        {"status": "submitted", "query": raw_query[:200]},  # truncate for storage
+        {"status": "submitted", "query": raw_query[:200], "query_full": raw_query},
         owner_id=user_id,
     )
 
@@ -647,6 +649,89 @@ async def query(
         yield {"event": "done", "data": "{}"}
 
     return EventSourceResponse(event_stream())
+
+
+# ── GET /tasks/{task_id}/result ───────────────────────────────────────────────
+
+@app.get("/tasks/{task_id}/result")
+async def task_result(
+    task_id: str,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Requester-side approval-outcome poll (the UI polls this after a query parks
+    on `input-required`).
+
+    Re-checks the CALLER's CURRENT authorization for the task's original query by
+    re-running the governed pipeline in check_only mode — which RE-CHECKS live OpenFGA
+    state but does NOT start a new approval workflow (see start_approval). Returns:
+        {"status": "pending"}                    — still awaiting the owner's decision
+        {"status": "completed", "answer": "..."} — approved → answer released
+        {"status": "denied", "message": "..."}   — denied / timed out / no access
+
+    Security:
+      * the bearer token is validated and the namespaced principal MUST own the task
+        (no IDOR — a user cannot poll another user's task);
+      * the answer is released ONLY after a fresh OpenFGA re-authorization, so a
+        revoked/expired grant stops delivering immediately (no stale replay);
+      * read-only — it never mutates authorization state, and the check_only flag is
+        threaded to the peer so a cross-division poll never re-notifies the data owner.
+    """
+    token, claims = await _get_bearer_token(authorization)
+    try:
+        user_id = principal(claims)
+    except ValueError as exc:
+        log.warning("task_result_principal_unbuildable", error=str(exc))
+        raise HTTPException(
+            status_code=401,
+            detail="Token lacks a verified email required for authorization",
+        )
+
+    rec = await _load_task(task_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    # IDOR guard: only the task's owner (namespaced principal) may poll it.
+    if rec.get("_owner_id") != user_id:
+        log.warning("task_result_ownership_denied", task_id=task_id, agt_audit=True)
+        raise HTTPException(status_code=403, detail="Not the owner of this task")
+
+    query_text = rec.get("query_full") or rec.get("query") or ""
+    if not query_text:
+        return JSONResponse({"status": "pending"})
+
+    # Re-run the governed pipeline check-only: re-authorize against live OpenFGA, never
+    # spawn a new approval. Claims come from THIS caller's token (a cross-division
+    # re-check forwards them to the peer, exactly like /query).
+    fwd_claims = minimal_assertion_claims(claims)
+    try:
+        result = await agent_graph.run_query(
+            query=query_text,
+            user_id=user_id,
+            user_claims=fwd_claims,
+            task_id=task_id,
+            context_id="",
+            check_only=True,
+        )
+    except PermissionError as exc:
+        log.warning("task_result_governance_denied", task_id=task_id, error=str(exc))
+        return JSONResponse({"status": "denied", "message": "Request denied by governance policy"})
+    except Exception as exc:
+        log.error("task_result_run_failed", task_id=task_id, error=str(exc))
+        raise HTTPException(status_code=503, detail="Could not check task result")
+
+    flow = (result.get("flow") or "").lower()
+    answer = result.get("answer") or ""
+    if "needs_approval" in flow:
+        return JSONResponse({"status": "pending"})
+    if ("allowed" in flow or "approved" in flow) and answer:
+        await _update_task(task_id, {"status": "completed"})
+        log.info("task_result_delivered", task_id=task_id, agt_audit=True)
+        return JSONResponse({"status": "completed", "answer": answer})
+    # LOCAL_DENIED / REMOTE_DENIED / no access — owner declined, timed out, or the
+    # grant was never made (deny/timeout revoke the pending tuple). No data leak.
+    return JSONResponse({
+        "status": "denied",
+        "message": "Your request was declined or you no longer have access.",
+    })
 
 
 # ── POST /a2a/query ───────────────────────────────────────────────────────────
@@ -740,6 +825,9 @@ async def a2a_query(request: Request) -> JSONResponse:
         raise HTTPException(status_code=401, detail="Invalid cross-division user assertion")
 
     context_id = str(payload.get("context_id", "")) or str(uuid.uuid4())
+    # Approval-poll re-auth (signed in the envelope): re-check this delegated user's
+    # access against live OpenFGA WITHOUT restarting our approval workflow.
+    check_only = bool(payload.get("check_only", False))
     task_id = str(uuid.uuid4())
     # M0 tenancy: the originating division (from the SIGNED envelope) is recorded
     # so cross-division requests are attributable in this division's audit.
@@ -783,6 +871,7 @@ async def a2a_query(request: Request) -> JSONResponse:
             context_id=context_id,
             originating_agent_url=orig_agent_url,   # M4: SSRF-validated callback target
             originating_task_id=orig_task_id,
+            check_only=check_only,  # approval-poll: re-check without restarting our workflow
         )
     except PermissionError as exc:
         log.warning("a2a_query_governance_denied", task_id=task_id, error=str(exc))
@@ -809,7 +898,11 @@ async def a2a_query(request: Request) -> JSONResponse:
     approval_request_id = result.get("approval_request_id")
     status_message = result.get("status_message", "")
     answer = result.get("answer") or ""
-    if approval_request_id:
+    flow = result.get("flow", "")
+    # "NEEDS_APPROVAL in flow" covers the check_only re-poll: start_approval returns
+    # approval_request_id=None (no new workflow) but the flow is still *_NEEDS_APPROVAL,
+    # so the request is genuinely pending — not a failure.
+    if approval_request_id or "needs_approval" in flow.lower():
         peer_status = "input_required"
     elif status_message == "completed" and answer:
         peer_status = "completed"
@@ -1020,7 +1113,17 @@ async def list_pending_approvals(
     Returns ``{"pending": [{"request_id", "requester_id", "query"}]}``.
     """
     _, claims = await _get_bearer_token(authorization)
-    caller_sub = claims.get("sub", "")
+    # The owner is seeded/stored as the NAMESPACED principal (email|issuer-ns), which is
+    # also what the workflow records as approver_id — compare like-for-like, NOT the raw
+    # Keycloak `sub` (a UUID that never equals the principal, which would empty the inbox).
+    try:
+        caller = principal(claims)
+    except ValueError as exc:
+        log.warning("approvals_pending_principal_unbuildable", error=str(exc))
+        raise HTTPException(
+            status_code=401,
+            detail="Token lacks a verified email required for authorization",
+        )
     temporal_client: TemporalClient = request.app.state.temporal_client
     pending: list[dict[str, str]] = []
     try:
@@ -1035,7 +1138,7 @@ async def list_pending_approvals(
                 info = await temporal_client.get_workflow_handle(wf.id).query("get_info")
             except Exception:
                 continue                # workflow completing / not yet queryable — skip
-            if info.get("decided") or info.get("approver_id") != caller_sub:
+            if info.get("decided") or info.get("approver_id") != caller:
                 continue
             pending.append({
                 "request_id": wf.id.removeprefix("approval-"),
@@ -1075,7 +1178,17 @@ async def authenticated_approval(
     _validate_safe_id(request_id, "request_id")
 
     _, claims = await _get_bearer_token(authorization)
-    approver_sub = claims.get("sub", "")
+    # Compare the NAMESPACED principal (email|issuer-ns) — the form the owner is stored
+    # as and the workflow records as approver_id — NOT the raw Keycloak `sub` (a UUID
+    # that never matches, which would 403 the legitimate owner).
+    try:
+        approver_principal = principal(claims)
+    except ValueError as exc:
+        log.warning("authenticated_approval_principal_unbuildable", error=str(exc))
+        raise HTTPException(
+            status_code=401,
+            detail="Token lacks a verified email required for authorization",
+        )
 
     try:
         body = await request.json()
@@ -1098,7 +1211,7 @@ async def authenticated_approval(
         raise HTTPException(status_code=404, detail="No open approval request found")
     if info.get("decided"):
         raise HTTPException(status_code=409, detail="This request has already been decided")
-    if approver_sub != info.get("approver_id"):
+    if approver_principal != info.get("approver_id"):
         # M8: a non-owner attempting to decide an approval is an authorization-bypass attempt.
         log.warning("authenticated_approval_forbidden_not_owner", agt_audit=True)
         raise HTTPException(status_code=403, detail="Only the data owner may decide this request")
@@ -1109,7 +1222,7 @@ async def authenticated_approval(
             ApprovalDecisionSignal(
                 decision="approved" if decision == "approve" else "denied",
                 reason=reason,
-                approver_id=approver_sub,  # real human attribution (vs the HMAC link's constant)
+                approver_id=approver_principal,  # real attribution (vs the HMAC link's constant)
             ),
         )
     except Exception as e:

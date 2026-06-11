@@ -116,6 +116,7 @@ function blankTask(id: string, query: string): NormalizedTask {
   const now = new Date()
   return {
     id,
+    serverTaskId: null,
     query,
     state: 'submitted',
     statusMessage: '',
@@ -205,14 +206,19 @@ async function submitQueryAGT(
       const statusMessage = (parsed['status_message'] as string) ?? ''
       const flow = (parsed['flow'] as string) ?? ''
       const approvalRequestId = (parsed['approval_request_id'] as string | null) ?? null
+      const serverTaskId = (parsed['task_id'] as string | null) ?? null
 
-      // Classify like the AGT backend's own a2a_query mapper: key on
-      // approval_request_id FIRST. format_response overwrites a None answer
-      // with the (LLM-generated, not literally "pending") status_message, so
-      // the approval case carries a non-empty answer — keying on answer alone
-      // would misclassify it as completed and the approval prompt never shows.
+      // Classify like the AGT backend's own a2a_query mapper. Key on the approval
+      // signals FIRST. format_response overwrites a None answer with the
+      // (LLM-generated, not literally "pending") status_message, so the approval case
+      // carries a non-empty answer — keying on answer alone would misclassify it as
+      // completed and the approval prompt never shows. `flow` carries *_needs_approval
+      // for BOTH the local case (approvalRequestId set) AND the cross-division case
+      // (approvalRequestId is null on this side — the peer holds it), so it is the
+      // reliable signal to enter the polling state.
       let state: TaskState
       if (approvalRequestId) state = 'input-required'
+      else if (flow.toLowerCase().includes('needs_approval')) state = 'input-required'
       else if (statusMessage.toLowerCase().includes('pending')) state = 'input-required'
       else if (answer) state = 'completed'
       else state = 'working'
@@ -222,6 +228,9 @@ async function submitQueryAGT(
       task.statusMessage = statusMessage
       task.flow = flow || task.flow
       task.approvalRequestId = approvalRequestId ?? task.approvalRequestId
+      // Adopt the SERVER's task_id so the requester-side approval poll targets the
+      // record the backend actually stored (it ignores the client-supplied id).
+      task.serverTaskId = serverTaskId ?? task.serverTaskId
       task.updatedAt = new Date()
       onTask({ ...task })
       onEvent(makeEvent(cluster, user, inferKind(statusMessage, state), taskId, statusMessage || state))

@@ -8,6 +8,11 @@ export type TaskState =
 
 export interface NormalizedTask {
   id: string
+  /** The id the SERVER stored this task under (returned in the `result` SSE event).
+   *  The requester-side approval poll (GET /tasks/{id}/result) must use THIS id, not
+   *  the client-generated `id` — the backend generates its own task_id and ignores
+   *  the one the client sends. */
+  serverTaskId: string | null
   query: string
   state: TaskState
   statusMessage: string

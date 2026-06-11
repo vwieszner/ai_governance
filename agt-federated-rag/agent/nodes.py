@@ -361,6 +361,12 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         flow = FlowDecision.LOCAL_DENIED
         if not fused and settings.peer_agent_url and state.get("allow_remote", True):
             flow = FlowDecision.REMOTE
+            if state.get("check_only"):
+                # Approval poll: this query already parked on the peer, so we KNOW it
+                # routes REMOTE. Skip the intent LLM — re-checking authz must be fast
+                # and free (polls fire every few seconds); no answer is generated here.
+                log.debug("check_auth_check_only_skip_intent", routed="remote")
+                return {"flow": flow, "allowed_chunk_ids": [], "pending_chunk_ids": [], "denied_chunk_ids": []}
             try:
                 intent_llm = await _get_intent_llm()
                 intent_resp = await intent_llm.ainvoke(
@@ -460,23 +466,28 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     # use the LLM to generate a helpful response rather than a generic empty string.
     status_message: str | None = None
     if flow == FlowDecision.LOCAL_DENIED or (not local_results_exist and not settings.peer_agent_url):
-        try:
-            llm = await _get_llm()
-            prompt = (
-                "You are a helpful AI assistant for a company knowledge base. "
-                "A user has asked a question but no relevant information was found "
-                "in the knowledge base, or access was denied.\n\n"
-                f"User's question: {state['query']}\n\n"
-                "Write a short, helpful response (1-2 sentences) acknowledging their question "
-                "and explaining that you don't have relevant information available to answer it. "
-                "If it seems like a general/conversational question not suited for a knowledge base, "
-                "gently clarify that you're specialised for company knowledge queries."
-            )
-            response = await llm.ainvoke(prompt)
-            status_message = response.content if hasattr(response, "content") else str(response)
-        except Exception as exc:
-            log.warning("no_results_llm_message_failed", error=str(exc))
-            status_message = "I couldn't find relevant information in the knowledge base to answer your question."
+        if state.get("check_only"):
+            # Approval poll: no user-facing prose needed — the caller maps the flow to a
+            # terse status. Skip the LLM so a still-denied poll stays fast and free.
+            status_message = "denied"
+        else:
+            try:
+                llm = await _get_llm()
+                prompt = (
+                    "You are a helpful AI assistant for a company knowledge base. "
+                    "A user has asked a question but no relevant information was found "
+                    "in the knowledge base, or access was denied.\n\n"
+                    f"User's question: {state['query']}\n\n"
+                    "Write a short, helpful response (1-2 sentences) acknowledging their question "
+                    "and explaining that you don't have relevant information available to answer it. "
+                    "If it seems like a general/conversational question not suited for a knowledge base, "
+                    "gently clarify that you're specialised for company knowledge queries."
+                )
+                response = await llm.ainvoke(prompt)
+                status_message = response.content if hasattr(response, "content") else str(response)
+            except Exception as exc:
+                log.warning("no_results_llm_message_failed", error=str(exc))
+                status_message = "I couldn't find relevant information in the knowledge base to answer your question."
 
     # Finding #6: drop the *text* of denied chunks from state so unauthorised
     # content is not carried in the AgentState snapshot / Langfuse traces / OTEL
@@ -576,6 +587,20 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
              status_message so users cannot probe the /approve endpoint.
     WorkflowAlreadyStartedError is caught and treated as idempotent (retry-safe).
     """
+    # Approval-poll re-auth (GET /tasks/{id}/result, check_only=True): the request is
+    # STILL pending (check_auth routed here), so report "pending" WITHOUT writing new
+    # pending tuples or starting another Temporal workflow — the original request's
+    # tuples + workflow are already live. Re-doing them on every 4 s poll would spam
+    # the data owner with duplicate approval notifications. flow stays
+    # LOCAL_NEEDS_APPROVAL (unchanged here) so the caller maps this to "pending".
+    if state.get("check_only"):
+        log.debug("start_approval_check_only_pending", user_id=state["user_id"])
+        return {
+            "approval_request_id": None,
+            "status_message": "pending_approval",
+            "answer": None,
+        }
+
     await _enforce(
         "approval.start_workflow",
         {
@@ -775,6 +800,9 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
             # envelope; the peer binds the asserted issuer to our signing DID and
             # re-authorizes via its own OpenFGA. No replayable credential leaves us.
             user_assertion=_user_claims_ctx.get(),
+            # Approval-poll re-auth: tell the peer to re-check WITHOUT restarting its
+            # approval workflow (else each cross-division poll re-notifies the owner).
+            check_only=state.get("check_only", False),
         )
     except Exception as exc:
         log.error("peer_call_failed", error=str(exc))
@@ -849,31 +877,43 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
         }
 
     elif peer_status == "input_required":
-        try:
-            llm = await _get_llm()
-            prompt = (
-                "You are a helpful AI assistant in a federated multi-cluster system. "
-                "The user asked a question that requires data from a peer cluster. "
-                "That peer cluster has determined the user needs approval from its data owner "
-                "before the information can be shared.\n\n"
-                f"User's question: {state['query']}\n\n"
-                "Write a short, clear message (2-3 sentences) that:\n"
-                "1. Explains the requested information lives on a remote cluster\n"
-                "2. States that the remote data owner's approval is required\n"
-                "3. Confirms a request has been submitted and they will be notified"
-            )
-            response = await llm.ainvoke(prompt)
-            status_message = response.content if hasattr(response, "content") else str(response)
-        except Exception as exc:
-            log.warning("peer_approval_llm_message_failed", error=str(exc))
-            status_message = (
-                "The requested information is on the remote cluster and requires "
-                "approval from the remote data owner. You will be notified once a "
-                "decision is made."
-            )
+        if state.get("check_only"):
+            # Approval poll: no prose needed — caller maps the flow to "pending".
+            status_message = "pending_approval"
+        else:
+            try:
+                llm = await _get_llm()
+                prompt = (
+                    "You are a helpful AI assistant in a federated multi-cluster system. "
+                    "The user asked a question that requires data from a peer cluster. "
+                    "That peer cluster has determined the user needs approval from its data owner "
+                    "before the information can be shared.\n\n"
+                    f"User's question: {state['query']}\n\n"
+                    "Write a short, clear message (2-3 sentences) that:\n"
+                    "1. Explains the requested information lives on a remote cluster\n"
+                    "2. States that the remote data owner's approval is required\n"
+                    "3. Confirms a request has been submitted and they will be notified"
+                )
+                response = await llm.ainvoke(prompt)
+                status_message = response.content if hasattr(response, "content") else str(response)
+            except Exception as exc:
+                log.warning("peer_approval_llm_message_failed", error=str(exc))
+                status_message = (
+                    "The requested information is on the remote cluster and requires "
+                    "approval from the remote data owner. You will be notified once a "
+                    "decision is made."
+                )
         return {
             "flow": FlowDecision.REMOTE_NEEDS_APPROVAL,
             "status_message": status_message,
+            "answer": None,
+        }
+
+    elif state.get("check_only"):
+        # Approval poll that resolved to denied/no-access — terse, no LLM.
+        return {
+            "flow": FlowDecision.REMOTE_DENIED,
+            "status_message": "denied",
             "answer": None,
         }
 

@@ -205,6 +205,7 @@ async def run_query(
     allow_remote: bool = True,
     originating_agent_url: str | None = None,
     originating_task_id: str | None = None,
+    check_only: bool = False,
 ) -> dict[str, Any]:
     """Run the governed agent graph for a single query.
 
@@ -254,6 +255,8 @@ async def run_query(
         # threaded to start_approval so a cross-division approval notifies the caller.
         "originating_agent_url": originating_agent_url,
         "originating_task_id": originating_task_id,
+        # Approval-poll re-auth: re-check authz without spawning a new approval.
+        "check_only": check_only,
     }
 
     log.info("agent_graph_invoked", user_id=user_id, task_id=initial_state["task_id"])

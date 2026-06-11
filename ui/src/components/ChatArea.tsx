@@ -46,7 +46,9 @@ export function ChatArea({ cluster, user, token, onEvent, onLogout }: Props) {
     const id = setInterval(() => {
       const pending = tasksRef.current.filter((t) => t.state === 'input-required')
       for (const t of pending) {
-        pollApprovalResult(cluster, token, t.id)
+        // Poll the SERVER's task id (the backend ignores the client-generated one);
+        // fall back to t.id only if the result event hasn't landed yet.
+        pollApprovalResult(cluster, token, t.serverTaskId ?? t.id)
           .then((r) => {
             if (r.status === 'completed') {
               upsertTask({ ...t, state: 'completed', answer: r.answer || '', statusMessage: 'Approved', updatedAt: new Date() })

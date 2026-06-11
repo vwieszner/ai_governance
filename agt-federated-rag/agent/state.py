@@ -89,6 +89,13 @@ class AgentState(TypedDict):
     # to another peer (no A->B->A loops, no forward-empty-claims 401).
     allow_remote: bool
 
+    # Approval-poll re-auth (GET /tasks/{id}/result): when True, a still-unauthorized
+    # request is RE-CHECKED against live OpenFGA state WITHOUT spawning a new approval
+    # workflow or writing new pending tuples (start_approval short-circuits to "pending").
+    # Threaded to the peer so a cross-division poll doesn't restart the peer's workflow
+    # each tick. Default False — the first /query is unaffected.
+    check_only: bool
+
     # M4 (FR-6): originating division's callback agent_url + task_id (SSRF-validated) so a
     # cross-division approval can notify the caller; None for local requests.
     originating_agent_url: str | None

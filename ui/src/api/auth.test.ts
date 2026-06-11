@@ -25,7 +25,8 @@ describe('getToken', () => {
 
     const token = await getToken('/auth/a', 'rag-ui', 'alice', 'secret')
 
-    expect(token).toBe('tok123')
+    // getToken returns an AuthTokens object (accessToken/refreshToken/expiresIn).
+    expect(token.accessToken).toBe('tok123')
 
     const fetchMock = vi.mocked(fetch)
     expect(fetchMock).toHaveBeenCalledOnce()

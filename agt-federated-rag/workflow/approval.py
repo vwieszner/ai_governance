@@ -120,6 +120,31 @@ class ApprovalWorkflow:
 
     def __init__(self) -> None:
         self._decision: ApprovalDecisionSignal | None = None
+        # Snapshot of the request, exposed via the get_info query so the AUTHENTICATED
+        # approval endpoints (/approvals/pending + /approvals/{id}/decision) can verify
+        # the caller is the designated owner and render the owner's inbox. Populated at
+        # the top of run(); empty until then.
+        self._approver_id: str = ""
+        self._user_id: str = ""
+        self._query: str = ""
+
+    # ── Query handler ─────────────────────────────────────────────────────────
+
+    @workflow.query
+    def get_info(self) -> dict:
+        """Read-only snapshot for the authenticated approval endpoints.
+
+        ``approver_id`` is the namespaced data-owner principal (email|issuer-ns) the
+        request was routed to — the endpoints compare it to the caller's principal for
+        owner-verification. ``decided`` flips True once a decision signal arrives so a
+        second decision is rejected (409) instead of re-signalling Temporal.
+        """
+        return {
+            "approver_id": self._approver_id,
+            "user_id": self._user_id,
+            "query": self._query,
+            "decided": self._decision is not None,
+        }
 
     # ── Signal handler ────────────────────────────────────────────────────────
 
@@ -138,6 +163,11 @@ class ApprovalWorkflow:
     @workflow.run
     async def run(self, inp: ApprovalInput) -> ApprovalResult:
         """Execute the full approval flow: notify → wait → decide."""
+        # Expose request metadata to the get_info query (owner-verification + inbox).
+        self._approver_id = inp.approver_id
+        self._user_id = inp.user_id
+        self._query = inp.query
+
         workflow.logger.info(
             "approval_workflow_started",
             request_id=inp.approval_request_id,

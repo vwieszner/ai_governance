@@ -314,8 +314,12 @@ class OpenFGAAuth:
                 agt_audit=True,
             )
         except ApiException as exc:
-            if exc.status == 404:
-                # Tuple did not exist — idempotent, not an error.
+            # Idempotent delete: a missing tuple is a no-op. OpenFGA signals this as a
+            # 404 OR a 400 ValidationException ("the tuple to be deleted did not exist",
+            # write_failed_due_to_invalid_input) — swallow both so revoke is safe to
+            # re-run (e.g. revoking an already-revoked grant must not 500).
+            body = str(getattr(exc, "body", "") or exc)
+            if exc.status == 404 or "did not exist" in body or "does not exist" in body:
                 log.debug(
                     "openfga.delete_tuple.not_found",
                     user_id=user_id,

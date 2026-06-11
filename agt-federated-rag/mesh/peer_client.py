@@ -108,6 +108,7 @@ async def call_peer_agent(
     context_id: str,
     callback_url: str | None = None,
     user_assertion: dict | None = None,
+    check_only: bool = False,
 ) -> PeerResponse:
     """
     Send a governed, DID-signed query to the peer agent over HTTP.
@@ -180,6 +181,9 @@ async def call_peer_agent(
         # M0 tenancy: the originating division, carried (and signed) in the A2A
         # envelope so the receiver can attribute + audit the cross-division call.
         "source_division": settings.division_id,
+        # Approval-poll re-auth: signed in the envelope so the peer re-checks WITHOUT
+        # restarting its approval workflow (no duplicate owner notifications per poll).
+        "check_only": check_only,
     }
     signed_payload = await sign_outbound_message(payload)
 
