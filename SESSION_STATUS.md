@@ -18,10 +18,13 @@ Overarching goal (active): 100% functionality, every useful scenario proven work
 - **M8 — tamper-evident hash-chained audit (commit a825116).** `audit_log.py`: every `agt_audit=True` event is appended to an append-only hash chain (`hash=SHA256(seq|ts|event|canonical(data)|prev_hash)`); recompute detects tamper/delete/reorder/truncate. Captured DRY via a structlog processor (format preserved). Per-(division,role) chains (agent+worker = separate processes → no write race). `scripts/verify_audit.py` CLI; 6 tests. PROVEN live: BOTH agent AND worker chains capture governance events — alpha_agent/beta_agent/beta_worker all verify OK; forged entry in a copy → "hash mismatch — entry tampered". M8 security+quality review gate in flight. NEXT: add `agt_audit=True` to FAILED/REJECTED auth events (DID-sig/assertion/peer-DID rejections, token 401s, approval HMAC-invalid) so the intrusion trail is chained too.
 - **Quality [M1] fix (commit 2ae4a9c):** provisioning OpenFGA writes (`federate_divisions._apply_cross_grants` + `onboard_division._seed_division_tuples`) now fail LOUDLY via shared `_ofga_write` (swallow only 400 "already exists", raise everything else) — a run can no longer print "done" having written zero tuples. **43 tests pass.**
 
+- **Port migration (commit 00d6471):** divisions MOVED to a clean band — alpha **9000**, beta **9100**, gamma **9200** (agent=base, openfga=base+1, kc-issuer=base+2, …). ROOT CAUSE of the OpenFGA collisions: a co-resident project reserves `BACKEND=8000+N*100+1` (=8101/8201/8301/8401) which equalled our openfga=port_base+1 on the old 8100/8200/8300/8400 bases. `onboard_division._reserved_ports()` + `assert_port_base_clean()` now REJECT colliding port_bases in `load_manifest` so it can't recur (tests pin it). alpha+beta re-onboarded + re-federated on clean ports.
+- **M5 revocation (FR-7.2/7.3, commit after 00d6471):** `revoke_viewer` + `POST /access/revoke` (owner-authenticated, audited) — proven live: owner revokes → viewer removed + pending set → re-ask re-enters approval (no stale reuse). REMAINING for M5: expiry (FR-7.1) via OpenFGA conditional tuples.
+
 ### Current live state
-- alpha: port_base **8400** (agent 8400 / openfga 8401 / kc-issuer 8402); beta: **8200** (8201 / 8202). gamma 8300 not onboarded.
-- Both agents run via `clusters.ps1`; both healthy at session end. After any agent restart, cross-division needs the `.env` `PEER_AGENT_ISSUER` (set by `federate_divisions.py`) — re-run federate if 401s appear.
-- KNOWN ENV: Docker control-plane is sluggish here (many foreign stacks) — `docker compose up` can hang; division *services* are fine via direct 127.0.0.1 HTTP. NVIDIA endpoints flaky (use 8b).
+- alpha **9000** (agent 9000 / openfga 9001 / kc-issuer 9002); beta **9100** (9101 / 9102); gamma **9200** (not onboarded — for the e2e). 45 tests pass.
+- Both agents run via `clusters.ps1` (reads manifests → targets 9000/9100); healthy at session end. After any agent restart, cross-division needs `PEER_AGENT_ISSUER` (set by `federate_divisions.py`) — re-run federate if 401s appear.
+- KNOWN ENV: Docker control-plane can be sluggish (was responsive during the migration). NVIDIA 70b/3.2-3b throttled → using llama-3.1-8b. Direct 127.0.0.1 HTTP to division services always works.
 
 ## ✅ DONE & PROVEN — SESSION 1 (pushed; HEAD was e6ddf29)
 
