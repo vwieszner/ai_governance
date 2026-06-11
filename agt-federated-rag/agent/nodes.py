@@ -225,6 +225,9 @@ async def _get_llm() -> ChatOpenAI:
         return _llm
     async with _llm_lock:
         if _llm is None:
+            # M6/NFR-1: fail closed if local-residency would egress to an external LLM.
+            from residency import assert_inference_allowed
+            assert_inference_allowed(settings.openai_api_base, "LLM")
             _llm = ChatOpenAI(
                 model=settings.llm_model,
                 openai_api_base=settings.openai_api_base,
@@ -246,6 +249,9 @@ async def _get_intent_llm() -> ChatOpenAI:
         return _intent_llm
     async with _intent_llm_lock:
         if _intent_llm is None:
+            # M6/NFR-1: fail closed if local-residency would egress to an external LLM.
+            from residency import assert_inference_allowed
+            assert_inference_allowed(settings.openai_api_base, "LLM")
             _intent_llm = ChatOpenAI(
                 model=_INTENT_MODEL,
                 openai_api_base=settings.openai_api_base,
