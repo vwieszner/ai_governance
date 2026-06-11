@@ -719,13 +719,14 @@ async def a2a_query(request: Request) -> JSONResponse:
     # protected) envelope — NOT a forwarded raw bearer token (which a compromised peer
     # could replay against the user's HOME APIs). The assertion is a claims object; we
     # bind its issuer to THIS specific signing peer (settings.peer_agent_issuer), so a
-    # compromised-but-trusted peer cannot assert ANOTHER division's user. principal()
-    # then requires a verified email and namespaces by that signer-bound issuer.
+    # compromised-but-trusted peer cannot assert ANOTHER division's user. The identity
+    # WITHIN that signer's namespace is vouched by the DID-authenticated home agent (see
+    # assertion_principal's trust-model note), not re-verified against the home Keycloak.
     assertion = payload.get("user_assertion")
     if not isinstance(assertion, dict):
         raise HTTPException(
             status_code=401,
-            detail="Missing verifiable user assertion — cross-division identity required",
+            detail="Missing cross-division user assertion — identity required",
         )
     try:
         user_id = assertion_principal(assertion, settings.peer_agent_issuer)

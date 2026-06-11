@@ -272,8 +272,19 @@ def assertion_principal(assertion: dict, expected_issuer: str) -> str:
     caller — settings.peer_agent_issuer / a DID→issuer map). Binding to the signer
     (not to the trusted-issuer SET) is what prevents a compromised-but-trusted peer
     from asserting ANOTHER division's user (which set-membership would allow in a 3+
-    division mesh). principal() then requires a verified email and namespaces by the
-    (now signer-bound) issuer.
+    division mesh). principal() then namespaces by the (now signer-bound) issuer.
+
+    TRUST MODEL (be precise — this is delegated/VOUCHED identity, not receiver-verified):
+    the email/email_verified in the assertion are NOT re-verified against the home
+    Keycloak here (Keycloak cannot mint a token whose audience is the receiver, so there
+    is no receiver-verifiable home token — that constraint is what forced this design).
+    They are VOUCHED by the home division's DID-authenticated agent. Consequence: a
+    compromised-but-trusted peer can assert ANY identity WITHIN ITS OWN namespace
+    (issuer), e.g. a fabricated email — but the issuer binding above confines that blast
+    radius to the peer's own users; it can never reach across divisions. This is the
+    standard vouched cross-trust-domain delegation model and is strictly safer than
+    forwarding the user's raw (replayable) token. Authenticity of the assertion itself
+    is cryptographic: the envelope carrying it is Ed25519 DID-signed + ts/nonce fresh.
 
     Raises ValueError on any failure (callers fail closed).
     """
@@ -333,11 +344,18 @@ def principal(claims: dict) -> str:
     Format: ``<email>|<issuer-namespace>`` — e.g.
     ``alice@example.com|56b707f1d1087268``. The lower-cased email is the stable,
     human-readable, cross-division subject; the issuer-namespace (see
-    :func:`issuer_namespace`) scopes it so a trusted issuer can only vouch for ITS
-    OWN users. Requires a *verified* email (``email_verified == true``) and the
-    cryptographically-verified ``iss`` claim — callers MUST pass claims returned by
-    :func:`validate_token` or :func:`validate_peer_user_assertion`, never the raw
-    envelope's ``source_division``/``user_id``.
+    :func:`issuer_namespace`) scopes it so an issuer can only vouch for ITS OWN users.
+
+    Requires ``email``, ``email_verified == true``, and ``iss``. The STRENGTH of those
+    claims depends on how the caller obtained them:
+      - Local ``/query``: claims come from :func:`validate_token` — ``iss``/``email`` are
+        cryptographically verified against the home Keycloak JWKS.
+      - Cross-division ``/a2a/query``: claims come from a peer's DID-signed assertion via
+        :func:`assertion_principal`. There the email/email_verified are VOUCHED by the
+        DID-authenticated home agent (not re-verified by a Keycloak signature here — see
+        that function's trust-model note); ``iss`` is bound to the signing peer.
+    Callers MUST pass claims from one of those paths, never the raw envelope's
+    ``source_division``/``user_id``.
 
     Raises:
         ValueError: if ``iss`` or a verified ``email`` is absent.

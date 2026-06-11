@@ -1,0 +1,29 @@
+ACME CORP — SECURITY INCIDENT REGISTER
+Document ID: SEC-CONF-2026-IR
+Classification: STRICTLY CONFIDENTIAL — Security Team & CISO Only
+Last Revised: 2026-02-10
+Owner: CISO Office
+
+HANDLING NOTICE: This register records active and historical security incidents,
+including unremediated vulnerabilities. Disclosure outside the Security organisation
+materially increases risk to the company. No cross-division or external sharing.
+
+1. SCOPE
+This document is intentionally restricted to Division Beta's security function. It has
+NO viewer or pending_approval grant for any external/peer-division principal — it is the
+control case proving that a verifiable, trusted cross-division identity is still DENIED
+access to data it has not been explicitly granted (neither immediate nor via approval).
+
+2. OPEN INCIDENTS (SUMMARY)
+INC-2026-014  Sev2  Phishing campaign targeting finance staff; 3 credential resets; contained.
+INC-2026-019  Sev3  Misconfigured S3 bucket (staging telemetry); access logs under review.
+INC-2026-022  Sev1  Suspected lateral-movement attempt from a compromised CI runner; IR active.
+
+3. CONTROLS UNDER REMEDIATION
+- Rotate all CI/CD service-account credentials to short-lived OIDC tokens (target Q2).
+- Enforce mTLS on all internal service-to-service traffic (tracked with platform M7 work).
+- Complete rollout of hardware-backed MFA for privileged administrators.
+
+4. ACCESS
+Only members of the Beta security team (CISO-owned) may read this register. Requests from
+anyone else — including authenticated users from peer divisions — must be refused.

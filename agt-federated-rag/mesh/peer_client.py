@@ -167,7 +167,7 @@ async def call_peer_agent(
     payload: dict[str, Any] = {
         "query": query,
         # M2: user_id is now diagnostic only — the receiver derives the authoritative
-        # identity from the VERIFIABLE user_assertion below, not this string.
+        # identity from the DID-signed user_assertion claims below, not this string.
         "user_id": user_id,
         # M2 (FR-3.6), security-hardened: the user's VALIDATED identity CLAIMS
         # (sub/email/email_verified/iss) — NOT a raw bearer token. Authenticity +
