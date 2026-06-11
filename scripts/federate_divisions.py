@@ -45,6 +45,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.onboard_division import (  # noqa: E402
     REALM,
     Manifest,
+    _ofga_write,
     _seed_principal,
     derive_ports,
     load_manifest,
@@ -157,11 +158,12 @@ async def _apply_cross_grants(facts: DivisionFacts, by_id: dict[str, DivisionFac
             if dry_run:
                 continue
             for cid in chunks:
-                await c.post(f"{ofga}/stores/{store_id}/write",
-                             json={"writes": {"tuple_keys": [
-                                 {"user": f"user:{principal}", "relation": relation,
-                                  "object": f"chunk:{cid}"}]}},
-                             headers=headers)
+                # Quality M1: idempotent but NOT silent — _ofga_write raises on real
+                # failures (bad token / wrong store / model drift), so a federate run
+                # can't print "done" having written zero cross-grants.
+                await _ofga_write(c, ofga, store_id, headers,
+                                  {"user": f"user:{principal}", "relation": relation,
+                                   "object": f"chunk:{cid}"})
 
 
 def federate(only: list[str] | None, dry_run: bool) -> int:

@@ -9,7 +9,45 @@ principal is covered by tests/test_a2a.py::test_seed_principal_matches_runtime_p
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+
+import pytest
+
+
+class _FakeResp:
+    def __init__(self, status_code: int, text: str = ""):
+        self.status_code = status_code
+        self.text = text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _FakeClient:
+    def __init__(self, resp: _FakeResp):
+        self._resp = resp
+        self.calls = 0
+
+    async def post(self, url, json=None, headers=None):
+        self.calls += 1
+        return self._resp
+
+
+def test_ofga_write_swallows_already_exists_but_raises_real_failures():
+    # Quality M1: provisioning writes must be idempotent yet NOT silent — a genuine
+    # failure (bad token / wrong store / model drift) must surface, not be swallowed.
+    from scripts.onboard_division import _ofga_write
+    tk = {"user": "user:a@x|ns", "relation": "viewer", "object": "chunk:c"}
+
+    asyncio.run(_ofga_write(_FakeClient(_FakeResp(200, "{}")), "o", "s", {}, tk))     # ok
+    asyncio.run(_ofga_write(                                                          # idempotent
+        _FakeClient(_FakeResp(400, '{"message":"tuple already exists"}')), "o", "s", {}, tk))
+    with pytest.raises(Exception):                                                    # 403 bad token
+        asyncio.run(_ofga_write(_FakeClient(_FakeResp(403, "forbidden")), "o", "s", {}, tk))
+    with pytest.raises(Exception):                                                    # 404 wrong store
+        asyncio.run(_ofga_write(_FakeClient(_FakeResp(404, "store not found")), "o", "s", {}, tk))
 
 
 def test_upsert_env_replaces_existing_and_appends_new(tmp_path: Path):

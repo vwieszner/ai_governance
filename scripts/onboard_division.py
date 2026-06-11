@@ -509,6 +509,21 @@ def _seed_principal(email: str, issuer: str) -> str:
     return f"{email.strip().lower()}|{ns}"
 
 
+async def _ofga_write(c, ofga: str, store_id: str, headers: dict, tuple_key: dict) -> None:
+    """Write ONE OpenFGA tuple, idempotently but NOT silently (quality finding M1).
+
+    Mirrors auth/openfga.py: an existing tuple (HTTP 400 'already exists') is a no-op
+    on re-provisioning, but EVERY other failure (bad token, wrong store_id, auth-model
+    drift, malformed tuple) is raised — so a provisioning/federation run can never print
+    'done' having written zero tuples and leave authorization to fail closed at query
+    time with no signal."""
+    r = await c.post(f"{ofga}/stores/{store_id}/write",
+                     json={"writes": {"tuple_keys": [tuple_key]}}, headers=headers)
+    if r.status_code == 400 and "already exist" in r.text.lower():
+        return
+    r.raise_for_status()
+
+
 async def _seed_division_tuples(c, manifest: Manifest, ports: dict[str, int],
                                 secretz: dict[str, str], store_id: str) -> None:
     """Seed default per-chunk authz: alice viewer on seed_viewer doc; alice
@@ -537,10 +552,8 @@ async def _seed_division_tuples(c, manifest: Manifest, ports: dict[str, int],
 
     async def grant(user: str, rel: str, title: str) -> None:
         for cid in by_title.get(title, []):
-            await c.post(f"{ofga}/stores/{store_id}/write",
-                         json={"writes": {"tuple_keys": [{"user": user, "relation": rel,
-                                                          "object": f"chunk:{cid}"}]}},
-                         headers=ofga_h)
+            await _ofga_write(c, ofga, store_id, ofga_h,
+                              {"user": user, "relation": rel, "object": f"chunk:{cid}"})
 
     if manifest.seed_viewer:
         await grant(f"user:{alice}", "viewer", manifest.seed_viewer)
