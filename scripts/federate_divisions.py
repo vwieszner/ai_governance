@@ -191,6 +191,11 @@ def federate(only: list[str] | None, dry_run: bool) -> int:
                 "PEER_AGENT_URL": primary.agent_url,
                 "PEER_AGENT_DID": did,
                 "PEER_AGENT_PUBLIC_JWK": jwk,
+                # SECURITY: bind the outbound peer's issuer to its DID, so a DID-signed
+                # cross-division assertion is accepted only if its `iss` matches THIS
+                # peer's issuer (api/main.py assertion_principal). Not the trusted-issuer
+                # set — that would let a compromised peer assert another division's user.
+                "PEER_AGENT_ISSUER": primary.issuer,
                 "TRUSTED_ISSUERS": ",".join(by_id[p].issuer for p in peers),
             }
             for ch in _upsert_env(f.env_path, updates, dry_run):

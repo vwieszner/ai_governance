@@ -1,112 +1,33 @@
 """M2 verifiable cross-division identity tests (IMPLEMENTATION_PLAN.md M2, FR-3.6).
 
-Spike outcome: Keycloak cannot mint a token whose audience is another division's
-client (cross-realm audience -> "Audience not found"). So a cross-division user
-assertion is the user's HOME-division token, forwarded in the DID-signed peer
-envelope, and the receiver validates it against the TRUSTED-ISSUER SET — signature
-+ issuer(in trusted set) + expiry + sub, but NOT the receiver's audience. These
-tests prove that primitive: a trusted-issuer assertion is accepted; an untrusted
-issuer, a forged signature, and an expired assertion are all rejected. The receiver
-then re-authorizes the sub via its own OpenFGA (the /a2a/query integration).
-Hermetic: real RS256 tokens + mocked JWKS, runs by default.
+Security-hardened design: a cross-division user assertion is NOT the user's raw
+home-division token (that would be a replayable bearer credential a compromised
+receiving division could replay against the user's HOME APIs). Instead the
+originating division forwards the user's already-VALIDATED identity CLAIMS
+(sub/email/email_verified/iss) inside the DID-signed, replay-protected peer envelope.
+The receiver:
+  1. verifies the Ed25519 envelope signature (-> signer DID) + ts/nonce freshness,
+  2. binds the asserted `iss` to THAT specific signer (settings.peer_agent_issuer) —
+     NOT to the trusted-issuer SET (which in a 3+ division mesh would let a
+     compromised-but-trusted peer assert ANOTHER division's user),
+  3. derives the OpenFGA principal (verified email, namespaced by the signer-bound iss).
+
+These hermetic tests pin both layers: the namespaced principal and the signer-bound
+assertion validation (auth.token_validator.assertion_principal / minimal_assertion_claims).
 """
 from __future__ import annotations
 
-import asyncio
-import time
-
 import pytest
-from jose import JWTError, jwt
+
+ALPHA_ISS = "http://localhost:8402/realms/rag"   # division alpha
+GAMMA_ISS = "http://localhost:8302/realms/rag"   # a DIFFERENT trusted division
 
 
-def _keypair_and_jwks(kid: str = "peer-key-1"):
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from jose import jwk
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    priv = key.private_bytes(serialization.Encoding.PEM,
-                             serialization.PrivateFormat.PKCS8,
-                             serialization.NoEncryption()).decode()
-    pub = key.public_key().public_bytes(
-        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
-    jd = jwk.construct(pub, "RS256").to_dict()
-    jd.update({"kid": kid, "alg": "RS256", "use": "sig"})
-    return priv, {"keys": [jd]}
-
-
-def _mint(priv, issuer, sub="alice-sub", kid="peer-key-1", aud="agent-alpha", ttl=3600):
-    now = int(time.time())
-    return jwt.encode({"sub": sub, "iss": issuer, "aud": aud, "iat": now, "exp": now + ttl},
-                      priv, algorithm="RS256", headers={"kid": kid})
-
-
-PEER_ISS = "http://localhost:8102/realms/rag"      # division alpha (a trusted peer)
-UNTRUSTED_ISS = "http://evil.example/realms/rag"
-
-
-def _setup(monkeypatch, make_settings, jwks, trusted=PEER_ISS):
-    from auth import token_validator as tv
-    s = make_settings(trusted_issuers=trusted, allowed_jwt_algorithms="RS256")
-    monkeypatch.setattr(tv, "settings", s)
-
-    async def _fake_fetch(_uri):
-        return jwks
-
-    monkeypatch.setattr(tv, "_fetch_jwks_for", _fake_fetch)
-    return tv
-
-
-def test_user_assertion_validated(make_settings, monkeypatch):
-    priv, jwks = _keypair_and_jwks()
-    tv = _setup(monkeypatch, make_settings, jwks)
-    token = _mint(priv, issuer=PEER_ISS, aud="agent-alpha")  # aud is the HOME agent, not us
-    claims = asyncio.run(tv.validate_peer_user_assertion(token))
-    assert claims["sub"] == "alice-sub"          # validated despite foreign audience
-
-
-def test_untrusted_issuer_rejected(make_settings, monkeypatch):
-    priv, jwks = _keypair_and_jwks()
-    tv = _setup(monkeypatch, make_settings, jwks, trusted=PEER_ISS)
-    token = _mint(priv, issuer=UNTRUSTED_ISS)     # issuer NOT in the trusted set
-    with pytest.raises(JWTError):
-        asyncio.run(tv.validate_peer_user_assertion(token))
-
-
-def test_forged_user_assertion_rejected(make_settings, monkeypatch):
-    # Token signed by a DIFFERENT key than the issuer's published JWKS.
-    forger_priv, _ = _keypair_and_jwks(kid="peer-key-1")
-    _real_priv, real_jwks = _keypair_and_jwks(kid="peer-key-1")
-    tv = _setup(monkeypatch, make_settings, real_jwks)
-    token = _mint(forger_priv, issuer=PEER_ISS)   # right issuer/kid, wrong key
-    with pytest.raises(JWTError):
-        asyncio.run(tv.validate_peer_user_assertion(token))
-
-
-def test_expired_assertion_rejected(make_settings, monkeypatch):
-    priv, jwks = _keypair_and_jwks()
-    tv = _setup(monkeypatch, make_settings, jwks)
-    token = _mint(priv, issuer=PEER_ISS, ttl=-10)  # already expired
-    with pytest.raises(JWTError):
-        asyncio.run(tv.validate_peer_user_assertion(token))
+def _claims(iss, email="alice@example.com", verified=True, sub="x"):
+    return {"iss": iss, "email": email, "email_verified": verified, "sub": sub}
 
 
 # ── Namespaced authorization principal (the federated-trust security boundary) ──
-#
-# The OpenFGA principal is (verified-issuer, email), NOT a bare email/sub. Without
-# the issuer namespace, trusting ANY issuer would let it mint email=<anyone> and
-# impersonate every user in the federation (email_verified does not help — the
-# receiver can't check the home realm actually verified it). These tests pin that
-# property: same (iss,email) is stable; a DIFFERENT trusted issuer claiming the same
-# email yields a DIFFERENT principal (no impersonation); unverified email is refused.
-
-ALPHA_ISS = "http://localhost:8102/realms/rag"
-GAMMA_ISS = "http://localhost:8302/realms/rag"
-
-
-def _claims(iss, email="alice@example.com", verified=True):
-    return {"iss": iss, "email": email, "email_verified": verified, "sub": "x"}
-
 
 def test_principal_is_namespaced_by_issuer():
     from auth.token_validator import principal
@@ -120,13 +41,9 @@ def test_principal_stable_for_same_issuer_and_email():
     assert principal(_claims(ALPHA_ISS)) == principal(_claims(ALPHA_ISS))
 
 
-def test_trusted_issuer_cannot_impersonate_another_divisions_user():
-    # THE security property: gamma is a trusted issuer, but a gamma-signed token
-    # claiming alice's email must NOT resolve to alice's alpha principal.
+def test_principal_distinct_across_issuers():
     from auth.token_validator import principal
-    alice_at_alpha = principal(_claims(ALPHA_ISS, "alice@example.com"))
-    alice_forged_by_gamma = principal(_claims(GAMMA_ISS, "alice@example.com"))
-    assert alice_at_alpha != alice_forged_by_gamma  # impersonation blocked
+    assert principal(_claims(ALPHA_ISS)) != principal(_claims(GAMMA_ISS))
 
 
 def test_principal_requires_verified_email():
@@ -145,3 +62,53 @@ def test_seed_principal_matches_runtime_principal():
     seeded = _seed_principal("Alice@Example.com", ALPHA_ISS)   # note casing/normalise
     runtime = principal(_claims(ALPHA_ISS, "alice@example.com"))
     assert seeded == runtime
+
+
+# ── Signer-bound cross-division assertion (no bearer token; no replay) ──────────
+
+def test_minimal_assertion_claims_is_subset_no_token():
+    # What the originating division forwards: identity claims only — never a token.
+    from auth.token_validator import minimal_assertion_claims
+    full = {"iss": ALPHA_ISS, "email": "alice@example.com", "email_verified": True,
+            "sub": "abc", "aud": "agent-alpha", "exp": 9999999999, "secret": "leak?"}
+    out = minimal_assertion_claims(full)
+    assert set(out) == {"sub", "email", "email_verified", "iss"}
+    assert "aud" not in out and "exp" not in out and "secret" not in out
+
+
+def test_assertion_principal_accepts_signer_bound_issuer():
+    from auth.token_validator import assertion_principal, principal
+    got = assertion_principal(_claims(ALPHA_ISS), expected_issuer=ALPHA_ISS)
+    assert got == principal(_claims(ALPHA_ISS))
+
+
+def test_assertion_principal_rejects_issuer_not_bound_to_signer():
+    # THE security property: a (compromised-but-trusted) peer whose bound issuer is
+    # alpha asserts a GAMMA user. Even though the claims are well-formed and gamma is
+    # a real division, binding the issuer to the SIGNER rejects it — no cross-issuer
+    # impersonation. (Set-membership in trusted_issuers would WRONGLY accept this.)
+    from auth.token_validator import assertion_principal
+    with pytest.raises(ValueError):
+        assertion_principal(_claims(GAMMA_ISS, email="ceo@example.com"),
+                            expected_issuer=ALPHA_ISS)
+
+
+def test_assertion_principal_requires_verified_email():
+    from auth.token_validator import assertion_principal
+    with pytest.raises(ValueError):
+        assertion_principal(_claims(ALPHA_ISS, verified=False), expected_issuer=ALPHA_ISS)
+
+
+def test_assertion_principal_fails_closed_without_bound_issuer():
+    # If no issuer is bound to the signer (misconfig), refuse — never fall back to
+    # accepting any issuer.
+    from auth.token_validator import assertion_principal
+    with pytest.raises(ValueError):
+        assertion_principal(_claims(ALPHA_ISS), expected_issuer="")
+
+
+def test_assertion_principal_rejects_non_dict():
+    # A raw string (e.g., a forwarded token) must not be accepted as an assertion.
+    from auth.token_validator import assertion_principal
+    with pytest.raises(ValueError):
+        assertion_principal("eyJhbGciOi...", expected_issuer=ALPHA_ISS)  # type: ignore[arg-type]

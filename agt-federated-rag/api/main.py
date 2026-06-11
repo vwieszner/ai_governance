@@ -53,8 +53,9 @@ import agent.nodes as agent_nodes
 import mesh.agent_identity as agent_identity
 from auth.token_validator import (
     AuthServiceUnavailable,
+    assertion_principal,
+    minimal_assertion_claims,
     principal,
-    validate_peer_user_assertion,
     validate_token,
 )
 from config import settings
@@ -583,8 +584,10 @@ async def query(
         owner_id=user_id,
     )
 
-    # Inject user token into ContextVar — never into state or logs
-    agent_graph.set_user_token(token)
+    # Forward only the user's VALIDATED identity claims (not the raw bearer token) so
+    # a delegated peer call carries a non-replayable, DID-signed assertion. run_query
+    # stashes these in a ContextVar — never in state or logs.
+    fwd_claims = minimal_assertion_claims(claims)
 
     async def event_stream() -> AsyncIterator[dict[str, str]]:
         yield {"event": "status", "data": '{"status": "working"}'}
@@ -593,7 +596,7 @@ async def query(
             agent_graph.run_query(
                 query=raw_query,
                 user_id=user_id,
-                user_token=token,
+                user_claims=fwd_claims,
                 task_id=task_id,
                 context_id=context_id,
             )
@@ -711,27 +714,21 @@ async def a2a_query(request: Request) -> JSONResponse:
             detail=f"Query exceeds maximum length of {settings.max_query_length} characters",
         )
 
-    # M2 (FR-3.6): derive the AUTHORITATIVE user identity from the VERIFIABLE
-    # assertion (the user's home-division Keycloak token), validated against this
-    # division's trusted-issuer set — NOT a bare user_id string the caller asserts.
-    # The DID signature proves the message came from a trusted peer agent; the
-    # assertion proves WHICH user, cryptographically (home Keycloak), so identity is
-    # not agent-vouched. Fail closed if the assertion is absent or invalid. The bare
-    # user_id field (if present) is diagnostic only.
-    assertion = str(payload.get("user_assertion", "")).strip()
-    if not assertion:
+    # M2 (FR-3.6), security-hardened: derive the AUTHORITATIVE user identity from the
+    # DID-signed user-assertion CLAIMS in the (already signature-verified, replay-
+    # protected) envelope — NOT a forwarded raw bearer token (which a compromised peer
+    # could replay against the user's HOME APIs). The assertion is a claims object; we
+    # bind its issuer to THIS specific signing peer (settings.peer_agent_issuer), so a
+    # compromised-but-trusted peer cannot assert ANOTHER division's user. principal()
+    # then requires a verified email and namespaces by that signer-bound issuer.
+    assertion = payload.get("user_assertion")
+    if not isinstance(assertion, dict):
         raise HTTPException(
             status_code=401,
             detail="Missing verifiable user assertion — cross-division identity required",
         )
     try:
-        assertion_claims = await validate_peer_user_assertion(assertion)
-        # Principal is namespaced by the assertion's VERIFIED issuer (the peer's home
-        # Keycloak), so a peer can only present its OWN users — a malicious trusted
-        # issuer cannot forge another division's user even with email_verified=true.
-        user_id = principal(assertion_claims)
-    except HTTPException:
-        raise
+        user_id = assertion_principal(assertion, settings.peer_agent_issuer)
     except Exception as exc:
         log.warning("a2a_query_assertion_invalid", error=str(exc))
         raise HTTPException(status_code=401, detail="Invalid cross-division user assertion")
@@ -752,13 +749,14 @@ async def a2a_query(request: Request) -> JSONResponse:
     )
 
     # ── Run the SAME governed pipeline as /query ─────────────────────────────
-    # No user JWT on this path — the peer vouches for user_id and OpenFGA on
-    # THIS cluster re-checks the delegated user's access to local data.
+    # The peer's DID-signed claims established user_id; OpenFGA on THIS division
+    # re-authorizes that principal. No onward forwarding here (single-hop), so no
+    # user_claims are injected.
     try:
         result = await agent_graph.run_query(
             query=raw_query,
             user_id=user_id,
-            user_token="",        # peer-to-peer: no user bearer token to forward
+            user_claims=None,     # single-hop: nothing to forward onward
             task_id=task_id,
             context_id=context_id,
         )

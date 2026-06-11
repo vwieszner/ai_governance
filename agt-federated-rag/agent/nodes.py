@@ -80,16 +80,20 @@ from workflow.approval import ApprovalInput, ApprovalWorkflow
 log = structlog.get_logger(__name__)
 
 # ── User token ContextVar (security boundary) ─────────────────────────────────
-# The raw bearer token is NEVER stored in AgentState.
-# It is injected by run_query (in graph.py) and read here only when needed.
-_user_token_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "user_token", default=""
+# The user's VALIDATED identity claims (minimal subset — see
+# token_validator.minimal_assertion_claims) for cross-division forwarding. NEVER
+# stored in AgentState/logs; injected by run_query before the graph runs and read
+# only by call_peer_agent when delegating to a peer. Security-hardened M2: we no
+# longer hold the user's RAW bearer token here — only non-replayable identity claims,
+# carried onward inside the DID-signed, replay-protected peer envelope.
+_user_claims_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "user_claims", default={}
 )
 
 
-def set_user_token(token: str) -> None:
+def set_user_claims(claims: dict) -> None:
     """Called once per request (in graph.run_query) before the graph is invoked."""
-    _user_token_ctx.set(token)
+    _user_claims_ctx.set(claims or {})
 
 
 # ── AGT PolicyEvaluator singleton ─────────────────────────────────────────────
@@ -168,7 +172,9 @@ _graph: GraphRAGRetriever | None = None
 _openfga: OpenFGAAuth | None = None
 _llm: ChatOpenAI | None = None
 _intent_llm: ChatOpenAI | None = None
-_INTENT_MODEL = "meta/llama-3.2-3b-instruct"
+# Fast model for intent classification. llama-3.2-3b was unreliable on NVIDIA NIM's
+# free tier (frequent ReadTimeouts); 3.1-8b is both faster in practice and reliable.
+_INTENT_MODEL = "meta/llama-3.1-8b-instruct"
 _temporal_client: TemporalClient | None = None
 
 _qdrant_lock: asyncio.Lock = asyncio.Lock()
@@ -748,11 +754,12 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
             user_id=state["user_id"],
             context_id=state.get("context_id", ""),
             callback_url=callback_url,
-            # M2 (FR-3.6): forward the user's VERIFIABLE home-division assertion (their
-            # Keycloak token, from the security ContextVar) so the peer cryptographically
-            # validates the user's identity against our issuer's JWKS and re-authorizes
-            # — instead of trusting a bare user_id string.
-            user_assertion=_user_token_ctx.get(),
+            # M2 (FR-3.6), security-hardened: forward the user's VALIDATED identity
+            # CLAIMS (minimal subset, from the security ContextVar) — NOT their raw
+            # bearer token. The claims travel inside the DID-signed, replay-protected
+            # envelope; the peer binds the asserted issuer to our signing DID and
+            # re-authorizes via its own OpenFGA. No replayable credential leaves us.
+            user_assertion=_user_claims_ctx.get(),
         )
     except Exception as exc:
         log.error("peer_call_failed", error=str(exc))

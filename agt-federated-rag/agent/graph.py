@@ -83,7 +83,7 @@ from agent.nodes import (
     generate_answer,
     handle_peer_result,
     retrieve_local,
-    set_user_token,
+    set_user_claims,
     start_approval,
 )
 from agent.state import AgentState, FlowDecision
@@ -199,27 +199,30 @@ async def _get_compiled_graph() -> Any:
 async def run_query(
     query: str,
     user_id: str,
-    user_token: str,
+    user_claims: dict | None = None,
     task_id: str = "",
     context_id: str = "",
 ) -> dict[str, Any]:
     """Run the governed agent graph for a single query.
 
-    The user token is injected into a ContextVar before the graph runs so it
-    is never stored in AgentState, LangGraph snapshots, or telemetry traces.
+    The user's identity claims are injected into a ContextVar before the graph runs
+    so they are never stored in AgentState, LangGraph snapshots, or telemetry traces.
 
     Args:
         query:       Natural-language query from the user.
-        user_id:     Verified user identifier (from JWT ``sub`` claim).
-        user_token:  Raw bearer token — stored ONLY in the ContextVar.
+        user_id:     Verified authorization principal (token_validator.principal()).
+        user_claims: Minimal VALIDATED identity claims (sub/email/email_verified/iss)
+                     for cross-division forwarding — NOT a bearer token. Only the
+                     originating /query path supplies these; a peer-received query
+                     (no onward forwarding) passes None. Stored ONLY in the ContextVar.
         task_id:     A2A / ANP task identifier; a UUID4 is generated if empty.
         context_id:  Conversation / session identifier.
 
     Returns:
         Dict with at minimum ``answer`` (str) and ``status_message`` (str).
     """
-    # Inject user token into ContextVar — never into state
-    set_user_token(user_token)
+    # Inject the user's identity claims into the ContextVar — never into state
+    set_user_claims(user_claims or {})
 
     initial_state: AgentState = {
         "query": query,

@@ -52,11 +52,22 @@ class Settings(BaseSettings):
     # ── Peer cluster ──────────────────────────────────────────────────────────
     peer_agent_url: AnyHttpUrl | None = None  # type: ignore[assignment]
     peer_agent_did: str = ""          # DID of the peer agent (AgentMesh identity)
+    # SECURITY (signer-specific issuer binding): the Keycloak issuer that the peer
+    # agent (peer_agent_did) is authorised to vouch for. A cross-division user
+    # assertion is accepted ONLY if its `iss` equals this AND the envelope is
+    # DID-signed by peer_agent_did. Binding the issuer to the specific signer (not
+    # to the trusted-issuer SET) is what stops a compromised trusted peer from
+    # asserting ANOTHER division's user. Set by scripts/federate_divisions.py.
+    # (Single outbound peer today; M3 multi-peer generalises this to a DID→issuer map.)
+    peer_agent_issuer: str = ""
 
     # ── LLM ───────────────────────────────────────────────────────────────────
     openai_api_base: str = "https://integrate.api.nvidia.com/v1"
     openai_api_key: str = Field(default=...)  # REQUIRED
-    llm_model: str = "meta/llama-3.3-70b-instruct"
+    # llama-3.1-8b is the default: on NVIDIA NIM's free tier the 70b/3.2-3b models are
+    # frequently throttled to 50-90s+ (or time out) while 3.1-8b answers reliably in
+    # ~1-2s. A self-hosted/paid endpoint (M6) can move back to a larger model.
+    llm_model: str = "meta/llama-3.1-8b-instruct"
     llm_temperature: float = 0.0
     llm_max_tokens: int = 2048
     # NVIDIA NIM (the default endpoint) cold-starts: the FIRST request after idle can

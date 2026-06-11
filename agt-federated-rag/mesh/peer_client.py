@@ -5,8 +5,11 @@ Microsoft Agent Governance Toolkit.
 Transport: a real HTTP POST of a DID-signed message to the peer cluster's
 ``/a2a/query`` endpoint. AgentMesh supplies the *security envelope* (DID identity,
 Ed25519 message signing, registry-backed trust scoring); HTTP is the wire. The
-peer authenticates the call by verifying the Ed25519 signature — no user JWT is
-forwarded — and re-runs its own OpenFGA authorization for the delegated user.
+peer authenticates the call by verifying the Ed25519 signature. The delegated user's
+identity travels as a DID-signed CLAIMS assertion (sub/email/email_verified/iss) —
+NOT the user's raw bearer token (which a compromised peer could replay against the
+user's home division). The peer binds the asserted issuer to this signer and re-runs
+its own OpenFGA authorization for the delegated user.
 
 Real toolkit APIs used here:
   - ``agentmesh.TrustBridge`` (via mesh)  — peer DID verification + trust score.
@@ -104,14 +107,16 @@ async def call_peer_agent(
     user_id: str,
     context_id: str,
     callback_url: str | None = None,
-    user_assertion: str = "",
+    user_assertion: dict | None = None,
 ) -> PeerResponse:
     """
     Send a governed, DID-signed query to the peer agent over HTTP.
 
-    The user_id is carried inside the signed payload so the peer can make its own
-    OpenFGA authorization decision. No raw user JWT is forwarded — the peer
-    trusts the user_id because the message is signed by this agent's verified DID.
+    The user's VALIDATED identity claims (user_assertion: sub/email/email_verified/iss)
+    are carried inside the DID-signed, replay-protected payload so the peer can bind
+    the asserted issuer to this signer and make its own OpenFGA authorization decision.
+    No raw user bearer token is forwarded — so a compromised peer gets no credential it
+    could replay against the user's home division. The plain user_id is diagnostic only.
     """
     if not settings.peer_agent_url:
         raise RuntimeError("No peer agent URL configured")
@@ -164,10 +169,11 @@ async def call_peer_agent(
         # M2: user_id is now diagnostic only — the receiver derives the authoritative
         # identity from the VERIFIABLE user_assertion below, not this string.
         "user_id": user_id,
-        # M2 (FR-3.6): the user's home-division Keycloak token. The receiver validates
-        # it against its trusted-issuer set (cryptographic, not agent-vouched) and
-        # re-authorizes the verified sub via its own OpenFGA.
-        "user_assertion": user_assertion,
+        # M2 (FR-3.6), security-hardened: the user's VALIDATED identity CLAIMS
+        # (sub/email/email_verified/iss) — NOT a raw bearer token. Authenticity +
+        # freshness come from the Ed25519 signature + ts/nonce on this envelope; the
+        # receiver binds `iss` to this signer and re-authorizes via its own OpenFGA.
+        "user_assertion": user_assertion or {},
         "context_id": context_id,
         "callback_url": callback_url,
         "source_cluster": settings.cluster_id,
