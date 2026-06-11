@@ -10,6 +10,7 @@ function seedPassword(division: string): string {
 }
 
 const ALICE_PW = seedPassword('alpha')
+const BOB_PW = seedPassword('beta')
 
 // Drives the ACTUAL rendered React UI in a headless browser against the live divisions
 // (via the Vite proxy) — not the API contract in isolation. Proves the customer-facing
@@ -62,4 +63,49 @@ test('alice gets a federated cross-division answer in the UI', async ({ page }) 
   await expect(answer).toBeVisible({ timeout: 210_000 })
   await expect(answer).toContainText(/\$?48\.3|revenue|Q4/i)
   await expect(page.locator('.badge-green').first()).toBeVisible()
+})
+
+// The full human-in-the-loop governance story, rendered: alice requests data she is NOT
+// cleared for -> her pane parks on "Awaiting approval" -> bob (the data owner) sees the
+// request in HIS pane's inbox and approves -> alice's answer appears automatically.
+test('approval flow: alice requests, bob approves in his inbox, alice gets the answer', async ({ page, request }) => {
+  // SETUP (no UI for this): revoke alice's standing q4 grant so the request must go
+  // through approval. Done via bob's owner-authenticated API token — mirrors an admin
+  // resetting access; keeps the test self-contained and repeatable.
+  const kc = await request.post('http://localhost:9102/realms/rag/protocol/openid-connect/token', {
+    form: { grant_type: 'password', client_id: 'rag-ui', username: 'bob', password: BOB_PW },
+  })
+  const bobToken = (await kc.json()).access_token as string
+  await request.post('http://127.0.0.1:9100/access/revoke', {
+    headers: { Authorization: `Bearer ${bobToken}` },
+    data: { user_email: 'alice@example.com', doc: 'q4_financial_results', home_division: 'alpha' },
+  })
+
+  await page.goto('/')
+  const alicePane = page.locator('.user-pane').nth(0)
+  const bobPane = page.locator('.user-pane').nth(1)
+
+  // Log both users in (each pane independently).
+  await alicePane.locator('input[type="password"]').fill(ALICE_PW)
+  await alicePane.getByRole('button', { name: 'Login' }).click()
+  await bobPane.locator('input[type="password"]').fill(BOB_PW)
+  await bobPane.getByRole('button', { name: 'Login' }).click()
+
+  // alice asks for the now-restricted Q4 data -> her task parks on approval.
+  const aliceChat = alicePane.locator('textarea.chat-input')
+  await expect(aliceChat).toBeVisible({ timeout: 30_000 })
+  await aliceChat.fill('What were the Q4 financial results and revenue?')
+  await alicePane.locator('button.btn-send').click()
+  await expect(alicePane.locator('.badge-yellow')).toBeVisible({ timeout: 210_000 })  // ⏳ Awaiting approval
+
+  // bob's inbox surfaces the request (polls every ~4s); he approves it.
+  const approve = bobPane.locator('.approval-item .btn-approve').first()
+  await expect(approve).toBeVisible({ timeout: 60_000 })
+  await approve.click()
+
+  // Back in alice's pane, the answer is DELIVERED automatically once the grant lands
+  // and her client polls the outcome — no re-typing, no shared browser.
+  const aliceAnswer = alicePane.locator('.bubble-agent').first()
+  await expect(aliceAnswer).toContainText(/\$?48\.3|revenue|Q4/i, { timeout: 210_000 })
+  await expect(alicePane.locator('.badge-green')).toBeVisible()
 })
