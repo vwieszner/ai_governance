@@ -4,6 +4,8 @@ _Last updated: 2026-06-11. Product: Microsoft Agent Governance Toolkit multi-div
 
 Overarching goal (active): 100% functionality, every useful scenario proven working, security 100%, capable of real users. Execute IMPLEMENTATION_PLAN.md milestones M0→M8 + M-GOV + a ≥3-division e2e, production-grade, each with a review gate.
 
+**MILESTONE TALLY (done & proven live): M0, M1, M2 (security-hardened), M5, M6, M8 (+failed-auth auditing) — 6 of ~8 core. REMAINING: M3 (discovery/multi-peer), M4 (offline delivery / A2A push), M7 (mTLS/secrets/IaC), ≥3-division e2e (gamma manifest ready @9200), M-GOV proving tests. M8 security+quality review gate still in flight (teammates security-2/quality-2).** Recent: M6 residency egress guard (commit 3b4774b); M5 lifecycle (revoke+expiry); port root-cause fix (divisions @9000/9100/9200).
+
 ---
 
 ## ✅ DONE & PROVEN — SESSION 2 (all pushed; HEAD = d9ded8f)
