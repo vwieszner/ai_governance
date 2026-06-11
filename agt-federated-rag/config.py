@@ -62,8 +62,12 @@ class Settings(BaseSettings):
     # DID-signed by peer_agent_did. Binding the issuer to the specific signer (not
     # to the trusted-issuer SET) is what stops a compromised trusted peer from
     # asserting ANOTHER division's user. Set by scripts/federate_divisions.py.
-    # (Single outbound peer today; M3 multi-peer generalises this to a DID→issuer map.)
+    # (Legacy single-peer fields; M3 generalises them to peer_trust_map below.)
     peer_agent_issuer: str = ""
+    # M3 multi-peer: JSON {peer_did: {issuer, public_jwk, agent_url, division_id}} — the
+    # data-path trust anchor (see the `peer_trust` property). Set by federate_divisions.py.
+    # Empty → a 1-entry map is synthesised from PEER_AGENT_* (back-compat, one code path).
+    peer_trust_map: str = ""
 
     # ── LLM ───────────────────────────────────────────────────────────────────
     openai_api_base: str = "https://integrate.api.nvidia.com/v1"
@@ -211,6 +215,33 @@ class Settings(BaseSettings):
     @property
     def trusted_peers_list(self) -> list[str]:
         return [s.strip() for s in self.trusted_peers.split(",") if s.strip()]
+
+    @property
+    def peer_trust(self) -> dict:
+        """M3 multi-peer DATA-PATH trust anchor: ``{peer_did: {issuer, public_jwk,
+        agent_url, division_id}}``. This — NOT the open discovery registry — is what a
+        division trusts for cross-division calls: verify_signed_message accepts a signer
+        only if its DID is a key here, and assertion_principal binds the asserted issuer
+        to THIS entry's issuer (per-DID, so a peer can only assert its OWN users).
+
+        ONE code path: if PEER_TRUST_MAP is unset, fall back to a 1-entry map synthesised
+        from the legacy single PEER_AGENT_* config (back-compat), so callers never branch."""
+        import json
+        raw = self.peer_trust_map.strip()
+        if raw:
+            try:
+                m = json.loads(raw)
+                return m if isinstance(m, dict) else {}
+            except Exception:
+                return {}
+        if self.peer_agent_did:
+            return {self.peer_agent_did: {
+                "issuer": self.peer_agent_issuer,
+                "public_jwk": self.peer_agent_public_jwk,
+                "agent_url": str(self.peer_agent_url or ""),
+                "division_id": "",
+            }}
+        return {}
 
     @property
     def trusted_issuers_list(self) -> list[str]:

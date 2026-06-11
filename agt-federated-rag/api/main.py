@@ -702,15 +702,10 @@ async def a2a_query(request: Request) -> JSONResponse:
         )
         raise HTTPException(status_code=403, detail="Peer identity verification failed")
 
-    # The verified signer must be the configured peer.
-    if settings.peer_agent_did and signer_did != settings.peer_agent_did:
-        log.warning(
-            "a2a_query_unexpected_peer_did",
-            signer_did=signer_did,
-            expected_did=settings.peer_agent_did,
-            agt_audit=True,                                          # M8: wrong peer DID
-        )
-        raise HTTPException(status_code=403, detail="Sender DID does not match configured peer")
+    # M3 multi-peer: the signer is already proven to be a TRUSTED peer (its DID is a key
+    # in settings.peer_trust — verify_signed_message rejected otherwise). Resolve THIS
+    # signer's bound issuer from the map for the per-DID assertion binding below.
+    peer_issuer = settings.peer_trust.get(signer_did, {}).get("issuer", "")
 
     # ── Extract the delegated query from the SIGNED payload ──────────────────
     raw_query = payload.get("query", "")
@@ -726,10 +721,12 @@ async def a2a_query(request: Request) -> JSONResponse:
     # DID-signed user-assertion CLAIMS in the (already signature-verified, replay-
     # protected) envelope — NOT a forwarded raw bearer token (which a compromised peer
     # could replay against the user's HOME APIs). The assertion is a claims object; we
-    # bind its issuer to THIS specific signing peer (settings.peer_agent_issuer), so a
-    # compromised-but-trusted peer cannot assert ANOTHER division's user. The identity
-    # WITHIN that signer's namespace is vouched by the DID-authenticated home agent (see
-    # assertion_principal's trust-model note), not re-verified against the home Keycloak.
+    # bind its issuer to THIS specific signing peer (peer_issuer, from the per-DID trust
+    # map), so a compromised-but-trusted peer cannot assert ANOTHER division's user — even
+    # with N trusted peers. The identity WITHIN that signer's namespace is vouched by the
+    # DID-authenticated home agent (see assertion_principal's trust-model note), not
+    # re-verified against the home Keycloak. assertion_principal fails closed if peer_issuer
+    # is empty (a map entry missing its issuer never widens acceptance).
     assertion = payload.get("user_assertion")
     if not isinstance(assertion, dict):
         raise HTTPException(
@@ -737,7 +734,7 @@ async def a2a_query(request: Request) -> JSONResponse:
             detail="Missing cross-division user assertion — identity required",
         )
     try:
-        user_id = assertion_principal(assertion, settings.peer_agent_issuer)
+        user_id = assertion_principal(assertion, peer_issuer)
     except Exception as exc:
         log.warning("a2a_query_assertion_invalid", error=str(exc), agt_audit=True)  # M8
         raise HTTPException(status_code=401, detail="Invalid cross-division user assertion")
@@ -766,6 +763,7 @@ async def a2a_query(request: Request) -> JSONResponse:
             query=raw_query,
             user_id=user_id,
             user_claims=None,     # single-hop: nothing to forward onward
+            allow_remote=False,   # M3 loop guard: a peer-originated query must not re-delegate
             task_id=task_id,
             context_id=context_id,
         )
@@ -883,16 +881,8 @@ async def task_callback(
         )
         raise HTTPException(status_code=403, detail="Peer identity verification failed")
 
-    # The verified signer must be the configured peer.
-    if settings.peer_agent_did and sender_did != settings.peer_agent_did:
-        log.warning(
-            "callback_unexpected_peer_did",
-            task_id=task_id,
-            sender_did=sender_did,
-            expected_did=settings.peer_agent_did,
-            agt_audit=True,                                          # M8: wrong callback peer DID
-        )
-        raise HTTPException(status_code=403, detail="Sender DID does not match configured peer")
+    # M3 multi-peer: the signer is already proven TRUSTED (its DID is in settings.peer_trust
+    # — verify_signed_message rejected otherwise), so no separate single-peer DID check.
 
     # ── Finding #5: enforce the AGT policy engine on the inbound callback ────
     # peer.receive_callback was previously enforced only inside the LangGraph

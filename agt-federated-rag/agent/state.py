@@ -85,5 +85,9 @@ class AgentState(TypedDict):
     peer_task_id: str | None                # task ID on the remote peer cluster
     peer_status: str | None                 # AGT PeerResponse.status string
 
+    # M3 loop guard: False for peer-originated queries so check_auth never re-delegates
+    # to another peer (no A->B->A loops, no forward-empty-claims 401).
+    allow_remote: bool
+
     # ── Diagnostics ───────────────────────────────────────────────────────────
     error: str | None                       # internal error — never surfaced raw to user

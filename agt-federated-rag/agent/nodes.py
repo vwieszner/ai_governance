@@ -359,7 +359,7 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         # No local data. Classify intent before paying for a federated round-trip:
         # company-data questions go to the peer; general chit-chat is answered here.
         flow = FlowDecision.LOCAL_DENIED
-        if not fused and settings.peer_agent_url:
+        if not fused and settings.peer_agent_url and state.get("allow_remote", True):
             flow = FlowDecision.REMOTE
             try:
                 intent_llm = await _get_intent_llm()
@@ -420,7 +420,7 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         flow = FlowDecision.LOCAL_NEEDS_APPROVAL
     elif allowed:
         flow = FlowDecision.LOCAL_ALLOWED
-    elif not local_results_exist and settings.peer_agent_url:
+    elif not local_results_exist and settings.peer_agent_url and state.get("allow_remote", True):
         # MED-4: no local data at all — ask peer, but first check intent so
         # conversational queries get an instant response instead of a 16s
         # round-trip through two clusters and two LLM calls.

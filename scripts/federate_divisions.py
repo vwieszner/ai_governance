@@ -189,21 +189,34 @@ def federate(only: list[str] | None, dry_run: bool) -> int:
         if peers:
             primary = by_id[peers[0]]
             did, jwk = primary.did_jwk()
+            # M3 multi-peer DATA-PATH trust anchor: {peer_did: {issuer, public_jwk,
+            # agent_url, division_id}} for EVERY trusted peer. verify_signed_message accepts
+            # a signer only if its DID is a key here, and assertion_principal binds the
+            # asserted issuer to THAT entry's issuer (per-DID — so a peer can only assert its
+            # OWN users, even at N>1). This is the trust anchor, NOT the open discovery registry.
+            trust_map = {}
+            for p in peers:
+                pdid, pjwk = by_id[p].did_jwk()
+                # did.json's jwk is itself JSON-encoded, so did_jwk() returns a string;
+                # unwrap fully to a dict so the map stores ONE clean object (no double
+                # encoding) — from_jwk takes a dict.
+                while isinstance(pjwk, str):
+                    pjwk = json.loads(pjwk)
+                trust_map[pdid] = {"issuer": by_id[p].issuer, "public_jwk": pjwk,
+                                   "agent_url": by_id[p].agent_url, "division_id": p}
             updates = {
+                # Legacy single-peer fields kept for back-compat (= the first trusted peer).
                 "PEER_AGENT_URL": primary.agent_url,
                 "PEER_AGENT_DID": did,
                 "PEER_AGENT_PUBLIC_JWK": jwk,
-                # SECURITY: bind the outbound peer's issuer to its DID, so a DID-signed
-                # cross-division assertion is accepted only if its `iss` matches THIS
-                # peer's issuer (api/main.py assertion_principal). Not the trusted-issuer
-                # set — that would let a compromised peer assert another division's user.
                 "PEER_AGENT_ISSUER": primary.issuer,
                 "TRUSTED_ISSUERS": ",".join(by_id[p].issuer for p in peers),
+                "PEER_TRUST_MAP": json.dumps(trust_map, separators=(",", ":")),
             }
             for ch in _upsert_env(f.env_path, updates, dry_run):
                 log(ch)
             if len(peers) > 1:
-                log(f"  NOTE outbound peer = '{peers[0]}' only (single-peer config; M3 = multi-peer)")
+                log(f"  multi-peer trust map: {len(trust_map)} peers ({', '.join(peers)})")
         # cross-grants land in THIS division's store
         asyncio.run(_apply_cross_grants(f, by_id, dry_run))
 

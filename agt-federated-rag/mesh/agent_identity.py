@@ -223,25 +223,27 @@ async def get_mesh() -> AgentMeshClient:
 
 
 def _build_identity_registry(self_identity: AgentIdentity) -> IdentityRegistry:
-    """Build a local IdentityRegistry holding THIS agent and the configured peer.
+    """Build a local IdentityRegistry holding THIS agent and EVERY trusted peer.
 
-    The AgentMesh trust handshake resolves peer DIDs (and their authoritative
-    trust score / capabilities) from an IdentityRegistry — without one, every
-    peer is rejected ("no IdentityRegistry configured"). In a federation the two
-    clusters trust each other out-of-band: each registers itself plus the peer,
-    where the peer identity is reconstructed from the trusted public JWK that the
-    operator copied from the peer's GET /identity endpoint into PEER_AGENT_PUBLIC_JWK.
+    The AgentMesh trust handshake resolves peer DIDs (and their authoritative trust
+    score) from an IdentityRegistry. M3 multi-peer: register every peer in the
+    trusted-peers map (settings.peer_trust) — each reconstructed from its trusted public
+    JWK — so the trust-score gate (verify_peer_identity) works for any of N trusted peers,
+    not just one. (In single-peer deployments the map is the 1-entry PEER_AGENT_* map.)
     """
     reg = IdentityRegistry(require_attestation=False)
     reg.register(self_identity)
-    if settings.peer_agent_public_jwk:
+    for did, entry in settings.peer_trust.items():
+        jwk = entry.get("public_jwk")
+        if not jwk:
+            continue
         try:
-            peer_jwk = json.loads(settings.peer_agent_public_jwk)
+            peer_jwk = json.loads(jwk) if isinstance(jwk, str) else jwk
             peer_identity = AgentIdentity.from_jwk(peer_jwk)
             reg.register(peer_identity)
             log.info("peer_identity_registered", peer_did=str(peer_identity.did))
         except Exception as exc:  # noqa: BLE001 — bad/missing peer JWK must not crash startup
-            log.warning("peer_identity_register_failed", error=str(exc))
+            log.warning("peer_identity_register_failed", peer_did=did, error=str(exc))
     return reg
 
 
@@ -325,28 +327,31 @@ async def verify_signed_message(payload: dict[str, Any]) -> tuple[bool, str | No
         log.warning("inbound_message_incomplete_envelope")
         return False, None
 
-    # Resolve the peer's PUBLIC key from trusted config — not from the message.
-    if not settings.peer_agent_public_jwk:
-        log.error("verify_signed_message_no_peer_jwk_configured")
+    # M3 multi-peer: resolve the signer's PUBLIC key from the trusted-peers MAP (config)
+    # keyed by the claimed DID — NEVER from the message body. A DID that is not a key in
+    # the map is an UNTRUSTED peer → reject. This single membership check is THE data-path
+    # trust decision and covers every caller of verify_signed_message (/a2a/query AND
+    # /tasks/callback) uniformly. (The map is a 1-entry PEER_AGENT_* map in single-peer
+    # deployments — one code path, no single-peer branch.)
+    entry = settings.peer_trust.get(sender_did)
+    if not entry or not entry.get("public_jwk"):
+        log.warning("verify_signed_message_untrusted_peer", sender_did=sender_did)
         return False, None
     try:
-        peer_jwk = json.loads(settings.peer_agent_public_jwk)
+        raw_jwk = entry["public_jwk"]
+        peer_jwk = json.loads(raw_jwk) if isinstance(raw_jwk, str) else raw_jwk
         peer_identity = AgentIdentity.from_jwk(peer_jwk)
     except Exception as exc:  # noqa: BLE001 — bad/missing config must fail closed
         log.warning("verify_signed_message_bad_peer_jwk", error=str(exc))
         return False, None
 
-    # The configured peer key must belong to the DID claimed in the envelope,
-    # and (if a peer DID is configured) to the expected peer.
+    # The trusted key must derive the claimed DID (key/DID binding) — kept from single-peer.
     if str(peer_identity.did) != sender_did:
         log.warning(
             "verify_signed_message_did_mismatch",
             claimed=sender_did,
             configured_key_did=str(peer_identity.did),
         )
-        return False, None
-    if settings.peer_agent_did and sender_did != settings.peer_agent_did:
-        log.warning("verify_signed_message_unexpected_peer", claimed=sender_did)
         return False, None
 
     try:

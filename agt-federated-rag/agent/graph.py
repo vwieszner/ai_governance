@@ -202,6 +202,7 @@ async def run_query(
     user_claims: dict | None = None,
     task_id: str = "",
     context_id: str = "",
+    allow_remote: bool = True,
 ) -> dict[str, Any]:
     """Run the governed agent graph for a single query.
 
@@ -243,6 +244,10 @@ async def run_query(
         "peer_task_id": None,
         "peer_status": None,
         "error": None,
+        # M3 loop guard: a peer-originated query (allow_remote=False) must NOT re-delegate
+        # to another peer — that would forward empty claims (-> downstream 401) and allow
+        # A->B->A loops. Suppress the REMOTE branch in check_auth for such queries.
+        "allow_remote": allow_remote,
     }
 
     log.info("agent_graph_invoked", user_id=user_id, task_id=initial_state["task_id"])
