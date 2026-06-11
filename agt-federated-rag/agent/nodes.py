@@ -851,6 +851,17 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
 
     if peer_status == "completed":
         raw_answer = state.get("peer_answer") or ""
+        if state.get("check_only"):
+            # Approval-outcome poll: the peer already GENERATED a full answer. Deliver it
+            # directly and skip the relay LLM — that second (cold-start-prone) model call
+            # is what made post-approval delivery slow for the requester. The poll's job is
+            # to deliver the approved answer fast, not to re-narrate it.
+            return {
+                "answer": raw_answer,
+                "peer_answer": raw_answer,
+                "flow": FlowDecision.REMOTE_APPROVED,
+                "status_message": "completed",
+            }
         try:
             llm = await _get_llm()
             prompt = (

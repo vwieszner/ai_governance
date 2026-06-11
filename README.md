@@ -71,6 +71,45 @@ Then open **http://localhost:5173** — alice on the left (cluster-a `:8010`), b
 > After re-running `setup_agt.py` (which creates a fresh OpenFGA store id), restart the backends so
 > they pick it up: `.\scripts\clusters.ps1 restart agt-a agt-b`.
 
+## Per-division deployment (Infrastructure-as-Code)
+
+The production topology is one **physically-isolated stack per division** (its own Postgres,
+OpenFGA, Keycloak realm, Temporal, Qdrant, Redis, DID, and ports) — not a shared backend. A
+division is declared by a manifest and stood up with **no source edits**:
+
+```powershell
+# 1. Declare the division — infra/divisions/<id>.yml (declarative; see alpha/beta/gamma):
+#      division_id, port_base, trusted_peers, docs_dir, residency_mode,
+#      seed_viewer / seed_approval / cross_grants (per-chunk authz seed)
+# 2. Render + stand up the whole stack from infra/division-stack.template.yml and provision it
+#    (Keycloak realm + rag-ui client + users, OpenFGA store/model + authz tuples, Ed25519 DID,
+#    document ingest). Idempotent.
+.venv\Scripts\python.exe scripts\onboard_division.py infra\divisions\alpha.yml
+.venv\Scripts\python.exe scripts\onboard_division.py infra\divisions\beta.yml
+#    --dry-run renders configs only (no docker/network — CI-safe); --teardown = down -v + cleanup;
+#    --force rotates secrets. Colliding port_bases are rejected (see _reserved_ports).
+
+# 3. Cross-wire the federation (peer DIDs + issuers + the per-DID trust map, both directions):
+.venv\Scripts\python.exe scripts\federate_divisions.py --only alpha beta
+
+# 4. Run each division's agent + Temporal worker, and check health:
+.\scripts\clusters.ps1 start all
+.\scripts\clusters.ps1 status all
+```
+
+Ports derive from `port_base` so divisions never clash (alpha **9000**, beta **9100**, gamma **9200**):
+`agent=base, openfga=+1, keycloak=+2, temporal=+3/+4, qdrant=+5, redis=+6`. Per-division secrets live
+in `infra/generated/<id>/` (gitignored). The compose template + manifests + `onboard_division.py` are
+the IaC; `tests/test_onboarding.py` unit-tests the pure rendering/port-derivation helpers, and three
+divisions (alpha/beta/gamma) are stood up this way.
+
+> **LLM latency note (real-user readiness).** The agent talks to any OpenAI-compatible endpoint via
+> `OPENAI_API_BASE`/`OPENAI_API_KEY`. On a free/shared tier (e.g. NVIDIA NIM) the FIRST call after idle
+> cold-starts (tens of seconds); steady-state is ~1–3 s. For production, point `OPENAI_API_BASE` at a
+> provisioned/always-warm or self-hosted endpoint (`residency_mode: local` keeps inference in-boundary).
+> The approval-outcome poll is LLM-free while pending and skips answer re-narration on delivery, so only
+> the one answer-generation call is on the critical path.
+
 ## The governance flows
 
 - **Local authorized** — alice asks; data is in her cluster and she's allowed; immediate answer.
