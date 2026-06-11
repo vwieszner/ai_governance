@@ -6,7 +6,22 @@ Overarching goal (active): 100% functionality, every useful scenario proven work
 
 ---
 
-## ✅ DONE & PROVEN this session (all pushed to origin/main; HEAD = e6ddf29)
+## ✅ DONE & PROVEN — SESSION 2 (all pushed; HEAD = d9ded8f)
+
+- **Review team** (`agt-fed`): security + quality teammates reviewed M2. Security review found a real VULN (below); re-reviewed the fix → CONFIRMED CLOSED.
+- **SECURITY — assertion-relay replay VULN FIXED (Option A, commit 96d207b).** M2 was forwarding the user's RAW home token as the assertion → a compromised receiving division could replay it at the user's home division. Fix: forward only DID-signed VALIDATED claims (sub/email/email_verified/iss), never a bearer token; receiver binds the asserted `iss` to the SPECIFIC signing peer (`settings.peer_agent_issuer` / `PEER_AGENT_ISSUER`, set by federate) — not the trusted-issuer set (which would let a compromised peer assert another division's user). `validate_peer_user_assertion`+peer-JWKS removed; raw-token ContextVar → claims ContextVar. `token_validator.assertion_principal()`. Trust model is now honest: in-namespace identity is VOUCHED by the DID-authenticated peer (Keycloak can't mint a receiver-audience token); cross-issuer impersonation stays blocked + tested. memory: [[m2-assertion-relay-vuln]].
+- **Cross-division APPROVAL (Step 1) PROVEN** — pending_approval cross_grant (beta.yml) routes a peer-division user to approval; bob@beta approves via HMAC deep-link → workflow grants the cross-principal viewer → re-send → real answer. No check_auth change (advisor-rejected denied-owned routing).
+- **Full cross-division matrix PROVEN** on the secure mechanism: IMMEDIATE (tech_arch viewer → answer), DENIED (security_incidents, no cross-grant → no leak), APPROVAL (q4 → pending→approve→answer "$48.3M"). Beta now has 3 docs.
+- **LLM → meta/llama-3.1-8b-instruct** (config default + intent model). NVIDIA free-tier 70b/3.2-3b were throttled to 50-90s+/timeouts; 8b answers in ~1-2s. (M6 self-host can move back up.)
+- **Approval-grant bug fix** (prior session, commit e6ddf29) — worker OpenFGA client was uninitialised; every approved user was silently denied. Fixed + proven.
+- 36 tests pass. Commits this session: `96d207b` (Option A), `10abf5c` (cross_grant), `d9ded8f` (docs-honesty + denial doc).
+
+### Current live state
+- alpha: port_base **8400** (agent 8400 / openfga 8401 / kc-issuer 8402); beta: **8200** (8201 / 8202). gamma 8300 not onboarded.
+- Both agents run via `clusters.ps1`; both healthy at session end. After any agent restart, cross-division needs the `.env` `PEER_AGENT_ISSUER` (set by `federate_divisions.py`) — re-run federate if 401s appear.
+- KNOWN ENV: Docker control-plane is sluggish here (many foreign stacks) — `docker compose up` can hang; division *services* are fine via direct 127.0.0.1 HTTP. NVIDIA endpoints flaky (use 8b).
+
+## ✅ DONE & PROVEN — SESSION 1 (pushed; HEAD was e6ddf29)
 
 Commits `c4cd7de..e6ddf29`:
 - `f5d1902` M2 integration — `/a2a/query` enforces the verifiable user assertion (not a bare user_id).
