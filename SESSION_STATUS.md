@@ -15,6 +15,7 @@ Overarching goal (active): 100% functionality, every useful scenario proven work
 - **LLM → meta/llama-3.1-8b-instruct** (config default + intent model). NVIDIA free-tier 70b/3.2-3b were throttled to 50-90s+/timeouts; 8b answers in ~1-2s. (M6 self-host can move back up.)
 - **Approval-grant bug fix** (prior session, commit e6ddf29) — worker OpenFGA client was uninitialised; every approved user was silently denied. Fixed + proven.
 - 36 tests pass. Commits this session: `96d207b` (Option A), `10abf5c` (cross_grant), `d9ded8f` (docs-honesty + denial doc).
+- **M8 — tamper-evident hash-chained audit (commit a825116).** `audit_log.py`: every `agt_audit=True` event is appended to an append-only hash chain (`hash=SHA256(seq|ts|event|canonical(data)|prev_hash)`); recompute detects tamper/delete/reorder/truncate. Captured DRY via a structlog processor (format preserved). Per-(division,role) chains (agent+worker = separate processes → no write race). `scripts/verify_audit.py` CLI; 6 tests. PROVEN live: alice@alpha query → 3-entry linked chain, verify OK; forged entry in a copy → "hash mismatch — entry tampered". 42 tests pass. AWAITING security+quality review gate. (Worker chain uses identical code; populates on the next approval grant.)
 
 ### Current live state
 - alpha: port_base **8400** (agent 8400 / openfga 8401 / kc-issuer 8402); beta: **8200** (8201 / 8202). gamma 8300 not onboarded.
