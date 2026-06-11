@@ -104,3 +104,18 @@ def test_revoked_cert_detected(pki):
 def test_cert_identifies_division(pki):
     cn = pki["client_cert"].subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
     assert cn == "beta"
+
+
+def test_mtls_holds_under_truststore_injection(pki):
+    """The app calls truststore.inject_into_ssl() (verify against the OS trust store).
+    A federation cert is signed by our PRIVATE CA — absent from any OS store — so the
+    contexts must build genuine stdlib SSLContexts that honour our loaded CA regardless.
+    Pin it: with truststore injected, a CA-signed mTLS handshake must STILL succeed."""
+    truststore = pytest.importorskip("truststore")
+    truststore.inject_into_ssl()
+    try:
+        sctx = mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"])
+        good = mtls.client_context(pki["ca"], pki["c_crt"], pki["c_key"])
+        assert _handshake_ok(sctx, good) is True
+    finally:
+        truststore.extract_from_ssl()

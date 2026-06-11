@@ -15,6 +15,7 @@ existing deployments are unaffected); the machinery + its proofs are independent
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import ssl
 from dataclasses import dataclass
@@ -43,6 +44,34 @@ class CertPair:
         # won't anchor a bare leaf to a separately-loaded root during the handshake.
         cp.write_bytes(self.cert_pem + self.ca_cert_pem)
         return str(cp), str(kp)
+
+
+@contextlib.contextmanager
+def _genuine_ssl():
+    """Run the enclosed block with the GENUINE stdlib ``ssl.SSLContext`` in effect.
+
+    The app (api.main, workflow.worker) calls ``truststore.inject_into_ssl()``, which
+    rebinds ``ssl.SSLContext`` to verify against the OPERATING SYSTEM trust store and
+    IGNORE ``load_verify_locations`` — correct for outbound TLS to public endpoints, but
+    WRONG for federation mTLS (a division cert is signed by our PRIVATE CA, absent from
+    any OS store). We can't merely construct a genuine context: truststore rebinds the
+    ``ssl.SSLContext`` MODULE GLOBAL, and the stdlib ``verify_mode`` setter does
+    ``super(SSLContext, SSLContext)`` against that global → infinite recursion when set
+    while truststore is active. So we extract truststore (its own public API) for the whole
+    build+configure, then re-inject so the rest of the process is unaffected.
+    """
+    try:
+        import truststore
+        injected = ssl.SSLContext is getattr(truststore, "SSLContext", None)
+    except Exception:
+        injected = False
+    if injected:
+        truststore.extract_from_ssl()
+    try:
+        yield
+    finally:
+        if injected:
+            truststore.inject_into_ssl()
 
 
 def _now() -> datetime.datetime:
@@ -112,10 +141,11 @@ def is_revoked(cert: x509.Certificate, crl: x509.CertificateRevocationList) -> b
 def server_context(cert_path: str, key_path: str, ca_path: str) -> ssl.SSLContext:
     """Server SSL context that REQUIRES a client certificate signed by our CA (mTLS).
     (check_hostname is a client-side setting; not applicable on a server context.)"""
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(cert_path, key_path)
-    ctx.load_verify_locations(ca_path)
-    ctx.verify_mode = ssl.CERT_REQUIRED          # no client cert → handshake rejected
+    with _genuine_ssl():
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert_path, key_path)
+        ctx.load_verify_locations(ca_path)
+        ctx.verify_mode = ssl.CERT_REQUIRED      # no client cert → handshake rejected
     return ctx
 
 
@@ -125,9 +155,10 @@ def client_context(ca_path: str, cert_path: str | None = None, key_path: str | N
     carries `localhost` + the division_id, so a real connect with the right server_hostname
     passes) — never disable it in production: that would allow a MITM with any CA-signed
     cert to impersonate the peer. The data-path DID signature is defence-in-depth on top."""
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.load_verify_locations(ca_path)
-    ctx.check_hostname = verify_hostname
-    if cert_path and key_path:
-        ctx.load_cert_chain(cert_path, key_path)
+    with _genuine_ssl():
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(ca_path)
+        ctx.check_hostname = verify_hostname
+        if cert_path and key_path:
+            ctx.load_cert_chain(cert_path, key_path)
     return ctx

@@ -40,6 +40,12 @@ export function ChatArea({ cluster, user, token, onEvent, onLogout }: Props) {
   // releasing any answer.
   const tasksRef = useRef(tasks)
   useEffect(() => { tasksRef.current = tasks }, [tasks])
+  // Tasks whose poll is still in flight. The moment a grant lands, the COMPLETING poll
+  // re-runs the cross-division pipeline (peer LLM generate + local relay) and can take
+  // many seconds, during which the task is still 'input-required'. Without this guard the
+  // 4s interval would stack dozens of overlapping polls, each kicking a fresh peer LLM
+  // generation — a thundering herd against the throttled model. Skip a task already polling.
+  const inFlightRef = useRef<Set<string>>(new Set())
   const hasPending = tasks.some((t) => t.state === 'input-required')
   useEffect(() => {
     if (!hasPending) return
@@ -48,7 +54,11 @@ export function ChatArea({ cluster, user, token, onEvent, onLogout }: Props) {
       for (const t of pending) {
         // Poll the SERVER's task id (the backend ignores the client-generated one);
         // fall back to t.id only if the result event hasn't landed yet.
-        pollApprovalResult(cluster, token, t.serverTaskId ?? t.id)
+        const pollId = t.serverTaskId ?? t.id
+        if (inFlightRef.current.has(pollId)) continue
+        inFlightRef.current.add(pollId)
+        pollApprovalResult(cluster, token, pollId)
+          .finally(() => inFlightRef.current.delete(pollId))
           .then((r) => {
             if (r.status === 'completed') {
               upsertTask({ ...t, state: 'completed', answer: r.answer || '', statusMessage: 'Approved', updatedAt: new Date() })

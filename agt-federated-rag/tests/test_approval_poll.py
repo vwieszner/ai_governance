@@ -68,3 +68,57 @@ def test_normal_path_still_runs_the_policy_gate(monkeypatch):
         asyncio.run(nodes.start_approval(_state(check_only=False)))
 
     assert hit["enforce"], "the first real approval request must still hit the policy gate"
+
+
+# ── GET /tasks/{id}/result — ownership (IDOR) guard ───────────────────────────
+#
+# The result endpoint is the ONLY authenticated read of a parked request's outcome.
+# Its single access control is "the caller's namespaced principal must own the task".
+# A same-division IDOR isn't constructible from the seed data (only alice@alpha +
+# bob@beta, who fail at issuer validation cross-division), so the ownership branch is
+# pinned here as a unit test: it must 403 BEFORE re-running the pipeline (no Redis/LLM).
+
+_OWNER = "alice@example.com|aaaaaaaaaaaaaaaa"
+_OTHER = "mallory@example.com|bbbbbbbbbbbbbbbb"
+_CLAIMS = {"sub": "kc-uuid", "email": "alice@example.com", "email_verified": True,
+           "iss": "http://localhost:9002/realms/rag"}
+
+
+def test_task_result_rejects_non_owner_403(monkeypatch):
+    from api import main
+
+    async def fake_bearer(auth):
+        return ("tok", _CLAIMS)
+
+    async def fake_load(task_id):
+        return {"_owner_id": _OTHER, "query_full": "q4 revenue"}   # owned by someone ELSE
+
+    async def boom_run_query(**kw):
+        raise AssertionError("ownership must be enforced BEFORE any pipeline re-run")
+
+    monkeypatch.setattr(main, "_get_bearer_token", fake_bearer)
+    monkeypatch.setattr(main, "_load_task", fake_load)
+    monkeypatch.setattr(main, "principal", lambda claims: _OWNER)   # caller != owner
+    monkeypatch.setattr(main.agent_graph, "run_query", boom_run_query)
+
+    with pytest.raises(main.HTTPException) as ei:
+        asyncio.run(main.task_result("task-1", authorization="Bearer tok"))
+    assert ei.value.status_code == 403
+
+
+def test_task_result_unknown_task_404(monkeypatch):
+    from api import main
+
+    async def fake_bearer(auth):
+        return ("tok", _CLAIMS)
+
+    async def fake_load(task_id):
+        return None                                                # no such task
+
+    monkeypatch.setattr(main, "_get_bearer_token", fake_bearer)
+    monkeypatch.setattr(main, "_load_task", fake_load)
+    monkeypatch.setattr(main, "principal", lambda claims: _OWNER)
+
+    with pytest.raises(main.HTTPException) as ei:
+        asyncio.run(main.task_result("nope", authorization="Bearer tok"))
+    assert ei.value.status_code == 404
