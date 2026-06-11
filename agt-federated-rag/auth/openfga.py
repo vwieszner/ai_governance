@@ -325,6 +325,12 @@ class OpenFGAAuth:
         """Grant VIEWER relation to user_id on chunk_id."""
         await self._write_tuple(user_id, chunk_id, Relation.VIEWER)
 
+    async def revoke_viewer(self, user_id: str, chunk_id: str) -> None:
+        """Revoke VIEWER relation (M5/FR-7.2). Idempotent — a missing tuple (404) is a
+        no-op. After revocation the user has no standing access; a re-ask re-enters the
+        governed pipeline (and approval if the doc is owner-gated) — no stale reuse (D-6)."""
+        await self._delete_tuple(user_id, chunk_id, Relation.VIEWER)
+
     async def set_pending_approval(self, user_id: str, chunk_id: str) -> None:
         """Set PENDING_APPROVAL relation for user_id on chunk_id."""
         await self._write_tuple(user_id, chunk_id, Relation.PENDING_APPROVAL)

@@ -54,6 +54,7 @@ import mesh.agent_identity as agent_identity
 from auth.token_validator import (
     AuthServiceUnavailable,
     assertion_principal,
+    issuer_namespace,
     minimal_assertion_claims,
     principal,
     validate_token,
@@ -1111,6 +1112,86 @@ async def authenticated_approval(
 
     log.info("authenticated_approval_recorded", decision=decision, agt_audit=True)
     return JSONResponse(content={"status": "recorded"}, status_code=200)
+
+
+# ── POST /access/revoke ───────────────────────────────────────────────────────
+
+async def _chunks_for_doc(title: str) -> list[str]:
+    """Resolve a document title to its chunk_ids in THIS division's Qdrant."""
+    import httpx
+    url = f"{str(settings.qdrant_url).rstrip('/')}/collections/{settings.qdrant_collection}/points/scroll"
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(url, json={"limit": 512, "with_payload": True, "with_vector": False})
+        r.raise_for_status()
+        out: list[str] = []
+        for pt in r.json().get("result", {}).get("points", []):
+            pl = pt.get("payload", {})
+            t = pl.get("title") or (pl.get("metadata") or {}).get("title", "")
+            cid = pl.get("chunk_id", "")
+            if t == title and cid:
+                out.append(cid)
+        return out
+
+
+@app.post("/access/revoke")
+async def revoke_access(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """M5 / FR-7.2: a data OWNER revokes a user's access to one of their documents.
+
+    Removes the VIEWER grant and re-sets PENDING_APPROVAL, so the user has no standing
+    access and a re-ask re-enters the approval flow — no stale reuse (D-6). The caller's
+    JWT is the credential; the backend verifies the caller is the document's owner
+    (OpenFGA `owner` relation) before revoking. Audited (agt_audit).
+
+    Body: ``{"user_email": "...", "doc": "<title>", "home_division": "<id>"?}``.
+    ``home_division`` (optional) namespaces the target principal to a peer division's
+    issuer; default is this division (a local user).
+    """
+    _, claims = await _get_bearer_token(authorization)
+    caller = principal(claims)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body must be valid JSON")
+    target_email = str(body.get("user_email", "")).strip().lower()
+    doc = str(body.get("doc", "")).strip()
+    home_division = str(body.get("home_division", "")).strip()
+    if not (target_email and doc):
+        raise HTTPException(status_code=400, detail="'user_email' and 'doc' are required")
+
+    # Target principal — namespaced by the target's HOME issuer (this division by
+    # default; the configured peer's issuer for a federated cross-division user).
+    if home_division and home_division != settings.division_id:
+        home_iss = settings.peer_agent_issuer
+        if not home_iss:
+            raise HTTPException(status_code=400,
+                                detail="cross-division revoke requires a federated peer issuer")
+    else:
+        home_iss = str(settings.oidc_issuer)
+    target = f"{target_email}|{issuer_namespace(home_iss)}"
+
+    chunk_ids = await _chunks_for_doc(doc)
+    if not chunk_ids:
+        raise HTTPException(status_code=404, detail=f"document '{doc}' not found in this division")
+
+    auth = await agent_nodes._get_openfga()
+    owner = await auth.get_chunk_owner(chunk_ids[0])
+    if owner != caller:
+        # Authorization-bypass attempt — high-signal audit.
+        log.warning("access_revoke_forbidden_not_owner", doc=doc, agt_audit=True)
+        raise HTTPException(status_code=403,
+                            detail="Only the data owner may revoke access to this document")
+
+    for cid in chunk_ids:
+        await auth.revoke_viewer(target, cid)
+        await auth.set_pending_approval(target, cid)   # re-ask re-enters approval (D-6)
+    log.info("access_revoked", target=target, doc=doc, chunks=len(chunk_ids),
+             by=caller, agt_audit=True)
+    return JSONResponse(content={"status": "revoked", "doc": doc, "chunks": len(chunk_ids)},
+                        status_code=200)
 
 
 # ── Exception handlers ────────────────────────────────────────────────────────
