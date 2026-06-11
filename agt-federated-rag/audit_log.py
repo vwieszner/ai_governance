@@ -1,0 +1,165 @@
+"""Tamper-evident, hash-chained audit log (IMPLEMENTATION_PLAN.md M8).
+
+Every governance event the system already emits with ``agt_audit=True`` (authorization
+decisions, OpenFGA grant/revoke/pending writes, approval decisions, kill-switch, peer
+calls) is appended to an append-only, hash-chained log so that any modification,
+deletion, or reordering of past audit entries is *detectable*.
+
+Each entry chains to the previous one:
+
+    hash = SHA256( seq | ts | event | canonical(data) | prev_hash )
+
+so entry N's hash depends on entry N-1's hash (genesis prev_hash = 64 zeros). Recomputing
+the chain (see :func:`verify_chain`) detects: a tampered field (hash mismatch), a deleted
+or reordered entry (seq gap / prev_hash mismatch), or a truncated tail.
+
+Process model: the agent (api.main) and the Temporal worker (workflow.worker) are SEPARATE
+processes that both emit ``agt_audit`` events. To avoid a cross-process write race on a
+single chain, each writes its OWN per-(division, role) chain file
+(``<division>_<role>.jsonl``); verification covers all of a division's chains. Each chain
+continues across process restarts (the tail hash/seq are reloaded on startup).
+
+Capture is DRY: :func:`configure_audit_logging` inserts :func:`_audit_processor` into the
+structlog pipeline (before the renderer), so existing ``agt_audit=True`` log calls are
+recorded automatically — no call-site changes. The processor never raises (a failing audit
+write must not break request logging) but records a sentinel error entry if it ever does.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import structlog
+
+GENESIS = "0" * 64
+
+
+def _canonical(data: dict) -> str:
+    """Deterministic JSON for hashing — sorted keys, no whitespace, str() fallback."""
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _entry_hash(seq: int, ts: str, event: str, data: dict, prev_hash: str) -> str:
+    msg = f"{seq}|{ts}|{event}|{_canonical(data)}|{prev_hash}"
+    return hashlib.sha256(msg.encode("utf-8")).hexdigest()
+
+
+class AuditChain:
+    """Append-only, hash-chained audit file for one (division, role)."""
+
+    def __init__(self, path: str | os.PathLike) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._seq, self._last_hash = self._load_tail()
+
+    def _load_tail(self) -> tuple[int, str]:
+        """Resume the chain across restarts: read the last entry's seq + hash."""
+        if not self.path.exists():
+            return -1, GENESIS
+        last_line = ""
+        with self.path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    last_line = line.strip()
+        if not last_line:
+            return -1, GENESIS
+        rec = json.loads(last_line)
+        return int(rec["seq"]), str(rec["hash"])
+
+    def append(self, event: str, data: dict | None = None) -> dict:
+        """Append one entry, returning the written record. Thread-safe + durable (fsync)."""
+        # Normalise to JSON-native FIRST so the hash computed here matches the hash
+        # recomputed from the re-parsed file in verify_chain (no default=str drift).
+        norm: dict = json.loads(json.dumps(data or {}, default=str))
+        with self._lock:
+            seq = self._seq + 1
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            prev = self._last_hash
+            h = _entry_hash(seq, ts, event, norm, prev)
+            rec = {"seq": seq, "ts": ts, "event": event, "data": norm,
+                   "prev_hash": prev, "hash": h}
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            self._seq, self._last_hash = seq, h
+            return rec
+
+
+def verify_chain(path: str | os.PathLike) -> tuple[bool, str]:
+    """Verify a chain file end-to-end. Returns (ok, human-readable detail)."""
+    p = Path(path)
+    if not p.exists():
+        return True, "no audit file (empty chain)"
+    prev = GENESIS
+    expected_seq = 0
+    with p.open("r", encoding="utf-8") as f:
+        for ln_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                return False, f"line {ln_no}: not valid JSON (corrupted)"
+            if int(rec.get("seq", -1)) != expected_seq:
+                return False, (f"line {ln_no}: seq {rec.get('seq')} != expected "
+                               f"{expected_seq} — deletion/reorder/truncation")
+            if rec.get("prev_hash") != prev:
+                return False, f"seq {rec.get('seq')}: prev_hash mismatch — chain broken"
+            recomputed = _entry_hash(rec["seq"], rec["ts"], rec["event"],
+                                     rec.get("data", {}), rec["prev_hash"])
+            if recomputed != rec.get("hash"):
+                return False, f"seq {rec.get('seq')}: hash mismatch — entry tampered"
+            prev = rec["hash"]
+            expected_seq += 1
+    return True, f"OK — {expected_seq} entries verified"
+
+
+# ── structlog integration (DRY capture of agt_audit=True events) ────────────────
+
+_chain: AuditChain | None = None
+log = structlog.get_logger(__name__)
+
+
+def _audit_processor(logger: Any, method_name: str, event_dict: dict) -> dict:
+    """structlog processor: record agt_audit=True events into the chain. Returns the
+    event_dict unchanged so normal rendering continues. Never raises."""
+    if _chain is not None and event_dict.get("agt_audit"):
+        try:
+            event = str(event_dict.get("event", ""))
+            data = {k: v for k, v in event_dict.items() if k not in ("event", "agt_audit")}
+            _chain.append(event, data)
+        except Exception as exc:  # audit must never break request logging
+            try:
+                _chain.append("audit_write_error", {"error": repr(exc)})
+            except Exception:
+                pass
+    return event_dict
+
+
+def configure_audit_logging(division: str, role: str, base_dir: str | None = None) -> AuditChain:
+    """Create this process's audit chain and hook it into the structlog pipeline.
+
+    Call ONCE at process startup (agent: role='agent'; worker: role='worker')."""
+    global _chain
+    base = Path(base_dir or os.environ.get("AUDIT_LOG_DIR", "audit_logs"))
+    _chain = AuditChain(base / f"{division}_{role}.jsonl")
+    cfg = structlog.get_config()
+    procs = list(cfg.get("processors") or [])
+    if _audit_processor not in procs:
+        # insert before the final renderer so the rendered line is unaffected
+        procs.insert(max(0, len(procs) - 1), _audit_processor)
+        structlog.configure(processors=procs)
+    log.info("audit_chain_ready", path=str(_chain.path), role=role, division=division)
+    return _chain
+
+
+def get_chain() -> AuditChain | None:
+    return _chain

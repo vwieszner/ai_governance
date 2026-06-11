@@ -57,3 +57,7 @@ Thumbs.db
 # M0: per-division generated stacks (secrets: stack env, agent .env, DID)
 infra/generated/
 agt-federated-rag/.env.*
+
+# M8 tamper-evident audit chains (runtime, per-division)
+audit_logs/
+agt-federated-rag/audit_logs/

@@ -392,6 +392,10 @@ async def _get_bearer_token(authorization: str | None) -> tuple[str, dict[str, A
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # M8: hook the tamper-evident audit chain into structlog (captures agt_audit events)
+    import audit_log
+    audit_log.configure_audit_logging(settings.division_id, "agent", settings.audit_log_dir)
+
     # Initialise AgentMesh identity — resolves or creates the DID
     await agent_identity.get_mesh()
     did = await agent_identity.get_did()

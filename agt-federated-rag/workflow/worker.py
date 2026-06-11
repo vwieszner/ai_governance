@@ -54,6 +54,11 @@ log = structlog.get_logger(__name__)
 
 async def _run() -> None:
     """Async worker loop with SIGTERM/SIGINT graceful shutdown."""
+    # M8: hook the tamper-evident audit chain (worker emits agt_audit grant/revoke events)
+    import audit_log
+    from config import settings as _settings
+    audit_log.configure_audit_logging(_settings.division_id, "worker", _settings.audit_log_dir)
+
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
 

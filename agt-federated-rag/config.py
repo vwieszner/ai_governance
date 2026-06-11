@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     trusted_issuers: str = ""
     agent_name: str = "AGT RAG Agent"
     agent_url: AnyHttpUrl = Field(default="http://localhost:8000")  # type: ignore[assignment]
+    # M8: directory for the tamper-evident hash-chained audit log. Each process writes
+    # <division>_<role>.jsonl (agent + worker are separate processes). Per-division so
+    # one division's audit trail is isolated from another's (NFR-2).
+    audit_log_dir: str = "audit_logs"
 
     # ── Data residency / inference egress (M6, NFR-1) ─────────────────────────
     # "external" = LLM/embeddings may egress to a hosted endpoint (e.g. NVIDIA).
