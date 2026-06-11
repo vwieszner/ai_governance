@@ -16,3 +16,11 @@ cross_grants:
     home_division: alpha
     relation: viewer
     doc: technical_architecture
+  # Cross-division APPROVAL (FR-3.x): alice (home: alpha) is pending_approval on beta's
+  # q4_financial_results (bob@beta owns it). A verifiable cross-division request from her
+  # routes to beta's approval workflow; on bob's approval she is granted viewer and can
+  # retrieve it. Reuses the existing pending_approval routing — no check_auth change.
+  - user_email: alice@example.com
+    home_division: alpha
+    relation: pending_approval
+    doc: q4_financial_results
