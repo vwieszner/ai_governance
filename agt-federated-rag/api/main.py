@@ -294,7 +294,7 @@ async def _check_rate_limit(subject: str) -> None:
         log.warning("rate_limit_check_failed", subject=subject, error=str(exc))
         return
     if count > settings.rate_limit_per_minute:
-        log.warning("rate_limit_exceeded", subject=subject, count=count)
+        log.warning("rate_limit_exceeded", subject=subject, count=count, agt_audit=True)  # M8: abuse signal
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Please slow down.")
 
 
@@ -372,7 +372,8 @@ async def _get_bearer_token(authorization: str | None) -> tuple[str, dict[str, A
     try:
         claims = await validate_token(token)
     except JWTError:
-        log.warning("token_validation_failed")
+        # M8: failed authentication is a security event — chain it (intrusion trail).
+        log.warning("token_validation_failed", agt_audit=True)
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     except AuthServiceUnavailable as exc:
         log.error("auth_service_unavailable", error=str(exc))
@@ -683,7 +684,7 @@ async def a2a_query(request: Request) -> JSONResponse:
     # ── DID authentication: verify the Ed25519 signature on the payload ──────
     sig_verified, signer_did = await agent_identity.verify_signed_message(payload)
     if not sig_verified or not signer_did:
-        log.warning("a2a_query_signature_invalid")
+        log.warning("a2a_query_signature_invalid", agt_audit=True)   # M8: forged/unsigned peer msg
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing AgentMesh message signature",
@@ -696,6 +697,7 @@ async def a2a_query(request: Request) -> JSONResponse:
             "a2a_query_peer_identity_rejected",
             signer_did=signer_did,
             trust_score=trust_score,
+            agt_audit=True,                                          # M8: rejected peer identity
         )
         raise HTTPException(status_code=403, detail="Peer identity verification failed")
 
@@ -705,6 +707,7 @@ async def a2a_query(request: Request) -> JSONResponse:
             "a2a_query_unexpected_peer_did",
             signer_did=signer_did,
             expected_did=settings.peer_agent_did,
+            agt_audit=True,                                          # M8: wrong peer DID
         )
         raise HTTPException(status_code=403, detail="Sender DID does not match configured peer")
 
@@ -735,7 +738,7 @@ async def a2a_query(request: Request) -> JSONResponse:
     try:
         user_id = assertion_principal(assertion, settings.peer_agent_issuer)
     except Exception as exc:
-        log.warning("a2a_query_assertion_invalid", error=str(exc))
+        log.warning("a2a_query_assertion_invalid", error=str(exc), agt_audit=True)  # M8
         raise HTTPException(status_code=401, detail="Invalid cross-division user assertion")
 
     context_id = str(payload.get("context_id", "")) or str(uuid.uuid4())
@@ -845,7 +848,7 @@ async def task_callback(
     # the `_agentmesh` block against the payload and fails closed otherwise.
     sig_verified, signed_sender_did = await agent_identity.verify_signed_message(payload)
     if not sig_verified or not signed_sender_did:
-        log.warning("callback_signature_invalid", task_id=task_id)
+        log.warning("callback_signature_invalid", task_id=task_id, agt_audit=True)  # M8
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing AgentMesh message signature",
@@ -862,6 +865,7 @@ async def task_callback(
             task_id=task_id,
             claimed_did=claimed_did,
             signed_did=signed_sender_did,
+            agt_audit=True,                                          # M8: tampered callback body
         )
         raise HTTPException(status_code=403, detail="Sender DID does not match message signature")
     sender_did = signed_sender_did
@@ -874,6 +878,7 @@ async def task_callback(
             task_id=task_id,
             sender_did=sender_did,
             trust_score=trust_score,
+            agt_audit=True,                                          # M8: rejected callback peer
         )
         raise HTTPException(status_code=403, detail="Peer identity verification failed")
 
@@ -884,6 +889,7 @@ async def task_callback(
             task_id=task_id,
             sender_did=sender_did,
             expected_did=settings.peer_agent_did,
+            agt_audit=True,                                          # M8: wrong callback peer DID
         )
         raise HTTPException(status_code=403, detail="Sender DID does not match configured peer")
 
@@ -952,10 +958,11 @@ async def handle_approval(
     # Finding #2: reject expired links before any work. The expiry is part of
     # the HMAC-signed message, so a caller cannot extend it by editing the query.
     if exp < int(time.time()):
-        log.warning("approval_link_expired", request_id=request_id)
+        log.warning("approval_link_expired", request_id=request_id, agt_audit=True)  # M8
         raise HTTPException(status_code=401, detail="Approval link has expired")
     if not _verify_approval_token(request_id, decision, exp, token):
-        log.warning("approval_hmac_invalid")
+        # M8: an invalid HMAC on an approval link is a forgery attempt — high-signal audit.
+        log.warning("approval_hmac_invalid", agt_audit=True)
         raise HTTPException(status_code=401, detail="Invalid or expired approval token")
 
     temporal_client: TemporalClient = request.app.state.temporal_client
@@ -1084,7 +1091,8 @@ async def authenticated_approval(
     if info.get("decided"):
         raise HTTPException(status_code=409, detail="This request has already been decided")
     if approver_sub != info.get("approver_id"):
-        log.warning("authenticated_approval_forbidden_not_owner")
+        # M8: a non-owner attempting to decide an approval is an authorization-bypass attempt.
+        log.warning("authenticated_approval_forbidden_not_owner", agt_audit=True)
         raise HTTPException(status_code=403, detail="Only the data owner may decide this request")
 
     try:
