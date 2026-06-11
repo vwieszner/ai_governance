@@ -46,6 +46,27 @@ def test_derive_ports_layout():
                  "temporal": 8103, "temporal_ui": 8104, "qdrant": 8105, "redis": 8106}
 
 
+def test_reserved_port_base_rejected():
+    # A co-resident project reserves port_base+1 (=8000+N*100+1) as its BACKEND, so the
+    # old 8100/8200/8300/8400 bases (openfga=+1) collide. The guard must refuse them.
+    import pytest
+
+    from scripts.onboard_division import assert_port_base_clean
+    for colliding in (8100, 8200, 8300, 8400):
+        with pytest.raises(ValueError):
+            assert_port_base_clean(colliding)
+    for clean in (9000, 9100, 9200):
+        assert_port_base_clean(clean)            # no raise
+
+
+def test_real_manifests_use_clean_port_bases():
+    # The shipped division manifests must sit in a clean band (load_manifest enforces it).
+    from scripts.onboard_division import load_manifest
+    for div, expected in (("alpha", 9000), ("beta", 9100), ("gamma", 9200)):
+        m = load_manifest(DIVISIONS_DIR / f"{div}.yml")
+        assert m.port_base == expected
+
+
 def test_manifest_requires_division_id_and_port_base(tmp_path):
     bad = tmp_path / "bad.yml"
     bad.write_text("display_name: No Id\nport_base: 8400\n", encoding="utf-8")

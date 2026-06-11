@@ -119,6 +119,7 @@ def load_manifest(path: str | Path) -> Manifest:
         port_base = int(str(data.get("port_base", "")).strip())
     except ValueError as exc:
         raise ValueError(f"{path}: manifest needs an integer 'port_base'") from exc
+    assert_port_base_clean(port_base)  # reject collisions with the co-resident project
     peers = data.get("trusted_peers") or []
     if isinstance(peers, str):
         peers = [p.strip() for p in peers.split(",") if p.strip()]
@@ -137,6 +138,39 @@ def load_manifest(path: str | Path) -> Manifest:
 
 def derive_ports(port_base: int) -> dict[str, int]:
     return {name: port_base + off for name, off in PORT_OFFSETS.items()}
+
+
+# ── Co-resident project's reserved ports ────────────────────────────────────────
+# Another project on this host computes its ports from a slot N (1..8). A division's
+# OpenFGA port is port_base+1, which lands exactly on that project's BACKEND
+# (8000+N*100+1 = 8101/8201/...) — silently binding the wrong service. We MUST keep
+# division ports clear of the whole reserved set. Per slot N (1..8):
+#   BACKEND=8000+N*100+1   PROXY=8000+N*100+80   POSTGRES=5433+N*100
+#   NEO4J_BOLT=7687+N*100  NEO4J_HTTP=7474+N*100  REDIS=6379+N*100
+#   FRONTEND_DEBUG=9229+N*100  BACKEND_DEBUG=5678+N*100
+#   QDRANT_HTTP=6335+N*100  QDRANT_GRPC=6336+N*100
+def _reserved_ports() -> set[int]:
+    out: set[int] = set()
+    for n in range(1, 9):
+        out |= {8000 + n * 100 + 1, 8000 + n * 100 + 80, 5433 + n * 100,
+                7687 + n * 100, 7474 + n * 100, 6379 + n * 100, 9229 + n * 100,
+                5678 + n * 100, 6335 + n * 100, 6336 + n * 100}
+    return out
+
+
+RESERVED_PORTS = _reserved_ports()
+
+
+def assert_port_base_clean(port_base: int) -> None:
+    """Refuse a port_base whose derived ports collide with the co-resident project's
+    reserved ports — clean bands are e.g. 8900/9000/9100/9200 (below FRONTEND_DEBUG@9329)."""
+    clash = sorted(p for p in derive_ports(port_base).values() if p in RESERVED_PORTS)
+    if clash:
+        raise ValueError(
+            f"port_base {port_base}: derived ports {clash} collide with the co-resident "
+            f"project's reserved ports (slots N=1..8). Choose a clean port_base such as "
+            f"9000/9100/9200."
+        )
 
 
 def compose_project(division_id: str) -> str:
