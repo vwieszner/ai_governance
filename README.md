@@ -71,6 +71,25 @@ Then open **http://localhost:5173** — alice on the left (cluster-a `:8010`), b
 > After re-running `setup_agt.py` (which creates a fresh OpenFGA store id), restart the backends so
 > they pick it up: `.\scripts\clusters.ps1 restart agt-a agt-b`.
 
+## Fresh machine? One command
+
+On a new Windows machine, the whole bring-up (venv + pinned deps + npm + per-division
+Docker stacks + provisioning + federation + agents) is one script:
+
+```powershell
+# Prereqs you install yourself: Python 3.11+, Node 18+, Docker Desktop (running).
+# Put your LLM key in .\.env :   NVIDIA_API_KEY=<key>
+powershell -File scripts\bootstrap.ps1            # alpha + beta (the demo pair)
+powershell -File scripts\bootstrap.ps1 -ThreeDivisions   # + gamma
+```
+
+It is idempotent (safe to re-run), checks prerequisites with clear errors, pins all
+versions (Python deps via `agt-federated-rag/requirements.lock.txt`, Docker images
+pinned in `infra/division-stack.template.yml`), and prints the demo logins when done.
+Then: `cd ui; npm run start` and open http://localhost:5173. Expect the first run to
+take a while (Docker image pulls); each division is ~7 containers, so 16 GB+ RAM is
+comfortable for the two-division demo.
+
 ## Per-division deployment (Infrastructure-as-Code)
 
 The production topology is one **physically-isolated stack per division** (its own Postgres,

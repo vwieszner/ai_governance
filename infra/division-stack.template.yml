@@ -37,7 +37,7 @@ services:
     restart: unless-stopped
 
   openfga-migrate:
-    image: openfga/openfga:latest
+    image: openfga/openfga:v1.16.1   # pinned for reproducibility (was :latest)
     container_name: div-${DIV_ID}-openfga-migrate
     command: migrate
     environment:
@@ -49,7 +49,7 @@ services:
     restart: on-failure
 
   openfga:
-    image: openfga/openfga:latest
+    image: openfga/openfga:v1.16.1   # pinned for reproducibility (was :latest)
     container_name: div-${DIV_ID}-openfga
     command: run
     environment:
@@ -72,7 +72,7 @@ services:
     restart: unless-stopped
 
   temporal:
-    image: temporalio/temporal:latest
+    image: temporalio/temporal:1.7.0   # pinned (CLI 1.7.0 / server 1.31.0); was :latest
     # --db-filename persists to a SQLite file on a named volume so in-flight APPROVAL
     # workflows survive restart/reboot (the product's offline-approval headline).
     # Without it, start-dev is in-memory and approvals are lost. (prod B-3)
@@ -87,7 +87,7 @@ services:
     restart: unless-stopped
 
   keycloak:
-    image: quay.io/keycloak/keycloak:latest
+    image: quay.io/keycloak/keycloak:26.6.2   # pinned for reproducibility (was :latest)
     command: ["start-dev", "--features=token-exchange,admin-fine-grained-authz"]
     container_name: div-${DIV_ID}-keycloak
     environment:
@@ -101,7 +101,7 @@ services:
     restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.16.0   # pinned for reproducibility (was :latest)
     container_name: div-${DIV_ID}-qdrant
     volumes:
       - div-qdrant-data:/qdrant/storage
