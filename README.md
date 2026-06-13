@@ -29,7 +29,8 @@ Qdrant, and Keycloak.
 | Default-deny governance | Every LangGraph node `_enforce`s a policy before acting | `agent/policies/` |
 | Cryptographic federation | Ed25519-DID-signed, replay-protected `/a2a/query`; per-DID issuer binding | `mesh/` |
 | Human-in-the-loop approval | Durable Temporal workflow; owner inbox; **answer delivered back** to the requester | `workflow/`, `api/main.py` |
-| Any-IdP identity | OIDC; configurable claim mapping (Keycloak/Entra/Okta); **PKCE SSO** in the UI | `auth/token_validator.py`, `ui/src/api/oidc.ts` |
+| Any-IdP identity | OIDC; configurable claim mapping (Keycloak/Entra/Okta) | `auth/token_validator.py` |
+| Browser auth (production) | **BFF** — server-side PKCE; **no token in the browser**, only an `HttpOnly` session cookie; silent refresh; login-CSRF state binding; CSRF | `api/bff.py`, `ui/src/components/BffPane.tsx` |
 | Group-based access | IdP groups → OpenFGA `group#member` usersets (baseline access, instant revoke) + allowlist | `auth/`, `infra/idp-presets/` |
 | Production mTLS edge | nginx, route-based mutual TLS on the peer plane, JWT on the user plane | `infra/nginx/` |
 | Tamper-evident audit | Hash-chained + externally-anchored log (detects tamper/truncation/deletion) | `audit_log.py` |

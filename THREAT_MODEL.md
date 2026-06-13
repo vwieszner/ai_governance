@@ -38,6 +38,7 @@ without reverse-engineering the code.
 | Prompt/agent action abuse | Default-deny policy engine on every node action | `agent/policies/base-policy.yaml` |
 | Cost / DoS on expensive paths | Per-principal rate limit on `/query` + the poll/approval/revoke endpoints | `api/main._check_rate_limit` |
 | Recon via metrics | `/metrics` gated by `METRICS_TOKEN` when set | `api/main.metrics`, `test_metrics.py` |
+| Browser token theft (XSS) | BFF: no token in the browser, only an `HttpOnly` session cookie; server-side refresh; login-CSRF state binding | `api/bff.py`, `test_bff.py`, `ui/e2e/bff.spec.ts` |
 | Transport interception (peer) | Route-based **mTLS** at the nginx edge (federation-CA client cert required on peer routes) | `infra/nginx/`, `test_transport.py` |
 | Audit tamper (offline) | Hash-chained log + external head anchor (truncation/deletion detected) | `audit_log.py`, `test_audit.py` |
 | Operator emergency stop | Kill-switch denies the whole query path | `agent/graph.py`, `test_governance.py` |
@@ -85,11 +86,19 @@ assurance — worse than the honest current state. Each needs a decision, then r
   mediation** (for legacy). Needs a real MCP server + IdP OBO to build and test against.
 - **Why not done:** writing untested auth code against no live system is exactly the risk to avoid.
 
-### 4.3 Browser token storage (UI)
-- **Now:** PKCE tokens in `sessionStorage`.
-- **Gap:** XSS could exfiltrate them (same exposure as the password-grant tokens in React state).
-- **Decision needed:** in-memory tokens + silent refresh (token lost on reload — a UX trade-off)
-  and a tuned Content-Security-Policy. Both are product decisions, not mechanical fixes.
+### 4.3 Browser token storage (UI) — RESOLVED via the BFF pattern
+- **Decision taken:** implement the IETF "OAuth 2.0 for Browser-Based Apps" **BFF** pattern
+  (the industry best practice), not the in-memory/sessionStorage half-measures.
+- **Now:** the browser holds **no access or refresh token** — only an `HttpOnly; Secure;
+  SameSite=Strict` session cookie. Tokens live server-side in Redis; the BFF does the PKCE
+  code exchange server-side, silently refreshes (refresh token never leaves the server),
+  binds the OAuth `state` to the initiating browser (login-CSRF/fixation guard), and enforces
+  a CSRF double-submit token on mutations. Proven live (`ui/e2e/bff.spec.ts`): SSO login →
+  cookie → query works → **no token in `sessionStorage`/`localStorage`**.
+- **Code:** `api/bff.py`, `ui/src/api/session.ts`, `ui/src/components/BffPane.tsx`,
+  `tests/test_bff.py`. Enabled with `VITE_AUTH_MODE=bff`.
+- **Remaining (minor):** add a tuned Content-Security-Policy header at the edge as extra
+  XSS defence-in-depth (BFF already removes the token-theft prize).
 
 ## 5. Residual risk summary
 

@@ -49,10 +49,15 @@ hosts/keys are never in the browser bundle. Variables **without** `VITE_` are pr
 
 ## Auth modes
 
-- **password (demo):** Keycloak password grant, two independent panes in one tab.
-- **pkce (production):** `src/api/oidc.ts` — discovery-driven Authorization Code + PKCE redirect
-  to any OIDC IdP (Entra/Okta/Auth0/Keycloak), MFA handled by the IdP, no secret in the browser,
-  CSRF-state checked. Single authenticated session per tab.
+- **bff (production, recommended):** `VITE_AUTH_MODE=bff`. One division per browser session.
+  Login redirects to the agent's `/bff/*` endpoints which do the OIDC Auth-Code + PKCE
+  exchange **server-side**; the browser holds **only an `HttpOnly` session cookie** — no
+  access/refresh token ever reaches JS (XSS can't steal it). Server-side silent refresh,
+  login-CSRF state binding, CSRF double-submit. `src/api/session.ts` + `BffPane`. Each user
+  logs in from their own browser; open the other division separately. Backend: `api/bff.py`.
+- **password:** Keycloak password grant, two panes in one tab; tokens in React memory.
+- **pkce:** `src/api/oidc.ts` — Auth-Code + PKCE in the SPA (tokens in the browser; weaker
+  than bff, kept for reference).
 
 ## Tests
 
