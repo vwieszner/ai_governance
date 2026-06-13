@@ -43,7 +43,7 @@ import structlog
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from jose import JWTError
 from sse_starlette.sse import EventSourceResponse
 from temporalio.client import Client as TemporalClient
@@ -481,6 +481,15 @@ async def health() -> dict[str, str]:
         "cluster": settings.cluster_id,
         "agent_did": did,
     }
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    """Prometheus scrape endpoint (Phase-1 item 13). Dependency-free text format; counters
+    are the governance audit events (auth decisions/denials, approvals, rotations, peer
+    rejections, audit-write errors), so a scrape needs no extra instrumentation."""
+    import audit_log
+    return Response(content=audit_log.render_prometheus(), media_type="text/plain; version=0.0.4")
 
 
 # ── GET /.well-known/agent-card.json ─────────────────────────────────────────

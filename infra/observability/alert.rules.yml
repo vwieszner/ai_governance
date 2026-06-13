@@ -1,0 +1,51 @@
+# Prometheus alert rules for AGT governance signals (Phase-1 item 13).
+# Keyed on the agt_audit_events_total{event=...} counters the agent exposes at /metrics.
+groups:
+  - name: agt-governance
+    rules:
+      # A burst of federation-boundary auth failures = probing / misconfig / attack.
+      - alert: AuthFailureSpike
+        expr: >
+          sum by (division) (rate(agt_audit_events_total{event=~
+          "a2a_query_signature_invalid|a2a_query_peer_identity_rejected|a2a_query_assertion_invalid|approval_hmac_invalid|token_validation_failed"}[5m]))
+          > 0.2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Auth-failure spike in {{ $labels.division }}"
+          description: "Federation/auth rejections elevated for 5m — possible probing or broken peer config."
+
+      # Authorization-bypass attempts (non-owner trying to decide/revoke).
+      - alert: AuthorizationBypassAttempt
+        expr: >
+          increase(agt_audit_events_total{event=~
+          "authenticated_approval_forbidden_not_owner|access_revoke_forbidden_not_owner"}[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Authorization-bypass attempt in {{ $labels.division }}"
+          description: "A caller attempted an owner-only action they are not the owner of."
+
+      # The audit chain itself failed to write — tamper-evidence at risk.
+      - alert: AuditWriteError
+        expr: increase(agt_audit_events_total{event="audit_write_error"}[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Audit chain write error in {{ $labels.division }}"
+          description: "The tamper-evident audit chain failed to append — investigate immediately."
+
+      # Scheduled credential rotation failing.
+      - alert: KeyRotationFailing
+        expr: increase(agt_audit_events_total{event="did_rotation_failed"}[1h]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "DID rotation failing in {{ $labels.division }}"
+          description: "Scheduled credential rotation reported a failure in the last hour."
+
+      # The agent stopped exposing metrics (process down / unreachable).
+      - alert: DivisionAgentDown
+        expr: up{job="agt-divisions"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Division agent {{ $labels.division }} is down"
+          description: "Prometheus cannot scrape the agent for 2m."

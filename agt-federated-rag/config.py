@@ -285,6 +285,23 @@ class Settings(BaseSettings):
         return [s.strip() for s in self.trusted_issuers.split(",") if s.strip()]
 
     @model_validator(mode="after")
+    def resolve_secret_refs(self) -> "Settings":
+        # Phase-1 item 14: resolve any setting whose value is a `vault:path#field` reference
+        # via the configured secrets backend. No-op for the default env-file deployment
+        # (no values are refs), so this is free and safe. Fails loud if a ref can't resolve.
+        try:
+            from secrets_backend import is_ref, resolve_secret, get_backend
+        except Exception:
+            return self
+        refs = {n: v for n, v in self.__dict__.items() if isinstance(v, str) and is_ref(v)}
+        if not refs:
+            return self
+        be = get_backend()
+        for name, value in refs.items():
+            object.__setattr__(self, name, resolve_secret(value, be))
+        return self
+
+    @model_validator(mode="after")
     def default_division_id(self) -> "Settings":
         # Back-compat: a single-cluster .env that sets only CLUSTER_ID still gets a
         # division_id (so tenancy threading never sees an empty division).

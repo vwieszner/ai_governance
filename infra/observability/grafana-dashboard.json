@@ -1,0 +1,52 @@
+{
+  "__comment": "Minimal Grafana dashboard for AGT governance (Phase-1 item 13). Import via Dashboards -> New -> Import. Expects a Prometheus datasource scraping the agents' /metrics.",
+  "title": "AGT Federated RAG — Governance",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "division", "type": "query", "datasource": "Prometheus",
+        "query": "label_values(agt_audit_events_total, division)", "includeAll": true, "multi": true }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Authorization decisions / s",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum by (division) (rate(agt_audit_events_total{event=\"auth_decision\", division=~\"$division\"}[5m]))", "legendFormat": "{{division}} decisions" }
+      ]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Auth-failure / rejection rate",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sum by (division) (rate(agt_audit_events_total{event=~\"a2a_query_signature_invalid|a2a_query_peer_identity_rejected|a2a_query_assertion_invalid|approval_hmac_invalid\", division=~\"$division\"}[5m]))", "legendFormat": "{{division}} rejections" }
+      ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Authorization-bypass attempts (1h)",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "sum(increase(agt_audit_events_total{event=~\"authenticated_approval_forbidden_not_owner|access_revoke_forbidden_not_owner\", division=~\"$division\"}[1h]))" }
+      ]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Audit write errors (1h)",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 8 },
+      "targets": [
+        { "expr": "sum(increase(agt_audit_events_total{event=\"audit_write_error\", division=~\"$division\"}[1h]))" }
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Approvals: started vs granted",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 8 },
+      "targets": [
+        { "expr": "sum by (division) (rate(agt_audit_events_total{event=\"openfga_pending_written\", division=~\"$division\"}[15m]))", "legendFormat": "{{division}} pending" },
+        { "expr": "sum by (division) (rate(agt_audit_events_total{event=\"openfga.write_tuple\", division=~\"$division\"}[15m]))", "legendFormat": "{{division}} grants" }
+      ]
+    }
+  ]
+}

@@ -217,10 +217,43 @@ AUDIT_FIELD_ALLOWLIST = frozenset({
 _chain: AuditChain | None = None
 log = structlog.get_logger(__name__)
 
+# ── Metrics (Phase-1 item 13): dependency-free Prometheus counters ──────────────
+# Every agt_audit event increments a per-event counter (and a total). The same DRY hook
+# that feeds the audit chain feeds metrics, so no call-site changes. render_prometheus()
+# emits text-format for a /metrics scrape; alert rules key on these event names.
+_metrics: dict[str, int] = {}
+_metrics_lock = threading.Lock()
+
+
+def _bump_metric(event: str) -> None:
+    with _metrics_lock:
+        _metrics[event] = _metrics.get(event, 0) + 1
+
+
+def render_prometheus() -> str:
+    """Prometheus text-format snapshot of the audit-event counters."""
+    with _metrics_lock:
+        items = sorted(_metrics.items())
+    lines = [
+        "# HELP agt_audit_events_total AGT governance audit events by type.",
+        "# TYPE agt_audit_events_total counter",
+    ]
+    total = 0
+    for event, n in items:
+        safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in event)
+        lines.append(f'agt_audit_events_total{{event="{safe}"}} {n}')
+        total += n
+    lines.append("# HELP agt_audit_events_sum Total audit events recorded this process.")
+    lines.append("# TYPE agt_audit_events_sum counter")
+    lines.append(f"agt_audit_events_sum {total}")
+    return "\n".join(lines) + "\n"
+
 
 def _audit_processor(logger: Any, method_name: str, event_dict: dict) -> dict:
     """structlog processor: record agt_audit=True events into the chain. Returns the
     event_dict unchanged so normal rendering continues. Never raises."""
+    if event_dict.get("agt_audit"):
+        _bump_metric(str(event_dict.get("event", "")))      # metrics even before a chain exists
     if _chain is not None and event_dict.get("agt_audit"):
         try:
             event = str(event_dict.get("event", ""))

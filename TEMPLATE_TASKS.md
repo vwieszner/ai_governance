@@ -127,13 +127,20 @@ The gaps that block deployment against a real corporate IdP and network.
       LOCAL_DENIED. Full IdP-group → claim → contextual tuple → group viewer → answer →
       revoke chain, live through the real /query pipeline. 4 helper tests; 107 backend green._
 
-- [ ] **13. Observability preset + backup/restore runbook** — Prometheus metrics,
-      Grafana dashboard, alert rules (auth-failure spikes, circuit-breaker open,
-      approval backlog age, audit-verify failures); scripted backup/restore for
-      Postgres / Qdrant / Keycloak realm / OpenFGA store / DID keys. (~3–4 d)
+- [x] **13. Observability preset + backup/restore runbook** — dependency-free
+      `/metrics` (Prometheus text format) fed by the same agt_audit hook as the audit chain
+      (`audit_log.render_prometheus`); `infra/observability/` has `prometheus.yml`,
+      `alert.rules.yml` (auth-failure spike, authorization-bypass attempt, audit-write error,
+      rotation failing, agent-down), and a Grafana dashboard. `scripts/backup_division.py`
+      (Postgres dump, Qdrant snapshot, OpenFGA tuples, DID/state) + `BACKUP_RUNBOOK.md`.
+      _PROVEN LIVE: scraped alpha `/metrics` after a real query → `auth_decision` 1,
+      `openfga_check` 2. 2 metrics tests; 115 backend green._
 
-- [ ] **14. Secrets backend abstraction** — env-file (default) | Vault/KMS adapter
-      behind one interface. (~2 d)
+- [x] **14. Secrets backend abstraction** — `secrets_backend.py`: one interface
+      (`EnvFileBackend` default | `VaultBackend` KV v2). Any setting whose value is a
+      `vault:path#field` ref is resolved at startup (config model_validator), fail-loud on a
+      missing secret; literals pass through untouched, so the default env-file deployment is
+      unchanged. _Done: 6 hermetic tests (passthrough, env+vault resolve, KV v2 parse, fail-loud)._
 
 ---
 

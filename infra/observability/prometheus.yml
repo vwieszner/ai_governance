@@ -1,0 +1,20 @@
+# Prometheus scrape config for the AGT federated-RAG divisions (Phase-1 item 13).
+# Each division's agent exposes /metrics (dependency-free audit-event counters).
+# Adjust targets to your deployment DNS; localhost ports shown for the bundled stacks.
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+rule_files:
+  - alert.rules.yml
+
+scrape_configs:
+  - job_name: agt-divisions
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:9000"]
+        labels: { division: alpha }
+      - targets: ["127.0.0.1:9100"]
+        labels: { division: beta }
+      - targets: ["127.0.0.1:9200"]
+        labels: { division: gamma }
