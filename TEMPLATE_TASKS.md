@@ -3,8 +3,12 @@
 _Goal: make this a **general, secure, easy-to-deploy template** — every integration seam
 generic with one working reference implementation; everything company-specific is config._
 
-_Baseline (done & proven): all milestones M0–M8 + M-GOV + 3-division e2e; rendered-UI
-Playwright proofs (local / federated / approval); one-shot `scripts/bootstrap.ps1` with
+**STATUS: ALL 14 tasks COMPLETE (Phases 1–3).** 119 backend tests + 10 UI unit tests +
+3 Playwright e2e (local / federated / approval) all green. Key chains proven LIVE end-to-end:
+IdP-group → token claim → contextual tuple → group viewer → answer → revoke; containerized
+agent authenticated query; mTLS handshakes; approval flow (park → inbox approve → delivery).
+
+_Baseline: all milestones M0–M8 + M-GOV + 3-division e2e; one-shot bootstrap (ps1 + sh) with
 pinned images + frozen deps. See `SESSION_STATUS.md` for the full record._
 
 Status legend: `[ ]` todo · `[~]` partially exists (seam/scaffold present) · `[x]` done
