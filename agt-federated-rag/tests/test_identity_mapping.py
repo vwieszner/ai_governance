@@ -64,6 +64,20 @@ def test_groups_claim_name_configurable(monkeypatch):
     assert extract_groups({"roles": ["finance"], "groups": ["ignored"]}) == ["finance"]
 
 
+def test_recognized_groups_allowlist_drops_unexpected(monkeypatch):
+    # Hardening: with an allowlist, a group the (possibly misconfigured) IdP asserts but the
+    # division does NOT recognise is dropped before it can grant — no privilege escalation.
+    monkeypatch.setattr(type(tv.settings), "recognized_groups_set",
+                        property(lambda self: {"finance", "hr"}))
+    assert sorted(extract_groups({"groups": ["finance", "rogue-admins", "hr"]})) == ["finance", "hr"]
+
+
+def test_empty_allowlist_accepts_all(monkeypatch):
+    monkeypatch.setattr(type(tv.settings), "recognized_groups_set",
+                        property(lambda self: set()))
+    assert sorted(extract_groups({"groups": ["finance", "anything"]})) == ["anything", "finance"]
+
+
 # ── Group membership becomes a contextual tuple (not persisted) ────────────────
 
 def test_group_contextual_tuples_built_from_user_groups():

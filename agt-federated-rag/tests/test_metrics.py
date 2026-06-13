@@ -27,3 +27,24 @@ def test_render_prometheus_is_valid_textformat(monkeypatch):
     assert "# TYPE agt_audit_events_total counter" in out
     assert 'agt_audit_events_total{event="a2a_query_signature_invalid"} 3' in out
     assert out.endswith("\n")
+
+
+def test_metrics_endpoint_gated_when_token_set(monkeypatch):
+    # /metrics is open by default but requires the bearer token when METRICS_TOKEN is set,
+    # so the governance counters aren't world-readable recon.
+    import asyncio
+    from api import main
+
+    # token unset -> open
+    monkeypatch.setattr(main.settings, "metrics_token", "")
+    assert asyncio.run(main.metrics(authorization=None)).status_code == 200
+
+    # token set -> 401 without/with-wrong header, 200 with correct
+    monkeypatch.setattr(main.settings, "metrics_token", "scrape-secret")
+    import pytest
+    with pytest.raises(main.HTTPException) as ei:
+        asyncio.run(main.metrics(authorization=None))
+    assert ei.value.status_code == 401
+    with pytest.raises(main.HTTPException):
+        asyncio.run(main.metrics(authorization="Bearer wrong"))
+    assert asyncio.run(main.metrics(authorization="Bearer scrape-secret")).status_code == 200

@@ -157,6 +157,11 @@ class Settings(BaseSettings):
     # the moment the IdP drops them from the group (membership is sourced live from the
     # token as a contextual tuple, never persisted). Empty value/claim = no group grants.
     groups_claim: str = "groups"
+    # Optional ALLOWLIST of group names this division recognises (CSV). When set, any group
+    # in the token NOT on this list is dropped before it can grant access — defence against
+    # a misconfigured IdP mapper or a user-influenced group claim escalating privilege.
+    # Empty = accept every group the (trusted) IdP asserts (back-compat).
+    recognized_groups: str = ""
 
     # ── AgentMesh (Microsoft Agent Governance Toolkit — agent identity) ───────
     # Each agent has a DID (Decentralized Identifier) with Ed25519 credentials,
@@ -234,6 +239,11 @@ class Settings(BaseSettings):
     # expensive /query endpoint (retrieval fan-out + LLM call per request).
     rate_limit_per_minute: int = 60
 
+    # /metrics scrape protection. When set, GET /metrics requires this bearer token (so the
+    # governance event counters aren't world-readable recon). Empty = open (dev default);
+    # production sets METRICS_TOKEN and scrapes with `Authorization: Bearer <token>`.
+    metrics_token: str = ""
+
     # CORS — comma-separated list of allowed origins (str, not list[str], so that
     # operators can set the env var as a plain comma-separated string without
     # needing JSON escaping, matching the convention used by other list settings).
@@ -252,6 +262,11 @@ class Settings(BaseSettings):
     @property
     def trusted_peers_list(self) -> list[str]:
         return [s.strip() for s in self.trusted_peers.split(",") if s.strip()]
+
+    @property
+    def recognized_groups_set(self) -> set[str]:
+        """Allowlisted group names (empty set = accept all the IdP asserts)."""
+        return {s.strip() for s in self.recognized_groups.split(",") if s.strip()}
 
     @property
     def peer_trust(self) -> dict:

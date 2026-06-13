@@ -484,10 +484,19 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/metrics")
-async def metrics() -> Response:
+async def metrics(authorization: str | None = Header(default=None)) -> Response:
     """Prometheus scrape endpoint (Phase-1 item 13). Dependency-free text format; counters
     are the governance audit events (auth decisions/denials, approvals, rotations, peer
-    rejections, audit-write errors), so a scrape needs no extra instrumentation."""
+    rejections, audit-write errors).
+
+    Recon hardening: the counters reveal auth-failure / denial rates, so when METRICS_TOKEN
+    is configured this endpoint requires `Authorization: Bearer <token>` (timing-safe) and
+    401s otherwise. Empty METRICS_TOKEN = open (dev default); production sets it and the
+    scraper sends the header (or it's reached only via an internal network)."""
+    if settings.metrics_token:
+        expected = f"Bearer {settings.metrics_token}"
+        if not authorization or not hmac_lib.compare_digest(authorization, expected):
+            raise HTTPException(status_code=401, detail="metrics: unauthorized")
     import audit_log
     return Response(content=audit_log.render_prometheus(), media_type="text/plain; version=0.0.4")
 
@@ -700,6 +709,11 @@ async def task_result(
             status_code=401,
             detail="Token lacks a verified email required for authorization",
         )
+
+    # Rate-limit: each poll re-runs the governed pipeline (OpenFGA + a possible cross-division
+    # peer call + LLM), and the UI polls every ~4s — so an unthrottled caller is a real cost/DoS
+    # vector. Legitimate polling stays well under the per-minute limit.
+    await _check_rate_limit(user_id)
 
     rec = await _load_task(task_id)
     if rec is None:
@@ -1137,6 +1151,7 @@ async def list_pending_approvals(
             status_code=401,
             detail="Token lacks a verified email required for authorization",
         )
+    await _check_rate_limit(caller)        # bound inbox enumeration
     import approval_index
     items = await approval_index.list_for(caller)
     pending = [{"request_id": it.get("request_id", ""),
@@ -1183,6 +1198,7 @@ async def authenticated_approval(
             status_code=401,
             detail="Token lacks a verified email required for authorization",
         )
+    await _check_rate_limit(approver_principal)
 
     try:
         body = await request.json()
@@ -1273,6 +1289,7 @@ async def revoke_access(
     """
     _, claims = await _get_bearer_token(authorization)
     caller = principal(claims)
+    await _check_rate_limit(caller)        # bound owner-mutation calls
 
     try:
         body = await request.json()

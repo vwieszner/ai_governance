@@ -410,6 +410,15 @@ def extract_groups(claims: dict) -> list[str]:
     for g in raw:
         if isinstance(g, str) and g.strip():
             out.append(g.strip().lstrip("/"))
+    # Defence: if a division declares a recognised-group allowlist, drop any group not on
+    # it BEFORE it can grant access — so a misconfigured IdP mapper (or a user-influenced
+    # group claim) can't escalate via an unexpected group. Empty allowlist = accept all.
+    allow = settings.recognized_groups_set
+    if allow:
+        dropped = [g for g in out if g not in allow]
+        if dropped:
+            log.warning("groups_claim_filtered", dropped=dropped, agt_audit=True)
+        out = [g for g in out if g in allow]
     return out
 
 
