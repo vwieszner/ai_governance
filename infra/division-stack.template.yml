@@ -165,6 +165,35 @@ services:
       - agent
     restart: unless-stopped
 
+  # ── Production edge: route-based mTLS (production-grade peer security) ─────────
+  # The recommended PRODUCTION ingress. nginx terminates TLS and enforces MUTUAL TLS on
+  # the cross-division PEER routes (/a2a/*, /tasks/<id>/callback) — a peer with no/invalid
+  # federation client cert is rejected at the edge — while leaving the USER plane (UI +
+  # JWT) open to browsers (route-based mTLS via ssl_verify_client optional + a per-route
+  # client-cert check). Defence-in-depth: the agent still verifies the DID/Ed25519
+  # signature on every peer call. Certs come from scripts/issue_division_certs.py.
+  #   Federation then points PEER_AGENT_URL at https://<peer-host>:<edge port>.
+  # NOTE: a host running TLS-intercepting AV/proxy (e.g. Norton, corporate MITM) re-signs
+  # the server cert on the wire, which breaks federation-CA server-pinning locally — a host
+  # artifact, not a config issue (the cert chain + client-cert gate are independently proven).
+  edge:
+    profiles: ["containerized"]
+    image: nginx:alpine
+    container_name: div-${DIV_ID}-edge
+    environment:
+      AGENT_UPSTREAM: "agent:8000"
+      DIV_ID: ${DIV_ID}
+    volumes:
+      - ../nginx/division-edge.conf.template:/etc/nginx/templates/division-edge.conf.template:ro
+      - ../generated/_certs/${DIV_ID}.crt:/certs/server.crt:ro
+      - ../generated/_certs/${DIV_ID}.key:/certs/server.key:ro
+      - ../generated/_certs/federation-ca.crt:/certs/federation-ca.crt:ro
+    ports:
+      - "127.0.0.1:${DIV_EDGE_PORT:-8443}:8443"
+    depends_on:
+      - agent
+    restart: unless-stopped
+
 volumes:
   div-postgres-data:
   div-keycloak-data:

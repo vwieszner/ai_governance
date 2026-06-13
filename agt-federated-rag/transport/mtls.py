@@ -190,16 +190,24 @@ def tls_serving_kwargs(s) -> dict:
 
 
 def peer_tls_context(s) -> ssl.SSLContext | None:
-    """Client SSL context presenting THIS division's cert for outbound peer mTLS, or
-    None when mTLS isn't enabled (the caller then uses plain HTTP, as the demo does)."""
-    if not getattr(s, "require_mtls", False):
-        return None
-    cert, key, ca = s.tls_cert_file, s.tls_key_file, s.tls_ca_file
+    """Client SSL context presenting THIS division's cert for outbound peer mTLS, or None.
+
+    Activates whenever the division's TLS cert/key/CA are all configured — INDEPENDENT of
+    require_mtls. This decoupling is what the nginx-edge production mode needs: the agent
+    itself serves plain HTTP behind nginx (require_mtls=false), but still presents its
+    client cert when calling a PEER's mTLS ingress (an https PEER_AGENT_URL). httpx only
+    applies the context to https URLs, so it is harmless for a plain-http peer.
+    """
+    cert, key, ca = (getattr(s, "tls_cert_file", ""), getattr(s, "tls_key_file", ""),
+                     getattr(s, "tls_ca_file", ""))
     if not (cert and key and ca):
-        raise RuntimeError(
-            "require_mtls=true but TLS cert/key/ca paths are not all set — cannot make a "
-            "mutually-authenticated peer call."
-        )
+        # require_mtls without certs is a misconfiguration; fail loud only in that case.
+        if getattr(s, "require_mtls", False):
+            raise RuntimeError(
+                "require_mtls=true but TLS cert/key/ca paths are not all set — cannot make "
+                "a mutually-authenticated peer call."
+            )
+        return None
     return client_context(ca, cert, key)
 
 

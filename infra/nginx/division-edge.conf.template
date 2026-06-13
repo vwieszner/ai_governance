@@ -1,0 +1,62 @@
+# Production edge for one division (Phase: production-grade mTLS).
+# Processed by the nginx:alpine image's envsubst templating (/etc/nginx/templates/*.template).
+# Vars: AGENT_UPSTREAM (host:port of the agent), DIV_ID.
+#
+# TWO trust planes on ONE TLS ingress, separated by route (route-based mTLS):
+#   - USER plane  : the browser/UI + the logged-in user's JWT. A client cert is OPTIONAL,
+#                   so a browser (which has none) is served normally; the agent enforces JWT.
+#   - PEER plane  : cross-division /a2a/* and /tasks/<id>/callback. These REQUIRE a client
+#                   cert issued by the federation CA ($ssl_client_verify = SUCCESS) — a peer
+#                   with no/invalid cert is rejected at the edge (496) before reaching the agent.
+# Defence-in-depth: the agent still verifies the DID/Ed25519 signature on every peer call,
+# so transport mTLS here is an added layer, not the only one.
+
+upstream agent_backend {
+    server ${AGENT_UPSTREAM};
+}
+
+server {
+    listen 8443 ssl;
+    server_name ${DIV_ID};
+
+    ssl_certificate     /certs/server.crt;     # this division's cert (SAN includes localhost)
+    ssl_certificate_key /certs/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Federation CA pins WHICH client certs are acceptable on the peer plane. `optional`
+    # lets the browser/user plane connect with NO client cert; peer routes then demand one.
+    ssl_client_certificate /certs/federation-ca.crt;
+    ssl_verify_client optional;
+    ssl_verify_depth 2;
+
+    # ---- PEER plane (mTLS REQUIRED) ----------------------------------------------------
+    # Cross-division federation transport. Reject anything without a CA-verified client cert.
+    location ~ ^/a2a/ {
+        if ($ssl_client_verify != SUCCESS) { return 496; }   # 496 = nginx "no/invalid client cert"
+        proxy_pass http://agent_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Peer-Cert-Subject $ssl_client_s_dn;   # cert identity -> agent (defence-in-depth)
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 300s;
+    }
+    location ~ ^/tasks/[^/]+/callback$ {
+        if ($ssl_client_verify != SUCCESS) { return 496; }
+        proxy_pass http://agent_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Peer-Cert-Subject $ssl_client_s_dn;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 300s;
+    }
+
+    # ---- USER plane (TLS + JWT; client cert NOT required) -------------------------------
+    location / {
+        proxy_pass http://agent_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Authorization $http_authorization;
+        proxy_read_timeout 300s;
+        # SSE (the /query stream) needs buffering off + HTTP/1.1.
+        proxy_buffering off;
+        proxy_http_version 1.1;
+    }
+}
