@@ -43,10 +43,14 @@ The gaps that block deployment against a real corporate IdP and network.
       protocol-mapper + a group, and push the new model to the live division stores
       (re-onboard — additive/reversible)._
 
-- [ ] **4. IdP presets for the bundled Keycloak** — ready-made realm configs:
-      AD/LDAP user-federation template, Entra broker, Okta broker.
-      _Why: the zero-code path for "corporate has Windows users"._
-      _Accept: documented import-and-go preset per IdP; agent token contract unchanged._ (~2–3 d)
+- [x] **4. IdP presets for the bundled Keycloak** — `infra/idp-presets/`: AD/LDAP
+      user-federation, Entra broker, Okta/OIDC broker, and a **groups protocol-mapper**,
+      each an importable admin-API payload with a README (apply steps + matching agent
+      claim-mapping table per IdP).
+      _PROVEN LIVE: applied groups-mapper.json to alpha's rag-ui client, created group
+      `finance`, added a user — the user's token now carries `groups:['finance']`. With the
+      earlier OpenFGA proof this closes the full chain: IdP group → claim → contextual
+      member tuple → group#member viewer → allowed._
 
 - [ ] **5. Containerize agent + Temporal worker** into the division compose stack.
       _Why: removes the host-process/PowerShell dependency; one `docker compose up`

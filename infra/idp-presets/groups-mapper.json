@@ -1,0 +1,14 @@
+{
+  "_comment": "Group-membership protocol mapper for the rag-ui client. POST to /admin/realms/<realm>/clients/<rag-ui-uuid>/protocol-mappers/models. Adds a 'groups' claim to the access token (a flat list of group names) so the agent's group grants resolve (auth.token_validator.extract_groups + the group#member viewer tuples). full.path=false emits 'finance' not '/finance'; extract_groups also strips a leading '/' either way. Pair with agent GROUPS_CLAIM=groups (default).",
+  "name": "groups",
+  "protocol": "openid-connect",
+  "protocolMapper": "oidc-group-membership-mapper",
+  "consentRequired": false,
+  "config": {
+    "claim.name": "groups",
+    "full.path": "false",
+    "id.token.claim": "true",
+    "access.token.claim": "true",
+    "userinfo.token.claim": "true"
+  }
+}

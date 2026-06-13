@@ -1,0 +1,27 @@
+{
+  "_comment": "Keycloak LDAP/Active Directory user-federation provider. POST to /admin/realms/<realm>/components. Users stay in AD; Keycloak verifies credentials against it and issues OUR tokens. Replace <<PLACEHOLDERS>>. For AD set vendor=ad; for generic LDAP set vendor=other and adjust the *Attribute fields.",
+  "name": "corp-ad",
+  "providerId": "ldap",
+  "providerType": "org.keycloak.storage.UserStorageProvider",
+  "config": {
+    "enabled": ["true"],
+    "priority": ["1"],
+    "vendor": ["ad"],
+    "editMode": ["READ_ONLY"],
+    "importEnabled": ["true"],
+    "syncRegistrations": ["false"],
+    "connectionUrl": ["<<ldaps://dc.corp.example.com:636>>"],
+    "usersDn": ["<<OU=Users,DC=corp,DC=example,DC=com>>"],
+    "bindDn": ["<<CN=svc-keycloak,OU=Service,DC=corp,DC=example,DC=com>>"],
+    "bindCredential": ["<<SERVICE_ACCOUNT_PASSWORD>>"],
+    "usernameLDAPAttribute": ["sAMAccountName"],
+    "rdnLDAPAttribute": ["cn"],
+    "uuidLDAPAttribute": ["objectGUID"],
+    "userObjectClasses": ["person, organizationalPerson, user"],
+    "usePasswordModifyExtendedOp": ["false"],
+    "trustEmail": ["true"],
+    "useTruststoreSpi": ["ldapsOnly"],
+    "connectionPooling": ["true"],
+    "pagination": ["true"]
+  }
+}

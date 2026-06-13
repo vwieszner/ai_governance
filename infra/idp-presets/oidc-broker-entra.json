@@ -1,0 +1,22 @@
+{
+  "_comment": "Keycloak identity-provider broker to Entra ID (Azure AD). POST to /admin/realms/<realm>/identity-provider/instances. 'Login' on our UI redirects users to Entra (incl. MFA/Conditional Access) and returns them here. Register a confidential web app in Entra; redirect URI = <KC>/realms/<realm>/broker/entra/endpoint. Replace <<PLACEHOLDERS>>.",
+  "alias": "entra",
+  "displayName": "Sign in with Microsoft",
+  "providerId": "oidc",
+  "enabled": true,
+  "trustEmail": true,
+  "storeToken": false,
+  "firstBrokerLoginFlowAlias": "first broker login",
+  "config": {
+    "clientId": "<<ENTRA_APP_CLIENT_ID>>",
+    "clientSecret": "<<ENTRA_APP_CLIENT_SECRET>>",
+    "clientAuthMethod": "client_secret_post",
+    "issuer": "https://login.microsoftonline.com/<<TENANT_ID>>/v2.0",
+    "authorizationUrl": "https://login.microsoftonline.com/<<TENANT_ID>>/oauth2/v2.0/authorize",
+    "tokenUrl": "https://login.microsoftonline.com/<<TENANT_ID>>/oauth2/v2.0/token",
+    "jwksUrl": "https://login.microsoftonline.com/<<TENANT_ID>>/discovery/v2.0/keys",
+    "useJwksUrl": "true",
+    "defaultScope": "openid email profile",
+    "syncMode": "FORCE"
+  }
+}
