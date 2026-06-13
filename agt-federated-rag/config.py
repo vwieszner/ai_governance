@@ -244,6 +244,17 @@ class Settings(BaseSettings):
     # production sets METRICS_TOKEN and scrapes with `Authorization: Bearer <token>`.
     metrics_token: str = ""
 
+    # ── BFF browser session (production auth: no token in the browser) ─────────
+    # The browser holds only this opaque HttpOnly cookie; tokens live server-side in Redis.
+    bff_cookie_name: str = "__Host-agtsession"
+    bff_cookie_secure: bool = True            # required for __Host- prefix; browsers allow it on localhost
+    bff_session_ttl_seconds: int = 28800      # 8h absolute session lifetime
+    bff_client_id: str = "rag-ui"             # public client + server-side PKCE
+    # The browser-facing origin the BFF redirect_uri is built from (must be a registered
+    # rag-ui redirect URI). Dev: the Vite origin; prod: the division's edge origin.
+    bff_public_base_url: str = "http://localhost:5173"
+    bff_post_login_redirect: str = "/"        # where to send the browser after login
+
     # CORS — comma-separated list of allowed origins (str, not list[str], so that
     # operators can set the env var as a plain comma-separated string without
     # needing JSON escaping, matching the convention used by other list settings).

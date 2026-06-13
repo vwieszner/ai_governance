@@ -443,6 +443,13 @@ if settings.sre_enabled:
         slo_latency_p99_ms=settings.sre_slo_latency_p99_ms,
     )
 
+# BFF session router + middleware (production browser auth — no token in the browser).
+# The middleware resolves a valid session cookie into an Authorization header (and enforces
+# CSRF), so the JWT-validating endpoints below work unchanged for cookie-authenticated SPAs.
+from api import bff  # noqa: E402
+app.include_router(bff.router)
+app.add_middleware(bff.BFFSessionMiddleware)
+
 # Correlation ID middleware — inject X-Request-ID into every request/response.
 # Added before body-size so every response (including 413) carries the header.
 app.add_middleware(_CorrelationIdMiddleware)
@@ -457,9 +464,9 @@ app.add_middleware(_LimitBodySizeMiddleware, max_bytes=settings.max_request_body
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
-    allow_credentials=False,
+    allow_credentials=True,                    # BFF session cookie + CSRF header
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept", "X-Request-ID"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Request-ID", "X-CSRF-Token"],
 )
 
 
