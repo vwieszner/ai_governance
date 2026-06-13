@@ -115,10 +115,17 @@ The gaps that block deployment against a real corporate IdP and network.
       _Done: 4 hermetic tests (default-deny, unlisted→rejected, allowed→transport, no token
       leak). 103 backend tests green._
 
-- [ ] **12. `agtctl` admin CLI** — `grant`/`revoke`/`list` for users *and* groups,
-      `doctor` (packaged post-deploy smoke probes from the existing test suites),
-      `status` across divisions.
-      _Why: day-2 ops; today grants are seeding scripts._ (~2–3 d)
+- [x] **12. `agtctl` admin CLI** — `scripts/agtctl.py`: `status` (all divisions), `doctor`
+      (per-division health probes), `list` (tuples on a doc), `grant`/`revoke` for **users**
+      (issuer-namespaced, with `--home` for cross-division) **and groups**
+      (`group#member` viewer). Standalone (OpenFGA REST + manifests); principal byte-identical
+      to the runtime (tested). Also added `scripts/migrate_authz_model.py` to push the
+      group-enabled model to live stores without re-onboarding.
+      _PROVEN LIVE END-TO-END: migrated the model to alpha/beta/gamma; `agtctl grant --group
+      finance` → carol (in the finance IdP group, ZERO per-user tuples) queried alpha →
+      LOCAL_ALLOWED + real answer; `agtctl revoke --group finance` → carol immediately
+      LOCAL_DENIED. Full IdP-group → claim → contextual tuple → group viewer → answer →
+      revoke chain, live through the real /query pipeline. 4 helper tests; 107 backend green._
 
 - [ ] **13. Observability preset + backup/restore runbook** — Prometheus metrics,
       Grafana dashboard, alert rules (auth-failure spikes, circuit-breaker open,
