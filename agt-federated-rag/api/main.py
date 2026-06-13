@@ -1119,19 +1119,16 @@ async def list_pending_approvals(
     """Authenticated approver inbox — the pending access requests THIS caller
     (as data owner) is entitled to decide.
 
-    The requester never learns the ``request_id`` (L-6); only the owner can
-    enumerate the requests routed to them. Implemented by listing running
-    ``ApprovalWorkflow`` executions and keeping those whose designated approver
-    == the caller's ``sub``. (This performs O(open requests) point queries and
-    does not scale to large request volumes; indexing the approver as a Temporal
-    search attribute would fix this.)
+    The requester never learns the ``request_id`` (L-6); only the owner can enumerate the
+    requests routed to them. Backed by the Redis approval index keyed on the caller's
+    NAMESPACED principal (email|issuer-ns) — a fast, consistent point read. (The previous
+    implementation scanned Temporal `list_workflows`, which on the bundled start-dev server
+    is eventually-consistent + O(open requests) — it lagged/stalled the inbox; the index
+    removes that dependency. Temporal remains the source of truth for the decision itself.)
 
     Returns ``{"pending": [{"request_id", "requester_id", "query"}]}``.
     """
     _, claims = await _get_bearer_token(authorization)
-    # The owner is seeded/stored as the NAMESPACED principal (email|issuer-ns), which is
-    # also what the workflow records as approver_id — compare like-for-like, NOT the raw
-    # Keycloak `sub` (a UUID that never equals the principal, which would empty the inbox).
     try:
         caller = principal(claims)
     except ValueError as exc:
@@ -1140,30 +1137,11 @@ async def list_pending_approvals(
             status_code=401,
             detail="Token lacks a verified email required for authorization",
         )
-    temporal_client: TemporalClient = request.app.state.temporal_client
-    pending: list[dict[str, str]] = []
-    try:
-        scanned = 0
-        async for wf in temporal_client.list_workflows(
-            "WorkflowType = 'ApprovalWorkflow' AND ExecutionStatus = 'Running'"
-        ):
-            scanned += 1
-            if scanned > 200:          # bound the scan for safety
-                break
-            try:
-                info = await temporal_client.get_workflow_handle(wf.id).query("get_info")
-            except Exception:
-                continue                # workflow completing / not yet queryable — skip
-            if info.get("decided") or info.get("approver_id") != caller:
-                continue
-            pending.append({
-                "request_id": wf.id.removeprefix("approval-"),
-                "requester_id": str(info.get("user_id", "")),
-                "query": str(info.get("query", "")),
-            })
-    except Exception as e:
-        log.error("list_pending_approvals_failed", error=str(e))
-        raise HTTPException(status_code=503, detail="Approval service temporarily unavailable")
+    import approval_index
+    items = await approval_index.list_for(caller)
+    pending = [{"request_id": it.get("request_id", ""),
+                "requester_id": it.get("requester_id", ""),
+                "query": it.get("query", "")} for it in items]
     return JSONResponse(content={"pending": pending}, status_code=200)
 
 
@@ -1223,7 +1201,11 @@ async def authenticated_approval(
     try:
         info = await handle.query("get_info")
     except Exception as e:
+        # Workflow gone (completed/terminated) but the inbox index still lists it — self-heal
+        # by dropping the stale entry so the inbox converges instead of showing dead requests.
         log.warning("authenticated_approval_query_failed", error=str(e))
+        import approval_index
+        await approval_index.remove(approver_principal, request_id)
         raise HTTPException(status_code=404, detail="No open approval request found")
     if info.get("decided"):
         raise HTTPException(status_code=409, detail="This request has already been decided")
@@ -1245,6 +1227,10 @@ async def authenticated_approval(
         # S-6: log full details internally, return a generic message to the caller.
         log.error("authenticated_approval_signal_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to record decision. Please try again.")
+
+    # Drop it from the approver's inbox index now that it's decided.
+    import approval_index
+    await approval_index.remove(approver_principal, request_id)
 
     log.info("authenticated_approval_recorded", decision=decision, agt_audit=True)
     return JSONResponse(content={"status": "recorded"}, status_code=200)

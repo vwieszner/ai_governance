@@ -695,6 +695,12 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
             approval_request_id=approval_request_id,
         )
 
+    # Record the pending request in the Redis inbox index so the approver's
+    # /approvals/pending is a fast, consistent point read (not a laggy Temporal
+    # visibility scan). Best-effort: a failure here never blocks the approval.
+    import approval_index
+    await approval_index.record(approver_id, approval_request_id, user_id, state["query"])
+
     # LLM generates a contextual message. Only source names from metadata are
     # passed — never chunk text — so the security boundary is preserved.
     sources = sorted({

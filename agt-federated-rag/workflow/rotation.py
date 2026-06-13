@@ -14,15 +14,21 @@ testable without the Temporal sandbox; the activity is a thin wrapper.
 """
 from __future__ import annotations
 
-import json
-import secrets as _secrets
 from dataclasses import dataclass
 from datetime import timedelta
-from pathlib import Path
 
-import structlog
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
+
+# Temporal validates the workflow-defining module inside its deterministic sandbox and
+# rejects non-deterministic imports (structlog/secrets pull in random.getrandbits). These
+# are used ONLY by the activity + helpers (which run OUTSIDE the sandbox), so import them
+# pass-through — the same pattern workflow/approval.py uses for its activity imports.
+with workflow.unsafe.imports_passed_through():
+    import json
+    import secrets as _secrets
+    from pathlib import Path
+    import structlog
 
 log = structlog.get_logger(__name__)
 

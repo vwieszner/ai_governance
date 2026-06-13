@@ -84,7 +84,10 @@ The gaps that block deployment against a real corporate IdP and network.
       approval HMAC secret (with a prior-value overlap window); registered in the worker;
       started via `scripts/schedule_rotation.py --division <id> --cron`. Logic factored
       into `perform_rotation()` (best-effort: one leg failing never aborts the other).
-      _Done: 5 hermetic tests (HMAC roll+overlap, best-effort isolation, worker wiring)._
+      _Done: 5 hermetic tests. NOTE: the workflow-defining module must import non-deterministic
+      deps (structlog/secrets) under `workflow.unsafe.imports_passed_through()` or Temporal's
+      sandbox rejects the workflow and the WHOLE worker fails to start — caught + fixed when
+      it broke the approval e2e; now guarded by the live e2e._
 
 - [x] **9. Audit-chain anchoring + field allowlist** — each append publishes the chain
       HEAD (seq, hash) to an external anchor (local sidecar by default, or `AUDIT_ANCHOR_URL`

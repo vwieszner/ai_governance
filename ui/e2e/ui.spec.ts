@@ -98,10 +98,16 @@ test('approval flow: alice requests, bob approves in his inbox, alice gets the a
   await alicePane.locator('button.btn-send').click()
   await expect(alicePane.locator('.badge-yellow')).toBeVisible({ timeout: 210_000 })  // ⏳ Awaiting approval
 
-  // bob's inbox surfaces the request (polls every ~4s); he approves it.
-  const approve = bobPane.locator('.approval-item .btn-approve').first()
-  await expect(approve).toBeVisible({ timeout: 60_000 })
-  await approve.click()
+  // bob's inbox surfaces the request (polls every ~4s); approve every pending item so a
+  // stale index entry (self-healed server-side on click) can't hide the real request.
+  await expect(bobPane.locator('.approval-item .btn-approve').first()).toBeVisible({ timeout: 60_000 })
+  for (let i = 0; i < 5; i++) {
+    const buttons = bobPane.locator('.approval-item .btn-approve')
+    const n = await buttons.count()
+    if (n === 0) break
+    await buttons.first().click()
+    await bobPane.page().waitForTimeout(1500)  // let the decision POST + inbox refresh settle
+  }
 
   // Back in alice's pane, the answer is DELIVERED automatically once the grant lands
   // and her client polls the outcome — no re-typing, no shared browser.
