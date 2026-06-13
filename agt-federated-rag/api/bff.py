@@ -148,6 +148,13 @@ def _clear_session_cookie(resp) -> None:
 
 # ── Routes ───────────────────────────────────────────────────────────────────────
 
+# Browser-bound login state: a cookie set at /bff/login and required to match the `state`
+# at /bff/callback. Without this, the callback only checks that *some* state exists in Redis
+# — vulnerable to login CSRF / session fixation (an attacker plants their own code in a
+# victim's session). SameSite=Lax (NOT Strict) so it survives the top-level IdP redirect back.
+_STATE_COOKIE = "__Host-bff_state"
+
+
 @router.get("/bff/login")
 async def bff_login() -> RedirectResponse:
     verifier, challenge = _pkce_pair()
@@ -163,13 +170,21 @@ async def bff_login() -> RedirectResponse:
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     })
-    return RedirectResponse(f"{_authorize_url()}?{params}", status_code=302)
+    out = RedirectResponse(f"{_authorize_url()}?{params}", status_code=302)
+    out.set_cookie(_STATE_COOKIE, state, max_age=600, httponly=True,
+                   secure=settings.bff_cookie_secure, samesite="lax", path="/")
+    return out
 
 
 @router.get("/bff/callback")
-async def bff_callback(code: str = "", state: str = "") -> RedirectResponse:
+async def bff_callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
     if not code or not state:
         raise HTTPException(status_code=400, detail="missing code/state")
+    # Bind the callback to the browser that started login (login-CSRF / fixation guard).
+    cookie_state = request.cookies.get(_STATE_COOKIE, "")
+    if not cookie_state or not hmac.compare_digest(cookie_state, state):
+        log.warning("bff_state_mismatch", agt_audit=True)
+        raise HTTPException(status_code=400, detail="login state mismatch")
     r = await _redis()
     verifier = await r.get(_pkce_key(state))
     if not verifier:
@@ -213,6 +228,7 @@ async def bff_callback(code: str = "", state: str = "") -> RedirectResponse:
     log.info("bff_login_ok", user=sess["user"], agt_audit=True)
     out = RedirectResponse(settings.bff_post_login_redirect, status_code=302)
     _set_session_cookie(out, sid)
+    out.delete_cookie(_STATE_COOKIE, path="/")     # one-time login-state cookie consumed
     return out
 
 

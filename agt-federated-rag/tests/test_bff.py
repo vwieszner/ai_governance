@@ -64,6 +64,24 @@ def test_session_endpoint_returns_identity_not_token(monkeypatch):
     assert "refresh" not in body
 
 
+def test_callback_rejects_unbound_state_login_csrf(monkeypatch):
+    # Login-CSRF / fixation guard: the callback must reject a state that isn't bound to the
+    # initiating browser (no matching __Host-bff_state cookie), even if the verifier exists.
+    fake = _patch_redis(monkeypatch)
+    asyncio.run(fake.setex(bff._pkce_key("STATE1"), 600, "verifier"))
+
+    class _Req:
+        cookies: dict = {}          # attacker callback: no browser-bound state cookie
+    with pytest.raises(bff.HTTPException) as ei:
+        asyncio.run(bff.bff_callback(_Req(), code="abc", state="STATE1"))
+    assert ei.value.status_code == 400
+
+    class _ReqWrong:
+        cookies = {bff._STATE_COOKIE: "DIFFERENT"}
+    with pytest.raises(bff.HTTPException):
+        asyncio.run(bff.bff_callback(_ReqWrong(), code="abc", state="STATE1"))
+
+
 def test_refresh_skips_when_not_expiring(monkeypatch):
     _patch_redis(monkeypatch)
     sess = {"access": "AT", "refresh": "R", "expiry": time.time() + 600}
