@@ -15,7 +15,7 @@ def _auth(viewer: bool, pending: bool):
 
     auth = ofga.OpenFGAAuth()
 
-    async def _check(user_id, chunk_id, relation):  # noqa: ANN001 - stub
+    async def _check(user_id, chunk_id, relation, groups=None):  # noqa: ANN001 - stub
         if relation == ofga.Relation.VIEWER:
             return viewer
         if relation == ofga.Relation.PENDING_APPROVAL:

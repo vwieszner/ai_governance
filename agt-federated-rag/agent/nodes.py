@@ -414,7 +414,10 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
                 result_empty["status_message"] = "I'm specialised for company knowledge questions and couldn't find anything relevant to that."
         return result_empty
 
-    decisions = await auth.batch_decide(user_id, chunk_ids)
+    # Phase-1 group grants: thread the user's IdP groups so a chunk granted to one of
+    # their groups (group#member viewer) resolves as allowed — membership is supplied to
+    # OpenFGA as a live contextual tuple, never persisted.
+    decisions = await auth.batch_decide(user_id, chunk_ids, groups=state.get("user_groups") or [])
 
     allowed = [cid for cid, d in decisions.items() if d == AuthzDecision.ALLOWED]
     pending = [cid for cid, d in decisions.items() if d == AuthzDecision.NEEDS_APPROVAL]

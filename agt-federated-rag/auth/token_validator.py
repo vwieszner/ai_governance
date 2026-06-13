@@ -341,41 +341,76 @@ def issuer_namespace(iss: str) -> str:
 def principal(claims: dict) -> str:
     """Canonical federated authorization principal for OpenFGA.
 
-    Format: ``<email>|<issuer-namespace>`` — e.g.
-    ``alice@example.com|56b707f1d1087268``. The lower-cased email is the stable,
-    human-readable, cross-division subject; the issuer-namespace (see
+    Format: ``<subject>|<issuer-namespace>`` — e.g.
+    ``alice@example.com|56b707f1d1087268``. The lower-cased subject is the stable,
+    human-readable, cross-division identifier; the issuer-namespace (see
     :func:`issuer_namespace`) scopes it so an issuer can only vouch for ITS OWN users.
 
-    Requires ``email``, ``email_verified == true``, and ``iss``. The STRENGTH of those
-    claims depends on how the caller obtained them:
-      - Local ``/query``: claims come from :func:`validate_token` — ``iss``/``email`` are
-        cryptographically verified against the home Keycloak JWKS.
+    The SUBJECT claim is configurable (``settings.principal_claim``, default ``email``)
+    so this works against any OIDC IdP — Keycloak ``email``, Entra ``preferred_username``/
+    ``upn``, etc. When the subject claim is ``email`` and ``settings.require_verified_principal``
+    is true (the default, hardened posture), ``email_verified == true`` is also required.
+
+    The STRENGTH of the claims depends on how the caller obtained them:
+      - Local ``/query``: claims come from :func:`validate_token` — cryptographically
+        verified against the home IdP JWKS.
       - Cross-division ``/a2a/query``: claims come from a peer's DID-signed assertion via
-        :func:`assertion_principal`. There the email/email_verified are VOUCHED by the
-        DID-authenticated home agent (not re-verified by a Keycloak signature here — see
-        that function's trust-model note); ``iss`` is bound to the signing peer.
+        :func:`assertion_principal` — VOUCHED by the DID-authenticated home agent (see that
+        function's trust-model note); ``iss`` is bound to the signing peer.
     Callers MUST pass claims from one of those paths, never the raw envelope's
     ``source_division``/``user_id``.
 
     Raises:
-        ValueError: if ``iss`` or a verified ``email`` is absent.
+        ValueError: if ``iss`` or the configured subject claim is absent (or, for an
+        email subject under the verified policy, if the email is unverified).
     """
     iss = claims.get("iss")
     if not iss:
         raise ValueError("token missing 'iss' claim — cannot namespace principal")
-    email = claims.get("email")
-    if not email:
+    claim_name = settings.principal_claim
+    subject = claims.get(claim_name)
+    if not subject:
         raise ValueError(
-            "token missing 'email' claim — the federated authorization principal "
-            "requires a verified email. Configure the Keycloak client to include "
-            "the 'email' scope/mapper."
+            f"token missing '{claim_name}' claim — the authorization principal requires it. "
+            f"Configure the IdP to emit '{claim_name}', or set PRINCIPAL_CLAIM to a claim it does emit."
         )
-    if claims.get("email_verified") is not True:
-        raise ValueError(
-            "token 'email' is not verified (email_verified != true) — refusing to "
-            "build an authorization principal from an unverified email."
-        )
-    return f"{str(email).strip().lower()}|{issuer_namespace(str(iss))}"
+    # email_verified is an email-specific assurance; enforce it only for an email subject
+    # under the configured policy (keeps the hardened Keycloak default, but lets an IdP
+    # that uses upn/preferred_username — and emits no email_verified — work).
+    if settings.require_verified_principal and claim_name == "email":
+        if claims.get("email_verified") is not True:
+            raise ValueError(
+                "token 'email' is not verified (email_verified != true) — refusing to "
+                "build an authorization principal from an unverified email."
+            )
+    return f"{str(subject).strip().lower()}|{issuer_namespace(str(iss))}"
+
+
+def extract_groups(claims: dict) -> list[str]:
+    """The user's group memberships from the configured ``settings.groups_claim``.
+
+    Maps an IdP's groups/roles (AD security groups via Keycloak/Entra/Okta) to OpenFGA
+    ``group`` ids. Used by the data path as LIVE contextual ``group#member`` tuples so a
+    user inherits a group's baseline document access with no per-user tuple — and loses it
+    the instant the IdP drops them from the group (the next token simply omits it).
+
+    Accepts a list claim or a single string. Normalises: trims whitespace, drops empties,
+    and strips a leading ``/`` (Keycloak emits group *paths* like ``/finance``). Returns
+    [] when the claim is absent/empty, so group support is opt-in and never fails closed
+    on a token that simply has no groups.
+    """
+    raw = claims.get(settings.groups_claim)
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for g in raw:
+        if isinstance(g, str) and g.strip():
+            out.append(g.strip().lstrip("/"))
+    return out
 
 
 def extract_client_id(claims: dict) -> str | None:

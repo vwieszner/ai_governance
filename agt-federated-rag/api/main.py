@@ -54,6 +54,7 @@ import mesh.agent_identity as agent_identity
 from auth.token_validator import (
     AuthServiceUnavailable,
     assertion_principal,
+    extract_groups,
     issuer_namespace,
     minimal_assertion_claims,
     principal,
@@ -596,6 +597,10 @@ async def query(
     # a delegated peer call carries a non-replayable, DID-signed assertion. run_query
     # stashes these in a ContextVar — never in state or logs.
     fwd_claims = minimal_assertion_claims(claims)
+    # Phase-1 group grants: the user's IdP groups (from the verified token) become live
+    # contextual group#member tuples in the per-chunk OpenFGA check, so a document granted
+    # to one of their groups is allowed without a per-user tuple.
+    user_groups = extract_groups(claims)
 
     async def event_stream() -> AsyncIterator[dict[str, str]]:
         yield {"event": "status", "data": '{"status": "working"}'}
@@ -607,6 +612,7 @@ async def query(
                 user_claims=fwd_claims,
                 task_id=task_id,
                 context_id=context_id,
+                user_groups=user_groups,
             )
         )
 
@@ -710,6 +716,7 @@ async def task_result(
             task_id=task_id,
             context_id="",
             check_only=True,
+            user_groups=extract_groups(claims),
         )
     except PermissionError as exc:
         log.warning("task_result_governance_denied", task_id=task_id, error=str(exc))

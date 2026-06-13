@@ -45,9 +45,16 @@ AUTH_MODEL = {
                     # the non_expired condition (a time-bound grant). OpenFGA stops
                     # treating a conditioned tuple as granting access once current_time
                     # >= expiry — expiry is enforced at check time, no sweeper needed.
+                    # Phase-1 group grants: viewer may be granted to an individual
+                    # user (optionally time-bound) OR to a `group#member` userset, so an
+                    # IdP group (AD/Entra/Okta) gets baseline access to a doc set. The
+                    # user's group membership is supplied as a LIVE contextual tuple from
+                    # the token at check time (auth.openfga._group_contextual_tuples), so
+                    # leaving the group revokes access on the next request.
                     "viewer": {"directly_related_user_types": [
                         {"type": "user"},
                         {"type": "user", "condition": "non_expired"},
+                        {"type": "group", "relation": "member"},
                     ]},
                     "pending_approval": {"directly_related_user_types": [{"type": "user"}]},
                 }

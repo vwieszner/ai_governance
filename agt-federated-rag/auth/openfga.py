@@ -118,13 +118,33 @@ class OpenFGAAuth:
 
     # ── Core check ────────────────────────────────────────────────────────────
 
+    def _group_contextual_tuples(self, user_id: str, groups: list[str] | None) -> list[Any]:
+        """Build ephemeral ``user:X member group:G`` tuples from the token's groups.
+
+        These are CONTEXTUAL tuples — they exist only for this one check, never persisted.
+        Group→document access is stored permanently (admin grants ``group:G#member`` viewer
+        on a doc set); the user→group membership is sourced LIVE from the token here, so
+        removing the user from the IdP group revokes their inherited access on the very next
+        request. No sync job, no stale membership.
+        """
+        if not groups:
+            return []
+        from openfga_sdk.client.models import ClientTuple  # type: ignore[import]
+        u = self._user_id(user_id)
+        return [ClientTuple(user=u, relation="member", object=f"group:{g}") for g in groups]
+
     async def check(
         self,
         user_id: str,
         chunk_id: str,
         relation: Relation,
+        groups: list[str] | None = None,
     ) -> bool:
         """Check whether *user_id* has *relation* on *chunk_id*.
+
+        If *groups* is given, the user's group memberships are supplied as contextual
+        tuples so a grant made to a ``group#member`` userset resolves for this user
+        (see :meth:`_group_contextual_tuples`).
 
         Emits a structured audit log event for every check (AGT audit hook).
         """
@@ -137,6 +157,7 @@ class OpenFGAAuth:
 
         from openfga_sdk.client.models import ClientCheckRequest  # type: ignore[import]
 
+        ctx_tuples = self._group_contextual_tuples(user_id, groups)
         body = ClientCheckRequest(
             user=self._user_id(user_id),
             relation=relation.value,
@@ -145,6 +166,8 @@ class OpenFGAAuth:
             # evaluated per request. Unconditioned tuples ignore it; REQUIRED once any
             # conditioned tuple exists, so we always pass it.
             context={"current_time": datetime.now(timezone.utc).isoformat()},
+            # Group memberships as live, request-scoped tuples (None when no groups).
+            contextual_tuples=ctx_tuples or None,
         )
         try:
             resp = await self._client.check(body)
@@ -174,18 +197,21 @@ class OpenFGAAuth:
 
     # ── Decision logic ────────────────────────────────────────────────────────
 
-    async def decide(self, user_id: str, chunk_id: str) -> AuthzDecision:
+    async def decide(
+        self, user_id: str, chunk_id: str, groups: list[str] | None = None
+    ) -> AuthzDecision:
         """Return a three-way AuthzDecision for user_id on chunk_id.
 
         Decision priority:
-            1. ALLOWED   — user has viewer, editor, or owner relation.
+            1. ALLOWED   — user has viewer, editor, or owner relation (directly OR via a
+               group#member userset, using *groups* as contextual membership).
             2. NEEDS_APPROVAL — user has pending_approval relation only.
             3. DENIED    — no relation found.
         """
         # Fan out the two most common checks concurrently.
         viewer_ok, pending_ok = await asyncio.gather(
-            self.check(user_id, chunk_id, Relation.VIEWER),
-            self.check(user_id, chunk_id, Relation.PENDING_APPROVAL),
+            self.check(user_id, chunk_id, Relation.VIEWER, groups=groups),
+            self.check(user_id, chunk_id, Relation.PENDING_APPROVAL, groups=groups),
         )
         if viewer_ok:
             return AuthzDecision.ALLOWED
@@ -194,11 +220,15 @@ class OpenFGAAuth:
         return AuthzDecision.DENIED
 
     async def batch_decide(
-        self, user_id: str, chunk_ids: list[str]
+        self, user_id: str, chunk_ids: list[str], groups: list[str] | None = None
     ) -> dict[str, AuthzDecision]:
-        """Return AuthzDecision for each chunk_id, evaluated concurrently."""
+        """Return AuthzDecision for each chunk_id, evaluated concurrently.
+
+        *groups* (from the user's token) are threaded into every per-chunk decision so a
+        document granted to one of the user's groups resolves as ALLOWED.
+        """
         decisions = await asyncio.gather(
-            *(self.decide(user_id, cid) for cid in chunk_ids)
+            *(self.decide(user_id, cid, groups=groups) for cid in chunk_ids)
         )
         return dict(zip(chunk_ids, decisions))
 

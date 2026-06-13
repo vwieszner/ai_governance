@@ -89,6 +89,11 @@ class AgentState(TypedDict):
     # to another peer (no A->B->A loops, no forward-empty-claims 401).
     allow_remote: bool
 
+    # Phase-1 group grants: the user's IdP group ids (from the token's groups claim),
+    # threaded into the per-chunk OpenFGA check as contextual group#member tuples so a
+    # document granted to one of the user's groups resolves as allowed. Empty = no groups.
+    user_groups: list[str]
+
     # Approval-poll re-auth (GET /tasks/{id}/result): when True, a still-unauthorized
     # request is RE-CHECKED against live OpenFGA state WITHOUT spawning a new approval
     # workflow or writing new pending tuples (start_approval short-circuits to "pending").

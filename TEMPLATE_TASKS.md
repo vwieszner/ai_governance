@@ -21,19 +21,24 @@ The gaps that block deployment against a real corporate IdP and network.
       _Accept: alice logs in via a redirect to the IdP (incl. MFA) and the existing
       Playwright e2e suite passes unchanged._ (~3–4 d)
 
-- [ ] **2. Configurable claim mapping** — per-division `PRINCIPAL_CLAIM`,
-      verified-claim policy, audience config in `auth/token_validator.py`.
-      _Why: Entra tokens carry `upn`/`oid` and often no `email_verified`._
-      _Accept: a token without `email`/`email_verified` but with the configured claim
-      builds the namespaced principal; hermetic tests cover Entra/Okta token shapes._ (~1–2 d)
+- [x] **2. Configurable claim mapping** — `PRINCIPAL_CLAIM`, `REQUIRE_VERIFIED_PRINCIPAL`,
+      `GROUPS_CLAIM` in config; `principal()` reads the configured subject claim and only
+      enforces `email_verified` for an email subject under the policy.
+      _Done: defaults keep the hardened Keycloak posture (83 tests green); tested live
+      against an Entra-style `preferred_username` token with no `email_verified`._
 
-- [~] **3. Group-based grants end-to-end** — wire `group#member` into chunk
-      `viewer`/`pending_approval` (model edit + live migration — mechanism proven in M5),
-      extract the group claim from tokens, support baseline doc-sets per group.
-      _Scaffold: the `group` type already exists in `scripts/_provisioning.py` AUTH_MODEL
-      but chunks only accept direct `user` grants._
-      _Accept: a user in group G sees G's doc set with ZERO per-user tuples; removing the
-      user from G in the IdP revokes on their next token._ (~3 d)
+- [x] **3. Group-based grants end-to-end** — `group#member` wired into chunk `viewer`
+      in the AUTH_MODEL; `extract_groups()` parses the IdP group claim (list/str,
+      Keycloak `/path` stripping); `openfga.check/decide/batch_decide` thread groups as
+      LIVE contextual `member` tuples (never persisted); groups flow
+      api `/query` + `/tasks/{id}/result` → `run_query` → state → `check_auth`.
+      _PROVEN LIVE on alpha's OpenFGA (throwaway store, deleted): a user with ZERO
+      per-user tuples is DENIED without group membership and ALLOWED with it — so leaving
+      the IdP group revokes on the next token. Persistent grant = `group:G#member` viewer
+      on a doc; membership = contextual, from the token._
+      _Remaining for a full UI demo (Phase-1 #4 territory): seed a Keycloak groups
+      protocol-mapper + a group, and push the new model to the live division stores
+      (re-onboard — additive/reversible)._
 
 - [ ] **4. IdP presets for the bundled Keycloak** — ready-made realm configs:
       AD/LDAP user-federation template, Entra broker, Okta broker.

@@ -133,6 +133,22 @@ class Settings(BaseSettings):
     agent_client_id: str = Field(default=...)    # REQUIRED — Keycloak client ID for this agent
     agent_client_secret: str = Field(default=...) # REQUIRED
 
+    # ── Identity claim mapping (template: works against ANY OIDC IdP) ──────────
+    # The authorization SUBJECT claim. Default "email" (Keycloak). Entra ID often
+    # uses "preferred_username"/"upn"; Okta uses "email". The principal becomes
+    # "<claim-value>|<issuer-namespace>" so per-IdP token shapes work with no code change.
+    principal_claim: str = "email"
+    # Whether to require the email_verified flag. Email-specific; some IdPs (Entra)
+    # omit it. Default true (the hardened Keycloak posture). Set false when the chosen
+    # principal_claim is not an email or the IdP does not emit email_verified.
+    require_verified_principal: bool = True
+    # Token claim carrying the user's group/role memberships (a list, or a single
+    # string). Maps IdP groups (AD/Entra/Okta) to OpenFGA `group#member` usersets so a
+    # user gets a group's baseline document access with NO per-user tuple — and loses it
+    # the moment the IdP drops them from the group (membership is sourced live from the
+    # token as a contextual tuple, never persisted). Empty value/claim = no group grants.
+    groups_claim: str = "groups"
+
     # ── AgentMesh (Microsoft Agent Governance Toolkit — agent identity) ───────
     # Each agent has a DID (Decentralized Identifier) with Ed25519 credentials,
     # created via agentmesh.AgentIdentity.create() on first run.
