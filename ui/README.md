@@ -1,113 +1,71 @@
-# Federated RAG UI
+# AGT Federated RAG — UI
 
 ## Overview
 
-This React + Vite application provides a split-screen interface for interacting with two federated RAG backends simultaneously. The left pane authenticates as **alice** against `federated-rag` (cluster-a, A2A protocol) and the right pane authenticates as **bob** against `agt-federated-rag` (cluster-b, AGT/DID identity). Both panes stream task updates in real time over SSE. A slide-up **Monitor** panel captures every agent-to-agent event emitted by either cluster so you can observe cross-cluster peer calls, approval handshakes, and status transitions in one place.
+A React + Vite split-screen interface over **two divisions** of the AGT federated-RAG system.
+The left pane is **alice @ Division Alpha**, the right pane **bob @ Division Beta** — both speak
+the *same* AGT contract (`POST /query`, status/result/done SSE), differing only in which
+physically-isolated division they hit. Both stream answers in real time; a slide-up **Monitor**
+panel captures every agent event (cross-division peer calls, approval handshakes, status
+transitions) so you can watch the governance flow live. The owner pane shows an **approval
+inbox**; an approved requester's answer is delivered back automatically.
 
----
+> This replaced an earlier "two different backends (cluster-a/cluster-b on 8000/8002)" design.
+> There is one codebase (`agt-federated-rag/`) run as multiple divisions; both panes are AGT.
 
 ## Prerequisites
 
 | Requirement | Notes |
 |---|---|
-| Node.js 18+ | `node -v` to check |
-| `federated-rag` running | cluster-a, default port 8000 |
-| `agt-federated-rag` running | cluster-b, default port 8002 |
-| Keycloak configured | realm `rag`, client `rag-ui`, users `alice` and `bob` created |
+| Node.js 18+ | `node -v` |
+| Two divisions running | alpha agent `:9000`, beta agent `:9100` (via `scripts/bootstrap.ps1` or `clusters.ps1 start all`) |
+| Keycloak per division | realm `rag`, client `rag-ui`, users `alice`/`bob` — provisioned by onboarding |
 
-Both backends must have `CORSMiddleware` enabled (see [Note on CORS](#note-on-cors)).
-
----
-
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Copy the example env file and edit it for your environment
-cp .env.example .env
-
-# 2. Install dependencies
+cp .env.example .env.prod      # then set NVIDIA_API_KEY; defaults already point at alpha/beta
 npm install
-
-# 3. Start the dev server
-npm run dev
+npm run start                  # vite --mode prod -> http://localhost:5173
 ```
 
-Open **http://localhost:5173** in your browser.
+Logins: alice (alpha) / bob (beta); passwords in `infra/generated/<div>/secrets.json`
+(`seed_user_password`). Run one throwaway query per pane first to warm the LLM.
 
----
+## Configuration (`.env.prod`, consumed by `vite.config.ts`)
 
-## Environment Variables
+The browser only talks to the Vite origin (`:5173`), which **proxies** to the divisions, so API
+hosts/keys are never in the browser bundle. Variables **without** `VITE_` are proxy config only;
+`VITE_`-prefixed ones reach the browser.
 
-These variables configure the Vite dev-server proxy. They are **not** embedded in the browser bundle.
-
-Copy `.env.example` to `.env` and adjust the values to match your deployment.
-
-| Variable | Default | Description |
+| Var | Default | Meaning |
 |---|---|---|
-| `CLUSTER_A_URL` | `http://localhost:8000` | Base URL of the `federated-rag` (cluster-a) FastAPI server |
-| `CLUSTER_B_URL` | `http://localhost:8002` | Base URL of the `agt-federated-rag` (cluster-b) FastAPI server |
-| `KEYCLOAK_A_URL` | `http://localhost:8080` | Keycloak server root used to authenticate alice (no realm or path suffix) |
-| `KEYCLOAK_B_URL` | `http://localhost:8080` | Keycloak server root used to authenticate bob (no realm or path suffix) |
-| `REALM_A` | `rag` | Keycloak realm for cluster-a |
-| `REALM_B` | `rag` | Keycloak realm for cluster-b |
+| `AGT_A_URL` / `AGT_B_URL` | `127.0.0.1:9000` / `:9100` | division agent API targets |
+| `KEYCLOAK_A_URL` / `_B_URL` | `localhost:9002` / `:9102` | division IdP (MUST be `localhost` — Keycloak reflects the request host into the token `iss`, which the agent validates) |
+| `REALM_A` / `REALM_B` | `rag` | OIDC realm |
+| `VITE_AUTH_MODE` | `password` | `password` = the bundled two-pane demo; `pkce` = production OIDC Auth-Code + PKCE SSO redirect (set `VITE_OIDC_*`) |
+| `NVIDIA_API_KEY`, `NVIDIA_BASE_URL`, `VITE_NVIDIA_MODEL` | — | LLM proxy (key injected server-side) |
+| `VITE_CLUSTER_A_LABEL` / `_B_LABEL` | Division Alpha/Beta | pane headers |
 
----
+## Auth modes
 
-## How to Use
+- **password (demo):** Keycloak password grant, two independent panes in one tab.
+- **pkce (production):** `src/api/oidc.ts` — discovery-driven Authorization Code + PKCE redirect
+  to any OIDC IdP (Entra/Okta/Auth0/Keycloak), MFA handled by the IdP, no secret in the browser,
+  CSRF-state checked. Single authenticated session per tab.
 
-1. **Log in** — on the left pane enter `alice`'s password and click **Login**; on the right pane enter `bob`'s password and click **Login**. Each pane performs an OIDC password-grant flow against its configured Keycloak realm and stores the bearer token in component state.
-
-2. **Submit a query** — type a question in either pane's text field and press **Send**. The pane displays the task state (`submitted → working → completed`) and streams the answer as it arrives over SSE.
-
-3. **Watch the Monitor** — click the **Monitor** button in the header to slide up the event panel. Every `query_sent`, `agent_working`, `peer_call`, `approval_needed`, `completed`, and `failed` event from both clusters appears here in chronological order, colour-coded by cluster. Click **Monitor** again (or the close button) to hide the panel.
-
-4. **Peer calls** — when cluster-a delegates to cluster-b (or vice versa) you will see a `peer_call` event in the Monitor. The originating pane also shows a `peerTaskId` link so you can correlate tasks across clusters.
-
----
-
-## Production Build
+## Tests
 
 ```bash
-npm run build
+npm test        # Vitest unit: auth (password grant) + oidc (PKCE) + SSE normalization
+npm run e2e     # Playwright (real browser, live divisions): local answer, federated answer,
+                # and the full approval flow (park -> bob approves in inbox -> answer delivered)
 ```
+`npm run e2e` needs the UI dev server (`npm run start`) and the divisions up.
 
-Output goes to `dist/`. Serve it with any static file host:
+## How it maps to the backend
 
-```bash
-# Quick check with Vite's preview server
-npm run preview
-
-# Or copy dist/ into a FastAPI app
-# In your FastAPI main.py:
-# from fastapi.staticfiles import StaticFiles
-# app.mount("/", StaticFiles(directory="ui/dist", html=True), name="ui")
-```
-
-When serving behind FastAPI or nginx, make sure the `/api/a`, `/api/b`, `/auth/a`, and `/auth/b` path prefixes are reverse-proxied to the correct backend and Keycloak hosts — the same targets configured in `.env` for the Vite dev proxy.
-
----
-
-## Note on CORS
-
-Both backends configure `CORSMiddleware` with an **explicit origin allow-list** — `allow_origins=settings.cors_origins_list` — never a wildcard. The dev default is the Vite dev server (`http://localhost:5173`), and `allow_credentials=False` (the API authenticates via the `Authorization: Bearer` header, not cookies), with methods/headers restricted to the set the UI actually needs.
-
-To point the backends at a production UI origin, set the `CORS_ORIGINS` env var (comma-separated) — no code change required:
-
-```bash
-# federated-rag / agt-federated-rag .env
-CORS_ORIGINS=https://rag.example.com,https://admin.example.com
-```
-
-This maps to the middleware already wired in each `api/main.py`:
-
-```python
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins_list,  # explicit allow-list from CORS_ORIGINS
-    allow_credentials=False,                    # bearer-token auth, no cookies
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept", "X-Request-ID"],
-)
-```
-
-Keep `allow_credentials=False`: it avoids the wildcard-plus-credentials footgun and matches the bearer-token design. Similarly, update the Keycloak client's **Valid Redirect URIs** and **Web Origins** to match the production UI origin.
+- `src/api/auth.ts` — Keycloak password grant; `src/api/oidc.ts` — PKCE.
+- `src/api/rag.ts` — `POST /query` + status/result/done SSE; requester-side approval polling of
+  `GET /tasks/{id}/result` (uses the **server's** task id from the result event).
+- `src/components/` — `UserPane`, `LoginForm`, `ChatArea`, `TaskMessage`, `ApprovalInbox`, `MonitorPanel`.
