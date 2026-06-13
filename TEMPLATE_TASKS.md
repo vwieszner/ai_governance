@@ -15,11 +15,14 @@ Status legend: `[ ]` todo · `[~]` partially exists (seam/scaffold present) · `
 
 The gaps that block deployment against a real corporate IdP and network.
 
-- [ ] **1. PKCE / Auth-Code login in the UI** — replace the password-grant (ROPC) flow
-      with OIDC Authorization Code + PKCE redirect.
-      _Why: ROPC fails at any IdP with MFA/Conditional Access (i.e., most corporates)._
-      _Accept: alice logs in via a redirect to the IdP (incl. MFA) and the existing
-      Playwright e2e suite passes unchanged._ (~3–4 d)
+- [x] **1. PKCE / Auth-Code login in the UI** — OIDC Auth-Code + PKCE added as an
+      additive production mode (`VITE_AUTH_MODE=pkce` + `VITE_OIDC_*`), discovery-driven
+      so it works against Entra/Okta/Auth0/Keycloak with no browser secret; the bundled
+      two-pane demo keeps password grant.
+      _Done: `src/api/oidc.ts` (PKCE verifier/challenge, authorize redirect, state-CSRF
+      guard, code exchange, discovery); LoginForm shows "Sign in with SSO" when configured;
+      App handles the `?code=&state=` callback. 6 unit tests (incl. CSRF state-mismatch),
+      and the 3 Playwright e2e scenarios still pass unchanged (password mode default)._
 
 - [x] **2. Configurable claim mapping** — `PRINCIPAL_CLAIM`, `REQUIRE_VERIFIED_PRINCIPAL`,
       `GROUPS_CLAIM` in config; `principal()` reads the configured subject claim and only

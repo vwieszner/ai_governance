@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import { getToken, AuthError, type AuthTokens } from '../api/auth'
+import { beginLogin, readEnvConfig } from '../api/oidc'
 import type { ClusterConfig } from '../types'
 
 interface Props {
@@ -12,6 +13,27 @@ export function LoginForm({ cluster, onLogin }: Props) {
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+
+  // Production SSO path: when VITE_AUTH_MODE=pkce is configured, offer a redirect to the
+  // corporate IdP instead of the password form (which most IdPs block under MFA).
+  const oidc = readEnvConfig()
+  if (oidc) {
+    return (
+      <div className="login-form">
+        <p className="login-hint">
+          Sign in to <strong>{cluster.label}</strong>
+        </p>
+        <button
+          type="button"
+          className="btn-primary"
+          onClick={() => { void beginLogin(oidc).catch((e) => setError(String(e))) }}
+        >
+          Sign in with SSO
+        </button>
+        {error && <p className="login-error">{error}</p>}
+      </div>
+    )
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
