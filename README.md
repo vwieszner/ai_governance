@@ -27,6 +27,7 @@ Qdrant, and Keycloak.
 |---|---|---|
 | Per-chunk authorization | OpenFGA ReBAC, re-decided live on every query (instant revoke/expiry) | `auth/openfga.py` |
 | Default-deny governance | Every LangGraph node `_enforce`s a policy before acting | `agent/policies/` |
+| Prompt-injection defense | LLM has no action agency + denied data pruned pre-LLM; content spotlighting + hardened prompt + audited heuristic (LLM01) | `agent/injection.py` |
 | Cryptographic federation | Ed25519-DID-signed, replay-protected `/a2a/query`; per-DID issuer binding | `mesh/` |
 | Human-in-the-loop approval | Durable Temporal workflow; owner inbox; **answer delivered back** to the requester | `workflow/`, `api/main.py` |
 | Any-IdP identity | OIDC; configurable claim mapping (Keycloak/Entra/Okta) | `auth/token_validator.py` |
