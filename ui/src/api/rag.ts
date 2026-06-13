@@ -3,6 +3,20 @@ import type { AgentEvent, ClusterConfig, EventKind, NormalizedTask, TaskState } 
 export type TaskCallback = (task: NormalizedTask) => void
 export type EventCallback = (event: AgentEvent) => void
 
+// BFF mode: the browser holds no token — auth rides the HttpOnly session cookie. We send
+// `credentials: 'include'` everywhere, attach the CSRF token (from /bff/session) on mutating
+// requests, and only add an Authorization header when a token is actually present (password
+// mode). One helper so every call is consistent.
+let _csrf = ''
+export function setCsrf(token: string): void { _csrf = token }
+
+function authHeaders(token: string, mutating: boolean): Record<string, string> {
+  const h: Record<string, string> = {}
+  if (token) h['Authorization'] = `Bearer ${token}`
+  if (mutating && _csrf) h['X-CSRF-Token'] = _csrf
+  return h
+}
+
 export class RagError extends Error {
   constructor(
     message: string,
@@ -149,8 +163,9 @@ async function submitQueryAGT(
 
   const res = await fetch(`${cluster.apiBase}/query`, {
     method: 'POST',
+    credentials: 'include',
     headers: {
-      Authorization: `Bearer ${token}`,
+      ...authHeaders(token, true),
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
     },
@@ -276,7 +291,7 @@ export async function pollApprovalResult(
 ): Promise<ApprovalOutcome> {
   const res = await fetch(
     `${cluster.apiBase}/tasks/${encodeURIComponent(taskId)}/result`,
-    { headers: { Authorization: `Bearer ${token}` } },
+    { credentials: 'include', headers: authHeaders(token, false) },
   )
   if (!res.ok) {
     throw new RagError(`Failed to poll approval result (${res.status})`, String(res.status))
@@ -303,7 +318,7 @@ export async function listPendingApprovals(
   token: string,
 ): Promise<PendingApproval[]> {
   const res = await fetch(`${cluster.apiBase}/approvals/pending`, {
-    headers: { Authorization: `Bearer ${token}` },
+    credentials: 'include', headers: authHeaders(token, false),
   })
   if (!res.ok) {
     throw new RagError(`Failed to load approvals (${res.status})`, String(res.status))
@@ -326,7 +341,8 @@ export async function decideApproval(
     `${cluster.apiBase}/approvals/${encodeURIComponent(requestId)}/decision`,
     {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      credentials: 'include',
+      headers: { ...authHeaders(token, true), 'Content-Type': 'application/json' },
       body: JSON.stringify({ decision }),
     },
   )

@@ -18,6 +18,13 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy: {
+        // BFF (production browser auth) — same-origin path to the PRIMARY division's agent,
+        // NOT rewritten (so /bff/login -> agent /bff/login). The HttpOnly session cookie is
+        // set on this (5173) origin. One browser session = one division (multi-user model).
+        '/bff': {
+          target: agtAUrl,
+          changeOrigin: true,
+        },
         '/api/agt-a': {
           target: agtAUrl,
           changeOrigin: true,
