@@ -193,8 +193,15 @@ async def call_peer_agent(
     # ── Step 5: real HTTP POST of the DID-signed message to the peer ─────────
     # AgentMesh provides the security envelope (DID + Ed25519 signature); HTTP is
     # the wire. The peer authenticates the call by verifying that signature.
+    # M7: present this division's client cert on the outbound call when mTLS is enabled,
+    # so the peer's CERT_REQUIRED server accepts us; None → plain HTTP (the demo posture).
+    from transport.mtls import peer_tls_context
+    _tls = peer_tls_context(settings)
     try:
-        async with httpx.AsyncClient(timeout=_PEER_HTTP_TIMEOUT) as client:
+        async with httpx.AsyncClient(
+            timeout=_PEER_HTTP_TIMEOUT,
+            verify=_tls if _tls is not None else True,
+        ) as client:
             http_response = await client.post(endpoint, json=signed_payload)
         http_response.raise_for_status()
         response = http_response.json()

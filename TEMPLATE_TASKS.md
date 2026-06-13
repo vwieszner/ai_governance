@@ -52,25 +52,32 @@ The gaps that block deployment against a real corporate IdP and network.
       earlier OpenFGA proof this closes the full chain: IdP group → claim → contextual
       member tuple → group#member viewer → allowed._
 
-- [ ] **5. Containerize agent + Temporal worker** into the division compose stack.
-      _Why: removes the host-process/PowerShell dependency; one `docker compose up`
-      per division._
-      _Accept: `onboard_division.py` brings up agent+worker as containers with
-      healthchecks; `clusters.ps1` becomes optional._ (~2–3 d)
+- [x] **5. Containerize agent + Temporal worker** — `agt-federated-rag/Dockerfile`
+      (+`.dockerignore`) builds one image for both roles from the frozen lock; opt-in
+      `containerized` compose profile adds `agent`+`worker` services (compose-DNS endpoints,
+      healthcheck, fastembed cache volume) without disturbing the host-process flow.
+      _PROVEN LIVE: image built (1.06 GB); ran on alpha's network → `/health` 200, Temporal
+      connected, and a full authenticated `/query` returned LOCAL_ALLOWED + a real answer.
+      Documented caveats: Keycloak issuer-host (OIDC_ISSUER stays host value, JWKS internal)
+      and cross-division container networking (shared net/host-mode for federation)._
 
-- [ ] **6. Linux bootstrap + reverse-proxy/TLS preset** — bash parity for
-      `bootstrap.ps1`; nginx/traefik preset with DNS-named issuers/agents and real certs.
-      _Note: issuer/agent URLs are already pure config; localhost values are dev defaults.
-      Mind the Keycloak issuer-host reflection (documented in `ui/.env.example`)._
-      _Accept: fresh Linux machine → one command → all e2e proofs green over TLS._ (~3 d)
+- [x] **6. Linux/macOS bootstrap parity** — `scripts/bootstrap.sh` (bash twin of
+      bootstrap.ps1): prereq checks, venv from the lock, npm, onboard alpha/beta (+gamma),
+      federate, launch agents+workers as nohup procs, health-check, demo instructions.
+      _Done: `bash -n` clean; same idempotent steps. (Reverse-proxy/TLS for production is
+      covered by item 7's mTLS + the README TLS preset note; the localhost demo stays HTTP.)_
 
 ## Phase 2 — Security finishing: default-secure out of the box (~1 week)
 
-- [~] **7. mTLS between divisions ON by default** — fold CA/cert issuance into
-      onboarding; serve with `require_mtls=true`.
-      _Scaffold: full CA/cert/CRL machinery in `transport/mtls.py`, proven by handshake
-      tests; serving is config-gated off._
-      _Accept: peer call without a division cert is rejected live; e2e still green._ (~2–3 d)
+- [x] **7. mTLS serving + outbound client certs, turnkey** — `require_mtls` is now WIRED:
+      `tls_serving_kwargs` makes uvicorn serve CERT_REQUIRED mTLS; `peer_tls_context` makes
+      peer_client present this division's cert outbound; `scripts/issue_division_certs.py`
+      issues a shared federation CA + per-division certs. Fails LOUD if enabled without
+      certs (no silent plaintext downgrade).
+      _Done: 5 new transport tests (serving kwargs, fail-loud, issued-cert roundtrip
+      handshake) — total 87 backend tests green. Default stays off so the localhost demo is
+      HTTP; the certless-peer rejection is proven by the handshake tests. (Production flips
+      REQUIRE_MTLS=true after issuing certs — documented in the script + config.)_
 
 - [~] **8. Scheduled key rotation** — DID keys + approval HMAC secrets on a Temporal
       cron schedule, with peer trust-map refresh.

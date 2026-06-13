@@ -118,9 +118,57 @@ services:
       - "127.0.0.1:${DIV_REDIS_PORT}:6379"
     restart: unless-stopped
 
+  # ── Containerized agent + worker (Phase-1 item 5; OPT-IN) ────────────────────
+  # Enabled only with `--profile containerized`, so the proven host-process flow
+  # (scripts/clusters.ps1) is unaffected by default. Both use the same image; they
+  # reach the infra services by compose DNS name on INTERNAL ports (not the host-mapped
+  # ones). The agent env is supplied via env_file = the generated .env.<id>.agent
+  # (in-network values), written by onboard_division alongside the host .env.<id>.
+  #
+  # CAVEATS (documented): (a) OIDC_ISSUER must stay the host value baked into browser
+  # tokens (e.g. http://localhost:<kc>/realms/rag) while OIDC_JWKS_URI points at the
+  # internal http://keycloak:8080/... — issuer is a string check, JWKS is host-independent.
+  # (b) cross-division peer URLs are host-mapped (other compose projects), so container
+  # federation needs a shared docker network or host networking — single-division serving
+  # works as-is.
+  agent:
+    profiles: ["containerized"]
+    build: { context: ../../agt-federated-rag }
+    image: agt-federated-rag:latest
+    container_name: div-${DIV_ID}-agent
+    env_file: [ "../generated/${DIV_ID}/.env.${DIV_ID}.agent" ]
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+    volumes:
+      - div-fastembed-cache:/cache/fastembed
+    ports:
+      - "127.0.0.1:${DIV_AGENT_PORT}:8000"
+    depends_on:
+      openfga: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  worker:
+    profiles: ["containerized"]
+    image: agt-federated-rag:latest
+    container_name: div-${DIV_ID}-worker
+    command: ["python", "-m", "workflow.worker"]
+    env_file: [ "../generated/${DIV_ID}/.env.${DIV_ID}.agent" ]
+    volumes:
+      - div-fastembed-cache:/cache/fastembed
+    depends_on:
+      - agent
+    restart: unless-stopped
+
 volumes:
   div-postgres-data:
   div-keycloak-data:
   div-temporal-data:
   div-qdrant-data:
   div-redis-data:
+  div-fastembed-cache:

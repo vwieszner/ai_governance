@@ -1342,12 +1342,19 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run() -> None:
+    # M7: serve mutual TLS when require_mtls is set (client cert REQUIRED). Empty dict
+    # in the default localhost-demo posture (plain HTTP). Fails loud if enabled without certs.
+    from transport.mtls import tls_serving_kwargs
+    ssl_kwargs = tls_serving_kwargs(settings)
+    if ssl_kwargs:
+        log.info("serving_mtls", cert=settings.tls_cert_file, client_cert="required")
     uvicorn.run(
         "api.main:app",
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level,
         reload=False,
+        **ssl_kwargs,
     )
 
 

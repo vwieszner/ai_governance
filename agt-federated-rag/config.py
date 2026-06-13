@@ -49,9 +49,18 @@ class Settings(BaseSettings):
     residency_mode: str = "external"
 
     # ── Transport security (M7, NFR-3) ────────────────────────────────────────
-    # When true, internet-facing agent/discovery calls require mTLS with cert
-    # identity validation + revocation. Threaded now; enforced in M7.
+    # When true, the agent SERVES mTLS (client cert REQUIRED) and presents its own
+    # division client cert on outbound peer calls. Default false → the bundled
+    # localhost demo stays HTTP. Production sets require_mtls=true with the cert paths
+    # below (issued from the federation CA by scripts/issue_division_certs.py, written
+    # to infra/generated/<id>/certs/). The certless-peer rejection is proven by the
+    # transport/mtls handshake tests.
     require_mtls: bool = False
+    # PEM paths for this division's cert chain + key and the federation CA bundle.
+    # Empty → mTLS cannot be served even if require_mtls is set (fail loud at startup).
+    tls_cert_file: str = ""
+    tls_key_file: str = ""
+    tls_ca_file: str = ""
 
     # ── Peer cluster ──────────────────────────────────────────────────────────
     peer_agent_url: AnyHttpUrl | None = None  # type: ignore[assignment]

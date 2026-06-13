@@ -63,3 +63,6 @@ agt-federated-rag/.env.*
 # M8 tamper-evident audit chains (runtime, per-division)
 audit_logs/
 agt-federated-rag/audit_logs/
+
+# mTLS key material (Phase-1 item 7)
+infra/generated/_certs/

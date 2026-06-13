@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+audit_logs/
+tests/
+e2e/
+node_modules/
+.env
+.env.*
+*.log

@@ -162,3 +162,60 @@ def client_context(ca_path: str, cert_path: str | None = None, key_path: str | N
         if cert_path and key_path:
             ctx.load_cert_chain(cert_path, key_path)
     return ctx
+
+
+# ── Settings-driven wiring (used by the API server + peer client) ──────────────
+
+def tls_serving_kwargs(s) -> dict:
+    """uvicorn ssl_* kwargs to SERVE mTLS, or {} when mTLS isn't enabled/configured.
+
+    Returns CERT_REQUIRED serving (mutual TLS) so a peer with no client cert is rejected
+    at the TLS layer. Raises if require_mtls is set but the cert paths are missing — fail
+    loud rather than silently fall back to plaintext (a security downgrade).
+    """
+    if not getattr(s, "require_mtls", False):
+        return {}
+    cert, key, ca = s.tls_cert_file, s.tls_key_file, s.tls_ca_file
+    if not (cert and key and ca):
+        raise RuntimeError(
+            "require_mtls=true but TLS_CERT_FILE / TLS_KEY_FILE / TLS_CA_FILE are not all set "
+            "— refusing to serve plaintext. Run scripts/issue_division_certs.py."
+        )
+    return {
+        "ssl_certfile": cert,
+        "ssl_keyfile": key,
+        "ssl_ca_certs": ca,
+        "ssl_cert_reqs": ssl.CERT_REQUIRED,   # mutual TLS: client cert demanded
+    }
+
+
+def peer_tls_context(s) -> ssl.SSLContext | None:
+    """Client SSL context presenting THIS division's cert for outbound peer mTLS, or
+    None when mTLS isn't enabled (the caller then uses plain HTTP, as the demo does)."""
+    if not getattr(s, "require_mtls", False):
+        return None
+    cert, key, ca = s.tls_cert_file, s.tls_key_file, s.tls_ca_file
+    if not (cert and key and ca):
+        raise RuntimeError(
+            "require_mtls=true but TLS cert/key/ca paths are not all set — cannot make a "
+            "mutually-authenticated peer call."
+        )
+    return client_context(ca, cert, key)
+
+
+def issue_federation_certs(out_dir, division_ids: list[str], ca_name: str = "AGT Federation CA"):
+    """Generate one shared CA + a per-division cert/key under out_dir, returning
+    {division_id: (cert_path, key_path), '_ca': ca_path}. Idempotent at the directory
+    level (overwrites). Used by scripts/issue_division_certs.py."""
+    from pathlib import Path
+    d = Path(out_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    ca_key, ca_cert = generate_ca(ca_name)
+    ca_path = d / "federation-ca.crt"
+    ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    result: dict = {"_ca": str(ca_path)}
+    for div in division_ids:
+        pair = issue_division_cert(ca_key, ca_cert, div)
+        crt, key = pair.write(d, div)
+        result[div] = (crt, key)
+    return result

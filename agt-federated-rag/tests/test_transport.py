@@ -106,6 +106,48 @@ def test_cert_identifies_division(pki):
     assert cn == "beta"
 
 
+class _S:
+    """Minimal settings stand-in for the wiring helpers."""
+    def __init__(self, require_mtls, cert="", key="", ca=""):
+        self.require_mtls = require_mtls
+        self.tls_cert_file, self.tls_key_file, self.tls_ca_file = cert, key, ca
+
+
+def test_tls_serving_kwargs_off_by_default():
+    # Default posture (require_mtls false) → plain HTTP, no ssl kwargs.
+    assert mtls.tls_serving_kwargs(_S(require_mtls=False)) == {}
+    assert mtls.peer_tls_context(_S(require_mtls=False)) is None
+
+
+def test_tls_serving_kwargs_demands_client_cert_when_enabled(pki):
+    s = _S(require_mtls=True, cert=pki["s_crt"], key=pki["s_key"], ca=pki["ca"])
+    kw = mtls.tls_serving_kwargs(s)
+    assert kw["ssl_certfile"] == pki["s_crt"]
+    assert kw["ssl_ca_certs"] == pki["ca"]
+    assert kw["ssl_cert_reqs"] == ssl.CERT_REQUIRED       # mutual TLS, not optional
+    # outbound side builds a client context presenting our cert. (Don't isinstance-check
+    # against ssl.SSLContext: truststore.inject_into_ssl, active once api.main is imported,
+    # rebinds it to a subclass while our context is the genuine base — see _genuine_ssl.)
+    ctx = mtls.peer_tls_context(s)
+    assert ctx is not None and hasattr(ctx, "wrap_bio")
+
+
+def test_require_mtls_without_certs_fails_loud():
+    # A security downgrade (serving plaintext while claiming mTLS) must never happen silently.
+    with pytest.raises(RuntimeError):
+        mtls.tls_serving_kwargs(_S(require_mtls=True))
+    with pytest.raises(RuntimeError):
+        mtls.peer_tls_context(_S(require_mtls=True))
+
+
+def test_issue_federation_certs_roundtrip_handshakes(tmp_path):
+    # The issued CA + division certs must actually mTLS-handshake (end-to-end issuance).
+    out = mtls.issue_federation_certs(tmp_path, ["alpha", "beta"])
+    sctx = mtls.server_context(out["alpha"][0], out["alpha"][1], out["_ca"])
+    cctx = mtls.client_context(out["_ca"], out["beta"][0], out["beta"][1])
+    assert _handshake_ok(sctx, cctx) is True
+
+
 def test_mtls_holds_under_truststore_injection(pki):
     """The app calls truststore.inject_into_ssl() (verify against the OS trust store).
     A federation cert is signed by our PRIVATE CA — absent from any OS store — so the
