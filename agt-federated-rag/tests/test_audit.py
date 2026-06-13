@@ -88,3 +88,54 @@ def test_processor_records_only_agt_audit(tmp_path: Path, monkeypatch):
     assert "agt_audit" not in entries[0]["data"]      # control field stripped
     ok, _ = verify_chain(chain.path)
     assert ok
+
+
+# ── #9: external anchoring (truncation/deletion) + field allowlist ─────────────
+
+def test_anchor_detects_tail_truncation(tmp_path: Path):
+    from audit_log import AuditChain, verify_chain
+    c = AuditChain(tmp_path / "alpha_agent.jsonl")
+    for i in range(4):
+        c.append("evt", {"count": i})
+    ok, _ = verify_chain(c.path)
+    assert ok
+    # Drop the last 2 lines (the classic attack a pure local chain can't catch).
+    lines = c.path.read_text().splitlines()
+    c.path.write_text("\n".join(lines[:-2]) + "\n")
+    ok, detail = verify_chain(c.path)         # anchor still records seq 3
+    assert not ok and "truncation" in detail.lower()
+
+
+def test_anchor_detects_whole_file_deletion(tmp_path: Path):
+    from audit_log import AuditChain, verify_chain
+    c = AuditChain(tmp_path / "alpha_agent.jsonl")
+    c.append("evt", {"count": 0})
+    c.path.unlink()                           # attacker deletes the whole chain
+    ok, detail = verify_chain(c.path)         # but the anchor sidecar remains
+    assert not ok and "deletion" in detail.lower()
+
+
+def test_clean_chain_with_anchor_verifies_ok(tmp_path: Path):
+    from audit_log import AuditChain, verify_chain
+    c = AuditChain(tmp_path / "alpha_agent.jsonl")
+    c.append("evt", {"count": 0})
+    c.append("evt", {"count": 1})
+    ok, detail = verify_chain(c.path)
+    assert ok and "anchor" in detail.lower()  # cross-checked against the anchor head
+
+
+def test_processor_allowlist_drops_unexpected_fields(tmp_path: Path, monkeypatch):
+    import audit_log
+    from audit_log import AuditChain
+    chain = AuditChain(tmp_path / "gamma_agent.jsonl")
+    monkeypatch.setattr(audit_log, "_chain", chain)
+    # A future .bind() leaks a token + answer onto an agt_audit event — must NOT persist.
+    audit_log._audit_processor(None, "info", {
+        "event": "auth_decision", "agt_audit": True,
+        "user_id": "alice@x|ns", "allowed": True,          # allowlisted -> kept
+        "access_token": "SECRET", "answer": "leak me",      # not allowlisted -> dropped
+    })
+    rec = [json.loads(l) for l in chain.path.read_text().splitlines() if l.strip()][0]
+    assert rec["data"]["user_id"] == "alice@x|ns"
+    assert "access_token" not in rec["data"] and "answer" not in rec["data"]
+    assert rec["data"]["count_dropped"] == 2               # how many, never what

@@ -50,11 +50,23 @@ def _entry_hash(seq: int, ts: str, event: str, data: dict, prev_hash: str) -> st
 
 
 class AuditChain:
-    """Append-only, hash-chained audit file for one (division, role)."""
+    """Append-only, hash-chained audit file for one (division, role).
 
-    def __init__(self, path: str | os.PathLike) -> None:
+    External anchoring (M8 review finding): a pure local chain cannot detect tail
+    truncation or whole-file deletion — an attacker who owns the file can drop the tail or
+    delete it. So each append also publishes the new HEAD (seq, hash) to an append-only
+    ANCHOR sink the attacker would have to tamper with consistently: a remote collector
+    (``AUDIT_ANCHOR_URL``) when set, else a separate local anchor file. verify_chain then
+    cross-checks the chain tail against the highest anchored head — truncation below it, or
+    a missing chain with a non-empty anchor, is flagged.
+    """
+
+    def __init__(self, path: str | os.PathLike, anchor_path: str | os.PathLike | None = None,
+                 anchor_url: str | None = None) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.anchor_path = Path(anchor_path) if anchor_path else self.path.with_suffix(".anchor.jsonl")
+        self.anchor_url = anchor_url or os.environ.get("AUDIT_ANCHOR_URL", "")
         self._lock = threading.Lock()
         self._seq, self._last_hash = self._load_tail()
 
@@ -89,16 +101,71 @@ class AuditChain:
                 f.flush()
                 os.fsync(f.fileno())
             self._seq, self._last_hash = seq, h
+            self._anchor_head(seq, h, ts)
             return rec
 
+    def _anchor_head(self, seq: int, h: str, ts: str) -> None:
+        """Publish the new head to the anchor sink. Best-effort: an anchor failure must
+        never break the audited request path (the local chain is still written)."""
+        head = {"seq": seq, "hash": h, "ts": ts}
+        try:
+            if self.anchor_url:
+                import urllib.request
+                req = urllib.request.Request(
+                    self.anchor_url, data=json.dumps(head).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                urllib.request.urlopen(req, timeout=5).close()
+            else:
+                with self.anchor_path.open("a", encoding="utf-8") as af:
+                    af.write(json.dumps(head) + "\n")
+                    af.flush()
+                    os.fsync(af.fileno())
+        except Exception:  # noqa: BLE001 — anchoring is best-effort
+            pass
 
-def verify_chain(path: str | os.PathLike) -> tuple[bool, str]:
-    """Verify a chain file end-to-end. Returns (ok, human-readable detail)."""
+
+def _load_anchor_head(anchor_path: Path) -> dict | None:
+    """Highest anchored head {seq, hash} from a local anchor file, or None."""
+    if not anchor_path.exists():
+        return None
+    best: dict | None = None
+    with anchor_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if best is None or int(rec.get("seq", -1)) > int(best.get("seq", -1)):
+                best = rec
+    return best
+
+
+def verify_chain(path: str | os.PathLike, anchor_path: str | os.PathLike | None = None) -> tuple[bool, str]:
+    """Verify a chain file end-to-end, cross-checked against its external anchor.
+
+    Returns (ok, detail). Detects, in addition to the in-chain checks (tamper/reorder/
+    internal-deletion): tail TRUNCATION and whole-file DELETION, by comparing the chain
+    tail against the highest anchored head (the M8 review gap). Without an anchor it falls
+    back to chain-only verification (the prior behaviour).
+    """
     p = Path(path)
+    ap = Path(anchor_path) if anchor_path else p.with_suffix(".anchor.jsonl")
+    anchor = _load_anchor_head(ap)
+
     if not p.exists():
+        # A missing chain is only OK if the anchor is also empty/absent.
+        if anchor is not None:
+            return False, (f"chain file missing but anchor records up to seq {anchor.get('seq')} "
+                           f"— whole-file deletion detected")
         return True, "no audit file (empty chain)"
+
     prev = GENESIS
     expected_seq = 0
+    tail_seq = -1
+    tail_hash = GENESIS
     with p.open("r", encoding="utf-8") as f:
         for ln_no, line in enumerate(f, 1):
             line = line.strip()
@@ -118,8 +185,31 @@ def verify_chain(path: str | os.PathLike) -> tuple[bool, str]:
             if recomputed != rec.get("hash"):
                 return False, f"seq {rec.get('seq')}: hash mismatch — entry tampered"
             prev = rec["hash"]
+            tail_seq, tail_hash = int(rec["seq"]), str(rec["hash"])
             expected_seq += 1
-    return True, f"OK — {expected_seq} entries verified"
+
+    # Anchor cross-check: the chain must reach at least the highest anchored head, and the
+    # hash at that seq must match (catches tail truncation + downstream rewrite-below-anchor).
+    if anchor is not None:
+        a_seq = int(anchor.get("seq", -1))
+        if tail_seq < a_seq:
+            return False, (f"chain tail seq {tail_seq} < anchored seq {a_seq} "
+                           f"— tail truncation detected")
+        if tail_seq == a_seq and tail_hash != anchor.get("hash"):
+            return False, f"seq {a_seq}: head hash != anchored hash — chain rewritten"
+    return True, f"OK — {expected_seq} entries verified" + (
+        f" (anchor seq {anchor.get('seq')})" if anchor else "")
+
+
+# Explicit ALLOWLIST of fields that may enter the immutable chain (M8 review): switch the
+# processor from copy-all-minus-2 to copy-only-these, so a future structlog .bind() or a new
+# field on any agt_audit call can NEVER land a token / query / answer / PII into the chain.
+AUDIT_FIELD_ALLOWLIST = frozenset({
+    "user_id", "chunk_id", "relation", "allowed", "decision", "division_id", "flow",
+    "count", "pending", "denied", "approval_request_id", "request_id", "task_id",
+    "peer_did", "signer_did", "trust_score", "source_division", "action", "reason",
+    "did", "hmac", "error", "subject", "count_dropped",
+})
 
 
 # ── structlog integration (DRY capture of agt_audit=True events) ────────────────
@@ -134,7 +224,15 @@ def _audit_processor(logger: Any, method_name: str, event_dict: dict) -> dict:
     if _chain is not None and event_dict.get("agt_audit"):
         try:
             event = str(event_dict.get("event", ""))
-            data = {k: v for k, v in event_dict.items() if k not in ("event", "agt_audit")}
+            # ALLOWLIST (not denylist): only known-safe diagnostic fields enter the chain.
+            # Anything else (a future bound token/answer/PII) is dropped; we record only
+            # HOW MANY were dropped, never their names or values.
+            data = {k: v for k, v in event_dict.items()
+                    if k in AUDIT_FIELD_ALLOWLIST and k not in ("event", "agt_audit")}
+            dropped = sum(1 for k in event_dict
+                          if k not in AUDIT_FIELD_ALLOWLIST and k not in ("event", "agt_audit"))
+            if dropped:
+                data["count_dropped"] = dropped
             _chain.append(event, data)
         except Exception as exc:  # audit must never break request logging
             try:

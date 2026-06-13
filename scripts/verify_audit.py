@@ -32,7 +32,9 @@ def main() -> int:
         print(f"no audit dir: {base}")
         return 1
     pattern = f"{args.division}_*.jsonl" if args.division else "*.jsonl"
-    files = sorted(base.glob(pattern))
+    # Exclude the external anchor sidecars (*.anchor.jsonl) — they are heads, not chains;
+    # verify_chain reads each chain's anchor automatically for the truncation cross-check.
+    files = sorted(f for f in base.glob(pattern) if not f.name.endswith(".anchor.jsonl"))
     if not files:
         print(f"no chain files matching {pattern} in {base}")
         return 1

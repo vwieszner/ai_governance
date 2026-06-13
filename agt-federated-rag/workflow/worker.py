@@ -48,6 +48,7 @@ from workflow.activities import (
     send_a2a_callback,
 )
 from workflow.approval import ApprovalWorkflow
+from workflow.rotation import KeyRotationWorkflow, rotate_keys_activity
 
 log = structlog.get_logger(__name__)
 
@@ -89,13 +90,14 @@ async def _run() -> None:
     async with Worker(
         client,
         task_queue=settings.temporal_task_queue,
-        workflows=[ApprovalWorkflow],
+        workflows=[ApprovalWorkflow, KeyRotationWorkflow],
         activities=[
             notify_approver,
             grant_access_in_openfga,
             revoke_pending_in_openfga,   # required — denial + timeout revoke path
             notify_user_of_decision,
             send_a2a_callback,
+            rotate_keys_activity,        # #8: scheduled credential rotation
         ],
     ):
         log.info("temporal_worker_running")

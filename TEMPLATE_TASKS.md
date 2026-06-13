@@ -79,18 +79,21 @@ The gaps that block deployment against a real corporate IdP and network.
       HTTP; the certless-peer rejection is proven by the handshake tests. (Production flips
       REQUIRE_MTLS=true after issuing certs — documented in the script + config.)_
 
-- [~] **8. Scheduled key rotation** — DID keys + approval HMAC secrets on a Temporal
-      cron schedule, with peer trust-map refresh.
-      _Scaffold: rotation function exists; no schedule._
-      _Accept: rotation runs unattended; federation keeps working across a rotation._ (~1–2 d)
+- [x] **8. Scheduled key rotation** — `workflow/rotation.py`: `KeyRotationWorkflow`
+      (Temporal cron) + `rotate_keys_activity` rotate the DID credentials and roll the
+      approval HMAC secret (with a prior-value overlap window); registered in the worker;
+      started via `scripts/schedule_rotation.py --division <id> --cron`. Logic factored
+      into `perform_rotation()` (best-effort: one leg failing never aborts the other).
+      _Done: 5 hermetic tests (HMAC roll+overlap, best-effort isolation, worker wiring)._
 
-- [ ] **9. Audit-chain anchoring + field allowlist** — periodically publish each chain
-      head (seq, hash) to a remote/append-only sink; switch the audit processor from
-      copy-all to an explicit field allowlist.
-      _Why: closes the open M8 review finding (tail-truncation / full-rewrite are
-      undetectable without an external anchor)._
-      _Accept: truncating a chain is detected against the anchor; no PII beyond the
-      namespaced principal enters the chain._ (~2–3 d)
+- [x] **9. Audit-chain anchoring + field allowlist** — each append publishes the chain
+      HEAD (seq, hash) to an external anchor (local sidecar by default, or `AUDIT_ANCHOR_URL`
+      remote sink); `verify_chain` cross-checks the tail against the highest anchored head,
+      so **tail truncation and whole-file deletion are now detected** (the open M8 finding).
+      The structlog processor switched to an explicit `AUDIT_FIELD_ALLOWLIST` — a future
+      bound token/answer/PII can never enter the immutable chain (only a `count_dropped`).
+      _Done: 4 new audit tests (truncation-via-anchor, whole-file-deletion, allowlist drop);
+      verify_audit CLI excludes anchor sidecars. 96 backend tests green._
 
 ## Phase 3 — Extension seams + ops kit (~1.5–2 weeks)
 
