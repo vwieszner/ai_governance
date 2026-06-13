@@ -175,6 +175,18 @@ class Settings(BaseSettings):
     # peer's GET /identity endpoint at setup time (alongside PEER_AGENT_DID).
     peer_agent_public_jwk: str = ""
 
+    # ── MCP tool servers (Phase-1 item 11) ───────────────────────────────────
+    # JSON list of allowed MCP servers, e.g.
+    #   [{"name":"jira","url":"https://mcp.corp/jira","allowed_auth_methods":["oauth2"],
+    #     "require_tls":true,"auth_mode":"oauth_obo"}]
+    #   (valid allowed_auth_methods: oauth2, bearer, api_key, mtls, none)
+    # Empty = no MCP servers (the default). The toolkit's McpAuthPolicy gateway enforces
+    # the per-server allowlist + required auth method; the policy engine's default-deny
+    # blocks any mcp.call to a server/tool not explicitly allowed. The user's RAW token is
+    # NEVER relayed (M2 lesson) — per-server auth_mode selects token-exchange or a
+    # service credential with agent-side ReBAC mediation.
+    mcp_servers: str = ""
+
     # ── AGT Policy Engine (Agent OS) ─────────────────────────────────────────
     # Path to YAML policy directory (loaded at startup).
     policy_dir: str = "agent/policies"

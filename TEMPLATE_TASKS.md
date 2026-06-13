@@ -97,22 +97,23 @@ The gaps that block deployment against a real corporate IdP and network.
 
 ## Phase 3 — Extension seams + ops kit (~1.5–2 weeks)
 
-- [~] **10. Connector SDK contract** — formalize the ingest interface:
-      `content → chunks + OpenFGA tuples + periodic ACL re-sync hook`; today's
-      folder-docs ingest becomes the reference implementation.
-      _Why: makes per-deployment connectors (Jira, SharePoint, …) contract work, not
-      template work. Non-OAuth sources use the ACL-mirroring pattern (service account +
-      per-user OpenFGA filter; group tuples when source perms are AD-group-shaped)._
-      _Accept: folder connector re-implemented against the contract; a connector
-      author guide._ (~3–4 d)
+- [x] **10. Connector SDK contract** — `connectors/`: `base.py` defines the contract
+      (`DocumentChunk`, `AccessGrant`, `Connector` protocol) + a generic `ingest()` engine
+      that upserts chunks to Qdrant AND writes ACL grants to OpenFGA (user/group/owner/
+      pending), with doc-title fan-out. Because emitting grants is part of the interface, a
+      connector cannot land content without declaring authz. `folder.py` is the reference
+      impl (stable chunk ids matching the legacy ingest). Added `grant_group_viewer` for
+      ACL-mirroring of group perms.
+      _Done: 3 hermetic tests (all grant kinds, title fan-out, FolderConnector roundtrip)._
 
-- [~] **11. MCP executor node** — one governed `call_mcp_tool` node wired to the
-      toolkit's installed gateway (`agent_os.mcp_gateway`, `McpAuthPolicy` allowlist,
-      response scanner); per-server auth mode config (OAuth token-exchange passthrough |
-      service-cred + ReBAC mediation); side-effecting tools route through the approval flow.
-      _Rule: never relay the user's raw token (M2 lesson)._
-      _Accept: unlisted server/tool is denied by default-deny; a listed read tool works;
-      a write tool parks on approval._ (~3–4 d)
+- [x] **11. MCP executor** — `tools/mcp.py`: one governed `call_mcp_tool` for ALL MCP
+      tools (servers are config in `MCP_SERVERS`, not new nodes). Three gates: policy
+      `_enforce("mcp.call")` default-deny, the toolkit's `McpAuthPolicy` gateway (per-server
+      allowlist + auth method, unconfigured → fail-closed), and caller-side OpenFGA filtering
+      of results. The user's RAW token is never forwarded (per-server `auth_mode`:
+      oauth_obo token-exchange | service_rebac); transport is injected (protocol-agnostic).
+      _Done: 4 hermetic tests (default-deny, unlisted→rejected, allowed→transport, no token
+      leak). 103 backend tests green._
 
 - [ ] **12. `agtctl` admin CLI** — `grant`/`revoke`/`list` for users *and* groups,
       `doctor` (packaged post-deploy smoke probes from the existing test suites),

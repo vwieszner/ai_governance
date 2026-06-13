@@ -92,6 +92,15 @@ rules:
     condition: {field: action, operator: eq, value: peer.receive_callback}
     action: allow
 
+  # MCP tool calls (Phase-1 item 11). Allow-listed so a governed call proceeds; the
+  # per-server allowlist + required auth method are enforced by the toolkit's
+  # McpAuthPolicy gateway (tools.mcp), and per-tool/per-user data authorization by
+  # OpenFGA. An mcp.call to an UNCONFIGURED server is rejected by the gateway (fail-closed).
+  - name: allow-mcp-call
+    priority: 100
+    condition: {field: action, operator: eq, value: mcp.call}
+    action: allow
+
   - name: allow-format-response
     priority: 100
     condition: {field: action, operator: eq, value: agent.format_response}

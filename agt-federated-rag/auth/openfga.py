@@ -365,6 +365,26 @@ class OpenFGAAuth:
         """Grant VIEWER relation to user_id on chunk_id."""
         await self._write_tuple(user_id, chunk_id, Relation.VIEWER)
 
+    async def grant_group_viewer(self, group: str, chunk_id: str) -> None:
+        """Grant VIEWER to a GROUP's members on chunk_id (ACL mirroring): writes
+        ``group:<group>#member viewer chunk:<chunk_id>``. Used by connectors that mirror a
+        source system's group-based permissions; individual membership is supplied live
+        from the user's token (contextual tuple), so the grant tracks IdP group changes."""
+        assert self._client is not None
+        from openfga_sdk.client.models import ClientTuple, ClientWriteRequest  # type: ignore[import]
+        userset = group if group.startswith("group:") else f"group:{group}#member"
+        if "#" not in userset:
+            userset = f"{userset}#member"
+        try:
+            await self._client.write(ClientWriteRequest(writes=[ClientTuple(
+                user=userset, relation=Relation.VIEWER.value, object=self._object_id(chunk_id))]))
+        except ApiException as exc:
+            detail = (getattr(exc, "body", "") or str(exc)).lower()
+            if exc.status == 400 and "already exist" in detail:
+                return
+            raise
+        log.info("openfga.grant_group_viewer", group=group, chunk_id=chunk_id, agt_audit=True)
+
     async def revoke_viewer(self, user_id: str, chunk_id: str) -> None:
         """Revoke VIEWER relation (M5/FR-7.2). Idempotent — a missing tuple (404) is a
         no-op. After revocation the user has no standing access; a re-ask re-enters the
