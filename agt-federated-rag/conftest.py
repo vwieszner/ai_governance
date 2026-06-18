@@ -7,6 +7,7 @@ real `.env` or live infra.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +35,18 @@ _REQUIRED = dict(
     agent_sponsor_email="sponsor@example.com",
     approval_hmac_secret="0" * 64,
 )
+
+# config.py constructs a module-level `settings = Settings()` on import, which needs
+# the REQUIRED fields. Locally a (gitignored) .env supplies them; in CI / a fresh
+# checkout there is NO .env, so `import config` (during collection) would raise.
+# When no env file is present, seed the REQUIRED values into the environment so the
+# suite is hermetic. `setdefault` + the file-absence guard keep a real .env run
+# (local/dev) byte-for-byte unchanged — these fallbacks apply ONLY when no env file
+# exists (the CI case). Must run at conftest import, before any test imports config.
+_ENV_FILE = _ROOT / os.environ.get("RAG_ENV_FILE", ".env")
+if not _ENV_FILE.exists():
+    for _field, _val in _REQUIRED.items():
+        os.environ.setdefault(_field.upper(), _val)
 
 
 @pytest.fixture
