@@ -22,14 +22,18 @@ without reverse-engineering the code.
   trusted peer can assert any identity **within its own issuer namespace**, but the per-DID
   issuer binding confines that blast radius to its own users — it can never reach across
   divisions. This is the standard cross-trust-domain delegation model and is strictly safer
-  than forwarding a replayable bearer token.
+  than forwarding a replayable bearer token. The assertion is additionally **recipient-bound**
+  (`aud` = the target division's DID) and **time-limited** (short, finite-checked `exp`), so it
+  cannot be re-used against a different division or indefinitely (2026-06-17 hardening;
+  enforced by `validate_cross_division_assertion`).
 
 ## 2. Controls that are ENFORCED and PROVEN (in code + tests)
 
 | Threat (OWASP-ASI / general) | Control | Evidence |
 |---|---|---|
 | Unauthorized data access | OpenFGA per-chunk ReBAC, re-decided live on every query | `auth/openfga.py`, `test_authz.py` |
-| Privilege escalation via federation | Namespaced principal `email\|sha256(iss)`; per-DID issuer binding | `token_validator.py`, `test_a2a.py` |
+| Privilege escalation via federation | Namespaced principal `email\|sha256(iss)`; per-DID issuer binding; **recipient-bound + finite-`exp` user assertion** | `token_validator.py`, `test_a2a.py`, `test_assertion.py` |
+| Poisoned content from an external retriever (RaaS) | Served chunk **text re-sourced from the trusted store of record**; external retrievers contribute candidate ids/ranking only; RaaS egress denylist (cloud-metadata / link-local) | `agent/nodes.py`, `rag/retriever.py`, `test_retriever.py` |
 | Token replay across divisions | DID-signed claims, never the raw token; ts+nonce replay guard | `mesh/`, `test_a2a.py` |
 | Forged/unsigned peer calls | Ed25519 signature verify + trust-score gate on `/a2a/query` | `api/main.py`, `test_multipeer.py` |
 | Group-claim escalation | Per-division `RECOGNIZED_GROUPS` allowlist; membership is contextual (never persisted) | `token_validator.extract_groups`, `test_identity_mapping.py` |
@@ -41,6 +45,7 @@ without reverse-engineering the code.
 | Recon via metrics | `/metrics` gated by `METRICS_TOKEN` when set | `api/main.metrics`, `test_metrics.py` |
 | Browser token theft (XSS) | BFF: no token in the browser, only an `HttpOnly` session cookie; server-side refresh; login-CSRF state binding | `api/bff.py`, `test_bff.py`, `ui/e2e/bff.spec.ts` |
 | Transport interception (peer) | Route-based **mTLS** at the nginx edge (federation-CA client cert required on peer routes) | `infra/nginx/`, `test_transport.py` |
+| Revoked peer certificate | **CRL checked at the mTLS handshake** (`VERIFY_CRL_CHECK_LEAF` + mtime-cached CRL refresh) when `require_mtls` + a CRL are configured; fail-closed; issued certs carry `CRLDistributionPoints` | `transport/mtls.py`, `test_transport.py` |
 | Audit tamper (offline) | Hash-chained log + external head anchor (truncation/deletion detected) | `audit_log.py`, `test_audit.py` |
 | Operator emergency stop | Kill-switch denies the whole query path | `agent/graph.py`, `test_governance.py` |
 | Worker-startup regression | AST guard: no sandbox-hostile import in a workflow module | `test_worker_sandbox.py` |
@@ -51,7 +56,10 @@ These are real production requirements the template supports but cannot self-sat
 
 - **mTLS ON + a host without TLS interception.** The edge is built and the client-cert gate is
   proven, but server-cert pinning is broken locally by AV/corporate MITM (e.g. Norton re-signs
-  the cert). Enable `require_mtls`/the edge in prod on a clean host.
+  the cert). Enable `require_mtls`/the edge in prod on a clean host. **CRL revocation is now
+  enforced at the in-process mTLS handshake** (`transport/mtls.py`); two follow-ups remain — wire
+  `ssl_crl` into the nginx peer-route for edge-terminated TLS, and add **OCSP** (needs a responder
+  + AIA URL + stapling; not faked here).
 - **HA stores.** Keycloak + Temporal run in `start-dev`/single-replica here. Production needs
   real HA Temporal (also removes the inbox visibility lag the Redis index works around) and
   clustered Keycloak with persistent storage.
@@ -67,25 +75,30 @@ These are real production requirements the template supports but cannot self-sat
 These are deliberately **not** implemented, because a half-built version would create false
 assurance — worse than the honest current state. Each needs a decision, then real work.
 
-### 4.1 Audit-chain key custody (raise tamper-evidence to tamper-PROOF)
-- **Now:** hash-chained + externally anchored → detects offline edits, truncation, deletion.
-- **Gap:** an attacker who compromises the agent *process* can recompute the chain AND the
-  local sidecar anchor (the hash is keyless and the process owns both).
-- **Decision needed:** where does a signing key live that the agent process does **not** hold?
-  Options: (a) per-entry HMAC/signature via a **separate signer service / KMS** the agent calls
-  but can't read; (b) near-real-time shipment to a remote append-only collector (the local file
-  becomes a cache). Recommended: (b) as the default + (a) for high-assurance.
-- **Why not done:** doing HMAC with a key the agent can read is security theater. Needs the
-  KMS/collector decision.
+### 4.1 Audit-chain key custody (tamper-evidence → tamper-PROOF) — IMPLEMENTED (opt-in)
+- **Now:** the chain is hash-chained + externally anchored AND supports an **HMAC-keyed** mode:
+  `hash = HMAC-SHA256(key, seq|ts|event|canonical(data)|prev_hash)`, the key resolved from the
+  secrets backend (`AUDIT_HMAC_KEY`, e.g. a `vault:` ref). Keyed, a host-compromise attacker who
+  rewrites the file **cannot** forge a verifying chain (demonstrated: a fully-valid keyless forgery
+  is rejected the moment a key is required). Backward-compatible: no key → the prior keyless chain.
+  `audit_log.py`, `tests/test_audit_hmac.py`.
+- **Residual (key custody):** the guarantee holds **only if `AUDIT_HMAC_KEY` lives where the
+  attacker can't read it** (Vault/KMS). Put the literal key in the same `.env` the attacker can read
+  and it degrades to the keyless guarantee. For highest assurance, also ship to a remote append-only
+  collector (`AUDIT_ANCHOR_URL`) so the local file is only a cache.
 
-### 4.2 MCP tool authentication (per-server)
-- **Now:** `tools/mcp.py` governs every call (default-deny + the toolkit gateway allowlist) and
-  documents "never forward the raw user token"; the actual transport is injected.
-- **Gap:** no vetted default transport — a deployer could wire an insecure one.
-- **Decision needed:** the canonical auth per server — OAuth **on-behalf-of token exchange**
-  (when the MCP server is an OAuth resource server) vs. **service credential + agent-side ReBAC
-  mediation** (for legacy). Needs a real MCP server + IdP OBO to build and test against.
-- **Why not done:** writing untested auth code against no live system is exactly the risk to avoid.
+### 4.2 MCP tool authentication (per-server) — TIGHTENED + contract documented
+- **Now:** `tools/mcp.py` governs every call (default-deny + the toolkit gateway allowlist) and is
+  **proven to never forward a raw user token** — `_assert_no_user_credential()` fail-closes BEFORE
+  any gate/transport if outbound args carry a credential key (`authorization`/`access_token`/`bearer`/
+  `jwt`/`user_token`/`api_key`/…); tested (`tests/test_mcp_tools.py`). The canonical per-server auth is
+  documented in the module: **OAuth OBO token-exchange** (user token is the *input* to the exchange;
+  only the audience-restricted exchanged token goes on the wire) for OAuth resource servers, or
+  **service credential + agent-side ReBAC mediation** for legacy — in both, the raw user token stops
+  at the agent boundary.
+- **Residual:** no *vetted default transport* is shipped (needs a real MCP server + IdP OBO to build
+  and test against), so a deployer must wire the chosen pattern; the executor enforces the no-raw-token
+  invariant regardless.
 
 ### 4.3 Browser token storage (UI) — RESOLVED via the BFF pattern
 - **Decision taken:** implement the IETF "OAuth 2.0 for Browser-Based Apps" **BFF** pattern
@@ -126,3 +139,12 @@ calls are cryptographically authenticated and the user's identity governs every 
 The residual risk is concentrated in (a) operator deployment choices (§3) and (b) three design
 decisions (§4) whose correct implementation depends on infrastructure not present in this
 environment. None are silent gaps — they are listed here so they are decided, not discovered.
+
+**Independent red-team (2026-06-17):** a 4-agent adversarial pass over the newest code
+(cross-division identity, offline delivery, discovery/RaaS, governance edge) found 3 demonstrated
+issues — a never-expiring assertion (`exp` non-finite), an unbound delivery callback, and RaaS
+content poisoning — **all fixed with regression tests**; every confidentiality control held. Two
+residuals are deployment-config and now warn at startup: a local-only audit anchor (set
+`AUDIT_ANCHOR_URL`) and `require_mtls` without `TLS_CRL_FILE`. Findings + runnable probes:
+`redteam/REDTEAM_*.md`, `redteam/probe_*.py`. This was an internal adversarial pass, **not** a
+third-party penetration test (still recommended before production).

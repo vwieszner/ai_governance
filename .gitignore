@@ -66,3 +66,6 @@ agt-federated-rag/audit_logs/
 
 # mTLS key material (Phase-1 item 7)
 infra/generated/_certs/
+
+# local throwaway tooling (helm/kind binaries, provisioning drivers)
+.tools/

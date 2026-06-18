@@ -1,0 +1,52 @@
+# Non-secret division config (config.Settings via env). Mirrors the in-network
+# values that scripts/onboard_division.render_agent_env writes for the compose
+# `containerized` profile — but pointed at Kubernetes Service DNS (postgres, openfga,
+# qdrant, redis, temporal, keycloak) on their INTERNAL ports, not the host-mapped ones.
+#
+# Secrets (passwords, API tokens, HMAC, NVIDIA key, OpenFGA store/model ids) live in
+# the Secret (secret.yaml), NOT here. Per-division values (DIVISION_ID, OIDC issuer
+# host, peer wiring) are patched by each overlay — this base carries only the values
+# that are identical across divisions.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-config
+data:
+  # ── Identity / residency (DIVISION_ID + CLUSTER_ID patched per overlay) ──────
+  RESIDENCY_MODE: "external"
+  AGENT_TRUST_THRESHOLD: "0.6"
+  # Required by config.Settings (human sponsor of record for this agent). Same
+  # across divisions; override per overlay if you want a division-specific sponsor.
+  AGENT_SPONSOR_EMAIL: "sponsor@agt.local"
+
+  # ── Server ───────────────────────────────────────────────────────────────────
+  HOST: "0.0.0.0"
+  PORT: "8000"
+  LOG_LEVEL: "info"
+  SRE_ENABLED: "true"
+
+  # ── LLM (NVIDIA NIM by default; key comes from the Secret) ───────────────────
+  OPENAI_API_BASE: "https://integrate.api.nvidia.com/v1"
+  LLM_MODEL: "meta/llama-3.3-70b-instruct"
+  EMBEDDING_MODEL: "nvidia/nv-embedqa-e5-v5"
+
+  # ── In-cluster service endpoints (Kubernetes DNS, internal ports) ────────────
+  # These resolve inside THIS division's namespace only — the NetworkPolicy blocks
+  # cross-namespace traffic, so `qdrant`/`openfga`/`redis` always mean this division's.
+  QDRANT_URL: "http://qdrant:6333"
+  QDRANT_COLLECTION: "knowledge_base"
+  OPENFGA_API_URL: "http://openfga:8080"
+  REDIS_URL: "redis://redis:6379/0"
+  TEMPORAL_ADDRESS: "temporal:7233"
+  TEMPORAL_NAMESPACE: "default"
+
+  # Neo4j/GraphRAG is optional + inert (retrieval degrades to Qdrant-only). config
+  # still requires the fields, so set harmless defaults (no neo4j service in base).
+  NEO4J_URI: "bolt://localhost:7687"
+  NEO4J_USER: "neo4j"
+  NEO4J_PASSWORD: "none"
+
+  # ── OIDC / JWT (issuer + JWKS host patched per overlay) ──────────────────────
+  ALLOWED_JWT_ALGORITHMS: "RS256"
+
+  CORS_ORIGINS: "http://localhost:5173"

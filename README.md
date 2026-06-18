@@ -16,8 +16,15 @@ Toolkit (Agent OS policy engine + AgentMesh DID identity), LangGraph, OpenFGA, T
 Qdrant, and Keycloak.
 
 > Each division is a **physically-isolated stack** — its own IdP realm, authorization store,
-> workflow engine, vector DB, secrets, and DID. "Kill one division, the others keep serving"
-> is a tested property. This replaced an earlier shared-infra single-host model.
+> workflow engine, vector DB, secrets, and DID. Cross-store isolation is asserted by an
+> integration test that runs against live stacks (the full kill-B 3-division e2e is still
+> pending — see `PROJECT_STATUS.md`). This replaced an earlier shared-infra single-host model.
+
+> **📍 Current state:** the governance core, **offline/account-bound delivery (FR-6)**,
+> **verifiable cross-division identity (FR-3.6)**, **dynamic discovery (FR-3.1/3.2)**,
+> **CRL revocation (NFR-3)**, and the **division-native UI** are built and tested (223 backend tests).
+> Remaining residuals: OCSP (needs a responder), the 3-division e2e run (needs live stacks), and an
+> independent pen-test. **See `PROJECT_STATUS.md` for the verified done / not-done picture.**
 
 ---
 
@@ -37,12 +44,14 @@ Qdrant, and Keycloak.
 | Tamper-evident audit | Hash-chained + externally-anchored log (detects tamper/truncation/deletion) | `audit_log.py` |
 | Scheduled rotation | Temporal cron rotates DID creds + approval HMAC | `workflow/rotation.py` |
 | Connector SDK | `content → chunks + ACL grants` contract; folder reference impl | `connectors/` |
+| Pluggable retrieval | N retrievers fused (RRF): Qdrant + Neo4j seam + any number of external retrieval-as-a-service backends; every returned chunk is still per-chunk authorized (governance preserved) | `rag/retriever.py`, `config.RaasEndpoint` |
 | Governed MCP tools | One governed executor, per-server allowlist gateway, no raw-token forwarding | `tools/mcp.py` |
 | Data residency | Block external inference egress in local mode | `residency.py` |
 | Observability | Dependency-free Prometheus `/metrics` + dashboard + alert rules | `infra/observability/` |
 | Secrets backend | env-file default, Vault/KMS adapter | `secrets_backend.py` |
 | Admin CLI | `agtctl` grant/revoke/list (users + groups), status, doctor | `scripts/agtctl.py` |
 | One-command bring-up | `bootstrap.ps1` / `bootstrap.sh`; pinned images + frozen deps | `scripts/` |
+| Kubernetes deployment | kustomize base + per-division overlays; per-namespace NetworkPolicy isolation; verified Running on kind (alongside Compose) | `k8s/` |
 
 ## Architecture at a glance
 
@@ -104,6 +113,9 @@ With the stack up and the UI open:
    → alpha delegates over the signed `/a2a` channel → beta re-authorizes → answer in alice's pane.
 3. **Human approval** — alice asks data she's *not* cleared for → pane parks on "⏳ Awaiting approval"
    → bob sees it in his inbox and approves → **alice's answer appears automatically** (no re-type).
+   *(Offline too (FR-6): if alice closes the browser, the outcome is durably stored against her
+   account and waits — `GET /inbox`, regenerated at delivery so a revoked grant can't leak stale
+   data — surfaced on next login with an in-app badge.)*
 4. **Denied (no leak)** — alice asks an un-granted beta doc with no cross-grant → polite nothing;
    she can't even tell whether it exists.
 5. **Group access** — a user in an IdP group sees that group's doc set with **zero per-user grants**;
@@ -116,7 +128,7 @@ All seven are exercised by the test suites below; the first three are rendered-U
 ## Verification
 
 ```powershell
-# Backend — 124 tests (governance, authz, federation, approval, audit, transport, connectors, MCP, …)
+# Backend — 254 tests (252 pass, 2 skip — skips need live division stacks): governance, authz, federation, approval, audit, transport, connectors, MCP, retrieval, offline-delivery, discovery, red-team regression, …
 cd agt-federated-rag; ..\.venv\Scripts\python.exe -m pytest tests -q
 
 # UI unit — auth + PKCE + SSE normalization
@@ -154,17 +166,23 @@ python scripts\agtctl.py doctor --division alpha
 - **Federation never grants ambient trust** — every data path re-authorizes the real user at
   the resource division.
 - **Full posture, residual risk, and open design decisions:** see **`THREAT_MODEL.md`**.
-  Findings record: `SECURITY_AUDIT.md` + `redteam/`.
+  Current review gate: `redteam/M0_REVIEW_*.md`. Historical findings: `docs/archive/`.
 
 ## Documentation map
 
+- **`PROJECT_STATUS.md`** — **start here for current state**: what is built / partial / not built,
+  verified against code + tests. Supersedes any status claim elsewhere.
+- **`ARCHITECTURE.md`** — components, request **dataflow**, **callgraph**, the cross-division
+  federation + offline-delivery sequence, and where each security control sits (Mermaid diagrams).
+- `PRODUCT_REQUIREMENTS.md` — the target requirements (FR/NFR/SC, the spec). Its "Today:" notes are
+  the original pre-implementation baseline (historical).
 - `THREAT_MODEL.md` — enforced controls, deployment-dependent items, open design decisions.
+- `redteam/M0_REVIEW_*.md` — the current adversarial review gate (security / prod / quality).
 - `infra/idp-presets/` — connect a corporate IdP (AD/LDAP, Entra, Okta) + groups mapper.
 - `infra/nginx/` — the production mTLS edge (design, enable, proof, host caveats).
 - `infra/observability/` — Prometheus/Grafana/alerts + `BACKUP_RUNBOOK.md`.
-- `TEMPLATE_TASKS.md` — the template-completion record (all 14 tasks, with proofs).
-- `IMPLEMENTATION_PLAN.md` / `PRODUCT_REQUIREMENTS.md` — milestone + requirements history.
-- `SESSION_STATUS.md` — engineering handoff log.
+- `docs/archive/` — historical: the executed `IMPLEMENTATION_PLAN.md`, prior handoff logs, the
+  template-task record, and dated audits (superseded; kept for history only).
 
 ## Per-division deployment (Infrastructure-as-Code)
 

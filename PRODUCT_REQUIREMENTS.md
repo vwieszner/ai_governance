@@ -5,6 +5,10 @@
 > implementation design, no file-level change plan, no sequencing. Acceptance criteria are
 > included per requirement so each can be validated, but *how* to build them is deliberately
 > out of scope.
+>
+> **Status note:** the "*(Today: …)*" parentheticals throughout describe the **original
+> pre-implementation baseline** and are kept as the gap rationale — they are **not** current
+> state. For what is actually built against each requirement, see **`PROJECT_STATUS.md`**.
 
 ---
 

@@ -1,0 +1,15 @@
+# One Namespace per division — the k8s-native division boundary (NFR-2, decision D-3).
+#
+# Each division is a PHYSICALLY ISOLATED stack: its own OpenFGA store, Qdrant, Redis,
+# Keycloak realm, Temporal, Postgres, and DID — nothing crosses the boundary. In
+# Compose that is a per-project network + volumes; in Kubernetes it is a dedicated
+# Namespace PLUS a default-deny NetworkPolicy (see networkpolicy.yaml). The overlay
+# patches the actual name (e.g. agt-div-alpha); this base value is a placeholder that
+# every overlay overrides via its namespace: field.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agt-div   # overridden per-division by the overlay's `namespace:`
+  labels:
+    app.kubernetes.io/part-of: agt-federated-rag
+    agt.division: base   # overlays patch this to the division id (alpha/beta/gamma)

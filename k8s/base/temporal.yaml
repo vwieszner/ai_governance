@@ -1,0 +1,89 @@
+# Temporal — this division's durable approval-workflow engine (FR-5 offline approvals).
+# One per division (NFR-2). Mirrors the compose `temporal` service:
+# temporalio/temporal:1.7.0, `server start-dev` with --db-filename on a durable volume
+# so in-flight APPROVAL workflows survive restart/reboot (the offline-approval headline).
+# Without the persisted db-filename, start-dev is in-memory and approvals are lost.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: temporal
+  labels:
+    app: temporal
+spec:
+  serviceName: temporal
+  replicas: 1
+  selector:
+    matchLabels:
+      app: temporal
+  template:
+    metadata:
+      labels:
+        app: temporal
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000        # the temporal user owns /home/temporal
+        fsGroup: 1000
+      containers:
+        - name: temporal
+          image: temporalio/temporal:1.7.0   # pinned to match compose (server 1.31.0)
+          args:
+            - server
+            - start-dev
+            - --ip
+            - 0.0.0.0
+            - --log-level
+            - warn
+            - --db-filename
+            - /home/temporal/temporal.db
+          ports:
+            - name: grpc
+              containerPort: 7233
+            - name: ui
+              containerPort: 8233
+          volumeMounts:
+            - name: temporal-data
+              mountPath: /home/temporal
+          readinessProbe:
+            tcpSocket:
+              port: 7233
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket:
+              port: 7233
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+  volumeClaimTemplates:
+    - metadata:
+        name: temporal-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal
+  labels:
+    app: temporal
+spec:
+  selector:
+    app: temporal
+  ports:
+    - name: grpc
+      port: 7233
+      targetPort: 7233
+    - name: ui
+      port: 8233
+      targetPort: 8233

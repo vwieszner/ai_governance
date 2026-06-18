@@ -1,0 +1,73 @@
+# Division Alpha overlay. Mirrors infra/divisions/alpha.yml (the compose manifest):
+# division_id=alpha, trusted_peers=[beta]. A new division = a new overlay like this
+# one; the base is never edited.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Every object lands in this division's OWN namespace — the isolation boundary.
+namespace: agt-div-alpha
+
+resources:
+  - ../../base
+
+# Tag the whole division's objects with its id (handy for `kubectl get -l agt.division=alpha`).
+labels:
+  - pairs:
+      agt.division: alpha
+    includeSelectors: false
+
+# Patches: the namespace name/label, and the per-division non-secret config.
+patches:
+  # Name the Namespace object (kustomize `namespace:` retargets objects INTO it, but
+  # the Namespace resource itself must be renamed explicitly) and label it so peer
+  # NetworkPolicies' namespaceSelector matches it.
+  - target:
+      kind: Namespace
+      name: agt-div
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: agt-div-alpha
+      - op: replace
+        path: /metadata/labels/agt.division
+        value: alpha
+  # Per-division config. DIVISION_ID/CLUSTER_ID identify the division; OIDC_* point at
+  # THIS division's Keycloak realm; TRUSTED_PEERS lists the divisions it federates with.
+  # OIDC_ISSUER must match the host baked into browser tokens at the division's edge —
+  # set it to the real external issuer URL at deploy time (placeholder host shown).
+  - target:
+      kind: ConfigMap
+      name: agent-config
+    patch: |-
+      - op: add
+        path: /data/DIVISION_ID
+        value: alpha
+      - op: add
+        path: /data/CLUSTER_ID
+        value: alpha
+      - op: add
+        path: /data/TRUSTED_PEERS
+        value: beta
+      - op: add
+        path: /data/OIDC_ISSUER
+        value: http://keycloak:8080/realms/rag
+      - op: add
+        path: /data/OIDC_JWKS_URI
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/certs
+      - op: add
+        path: /data/OIDC_TOKEN_ENDPOINT
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/token
+      - op: add
+        path: /data/AGENT_CLIENT_ID
+        value: agent-alpha
+      - op: add
+        path: /data/AGENT_NAME
+        value: AGT RAG - Division Alpha
+      - op: add
+        path: /data/TEMPORAL_TASK_QUEUE
+        value: approval-alpha
+
+# Per-division image tag (build/push agt-federated-rag:alpha, or use a digest).
+images:
+  - name: agt-federated-rag
+    newTag: alpha

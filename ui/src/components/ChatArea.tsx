@@ -1,17 +1,17 @@
 import { useState, useRef, useEffect, type KeyboardEvent } from 'react'
 import { TaskMessage } from './TaskMessage'
 import { submitQuery, pollApprovalResult } from '../api/rag'
-import type { AgentEvent, ClusterConfig, NormalizedTask } from '../types'
+import type { AgentEvent, Division, NormalizedTask } from '../types'
 
 interface Props {
-  cluster: ClusterConfig
+  division: Division
   user: string
   token: string
   onEvent: (e: AgentEvent) => void
   onLogout: () => void
 }
 
-export function ChatArea({ cluster, user, token, onEvent, onLogout }: Props) {
+export function ChatArea({ division, user, token, onEvent, onLogout }: Props) {
   const [input, setInput] = useState('')
   const [tasks, setTasks] = useState<NormalizedTask[]>([])
   const [submitting, setSubmitting] = useState(false)
@@ -57,20 +57,20 @@ export function ChatArea({ cluster, user, token, onEvent, onLogout }: Props) {
         const pollId = t.serverTaskId ?? t.id
         if (inFlightRef.current.has(pollId)) continue
         inFlightRef.current.add(pollId)
-        pollApprovalResult(cluster, token, pollId)
+        pollApprovalResult(division, token, pollId)
           .finally(() => inFlightRef.current.delete(pollId))
           .then((r) => {
             if (r.status === 'completed') {
               upsertTask({ ...t, state: 'completed', answer: r.answer || '', statusMessage: 'Approved', updatedAt: new Date() })
               onEvent({
-                id: crypto.randomUUID(), timestamp: new Date(), cluster: cluster.id,
+                id: crypto.randomUUID(), timestamp: new Date(), division: division.id,
                 user, kind: 'completed', taskId: t.id,
                 message: '✅ Data owner approved — answer delivered to requester',
               })
             } else if (r.status === 'denied') {
               upsertTask({ ...t, state: 'failed', answer: '', statusMessage: r.message || 'Your request was declined by the data owner.', updatedAt: new Date() })
               onEvent({
-                id: crypto.randomUUID(), timestamp: new Date(), cluster: cluster.id,
+                id: crypto.randomUUID(), timestamp: new Date(), division: division.id,
                 user, kind: 'failed', taskId: t.id,
                 message: '⛔ Data owner declined the request',
               })
@@ -80,7 +80,7 @@ export function ChatArea({ cluster, user, token, onEvent, onLogout }: Props) {
       }
     }, 4000)
     return () => clearInterval(id)
-  }, [hasPending, cluster, token, user, onEvent])
+  }, [hasPending, division, token, user, onEvent])
 
   async function handleSubmit() {
     const query = input.trim()
@@ -89,7 +89,7 @@ export function ChatArea({ cluster, user, token, onEvent, onLogout }: Props) {
     setError('')
     setSubmitting(true)
     try {
-      await submitQuery(cluster, user, token, query, upsertTask, onEvent)
+      await submitQuery(division, user, token, query, upsertTask, onEvent)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Request failed')
     } finally {
@@ -108,7 +108,7 @@ export function ChatArea({ cluster, user, token, onEvent, onLogout }: Props) {
     <div className="chat-area">
       <div className="chat-header">
         <span className="chat-user">{user}</span>
-        <span className="chat-cluster">{cluster.id}</span>
+        <span className="chat-division">{division.label}</span>
         <button className="btn-logout" onClick={onLogout} title="Log out">✕</button>
       </div>
 

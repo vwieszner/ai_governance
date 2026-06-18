@@ -25,12 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import sys
 from pathlib import Path
 
 import structlog
 
-from config import settings
 from rag.neo4j_retriever import GraphRAGRetriever
 from rag.qdrant_retriever import HybridQdrantRetriever
 

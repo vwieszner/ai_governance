@@ -1,0 +1,89 @@
+# Keycloak — this division's OWN realm host (user login / OIDC). One per division
+# (NFR-2); a token from this Keycloak is rejected by every other division
+# (issuer+audience+key binding). Mirrors the compose `keycloak` service:
+# quay.io/keycloak/keycloak:26.6.2, start-dev with token-exchange +
+# admin-fine-grained-authz, durable data volume, health endpoint enabled.
+#
+# NOTE: start-dev is the dev/demo profile (matches compose). A production cluster
+# would run `start` with an external DB + hostname config — that is the operator's
+# deploy-time hardening step, called out in k8s/README.md.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak
+  labels:
+    app: keycloak
+spec:
+  serviceName: keycloak
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.6.2   # pinned to match compose
+          args: ["start-dev", "--features=token-exchange,admin-fine-grained-authz"]
+          env:
+            - name: KEYCLOAK_ADMIN
+              valueFrom:
+                secretKeyRef: { name: agent-secrets, key: KEYCLOAK_ADMIN }
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: agent-secrets, key: KEYCLOAK_ADMIN_PASSWORD }
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: management
+              containerPort: 9000   # KC 26 serves /health on the management port
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 9000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 9000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          volumeMounts:
+            - name: keycloak-data
+              mountPath: /opt/keycloak/data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1536Mi"
+  volumeClaimTemplates:
+    - metadata:
+        name: keycloak-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  labels:
+    app: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

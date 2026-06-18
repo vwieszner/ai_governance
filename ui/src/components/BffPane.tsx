@@ -3,17 +3,18 @@ import { ChatArea } from './ChatArea'
 import { ApprovalInbox } from './ApprovalInbox'
 import { setCsrf } from '../api/rag'
 import { getSession, login, logout, type BffSession } from '../api/session'
-import type { AgentEvent, ClusterConfig } from '../types'
+import type { AgentEvent, Division } from '../types'
 
 interface Props {
-  cluster: ClusterConfig
+  division: Division
   onEvent: (e: AgentEvent) => void
 }
 
 // Production auth pane: the browser holds NO token. Auth state comes from /bff/session
 // (HttpOnly cookie); login/logout are server-driven redirects. The CSRF token from the
-// session is handed to the fetch layer for mutating calls.
-export function BffPane({ cluster, onEvent }: Props) {
+// session is handed to the fetch layer for mutating calls. One browser session binds to
+// ONE division (the production multi-user model — open another division in its own browser).
+export function BffPane({ division, onEvent }: Props) {
   const [session, setSession] = useState<BffSession | null>(null)
 
   useEffect(() => {
@@ -28,7 +29,7 @@ export function BffPane({ cluster, onEvent }: Props) {
   return (
     <div className="user-pane">
       <div className="pane-header">
-        <span className="pane-cluster">{cluster.label}</span>
+        <span className="pane-division">{division.label}</span>
         {session?.authenticated && <span className="pane-user">{session.user}</span>}
       </div>
 
@@ -36,10 +37,10 @@ export function BffPane({ cluster, onEvent }: Props) {
         <p className="chat-empty">Checking session…</p>
       ) : session.authenticated ? (
         <>
-          <ApprovalInbox cluster={cluster} token="" />
+          <ApprovalInbox division={division} token="" />
           {/* token="" => cookie mode (no token in JS); auth rides the HttpOnly cookie */}
           <ChatArea
-            cluster={cluster}
+            division={division}
             user={session.user ?? 'user'}
             token=""
             onEvent={onEvent}
@@ -48,7 +49,11 @@ export function BffPane({ cluster, onEvent }: Props) {
         </>
       ) : (
         <div className="login-form">
-          <p className="login-hint">Sign in to <strong>{cluster.label}</strong></p>
+          <div className="login-division" data-division={division.id}>
+            <span className="login-division-tag">Division</span>
+            <span className="login-division-name">{division.label}</span>
+          </div>
+          <p className="login-hint">Sign in to <strong>{division.label}</strong></p>
           <button type="button" className="btn-primary" onClick={() => login()}>
             Sign in with SSO
           </button>

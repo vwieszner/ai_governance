@@ -64,3 +64,41 @@ def test_no_transport_is_governed_but_not_executed(monkeypatch):
     mcp_tools.reset_cache()
     with pytest.raises(mcp_tools.McpToolError):       # validates OK, refuses to silently no-op
         asyncio.run(mcp_tools.call_mcp_tool("jira", "search"))
+
+
+def test_credential_in_arguments_is_refused_fail_closed(monkeypatch):
+    # §4.2 boundary invariant: a raw user credential smuggled into the tool ARGUMENTS is
+    # refused before any transport runs — auth is the caller's job (OBO/service credential),
+    # never tool arguments. Fail-closed: the call raises and the transport is NEVER invoked.
+    _patch_enforce_ok(monkeypatch)
+    monkeypatch.setattr(mcp_tools.settings, "mcp_servers",
+                        '[{"name":"jira","url":"https://mcp/jira","allowed_auth_methods":["oauth2"],'
+                        '"auth_mode":"oauth_obo"}]')
+    mcp_tools.reset_cache()
+
+    called = {"n": 0}
+    async def transport(server_cfg, tool, args):
+        called["n"] += 1
+        return {}
+
+    for leaky in ({"q": "x", "access_token": "SECRET"}, {"Authorization": "Bearer x"},
+                  {"user_token": "jwt"}):
+        with pytest.raises(mcp_tools.McpToolError):
+            asyncio.run(mcp_tools.call_mcp_tool("jira", "search", leaky, caller=transport))
+    assert called["n"] == 0                            # transport never ran (fail-closed)
+
+
+def test_clean_arguments_still_pass_through(monkeypatch):
+    # Positive control: the credential guard does not reject ordinary arguments.
+    _patch_enforce_ok(monkeypatch)
+    monkeypatch.setattr(mcp_tools.settings, "mcp_servers",
+                        '[{"name":"jira","url":"https://mcp/jira","allowed_auth_methods":["oauth2"],'
+                        '"auth_mode":"oauth_obo"}]')
+    mcp_tools.reset_cache()
+
+    async def transport(server_cfg, tool, args):
+        return {"ok": True}
+
+    out = asyncio.run(mcp_tools.call_mcp_tool("jira", "search", {"q": "bug", "limit": 10},
+                                              caller=transport))
+    assert out == {"ok": True}

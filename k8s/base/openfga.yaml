@@ -1,0 +1,155 @@
+# OpenFGA — per-division ReBAC store (per-chunk authorization). One per division;
+# its Postgres datastore is this division's only (NFR-2). Mirrors the compose
+# `openfga-migrate` (a one-shot schema migration) + `openfga` (run) services with
+# pinned image openfga/openfga:v1.16.1.
+#
+# The datastore URI is assembled from the Secret at runtime (sh -c) so the password
+# never appears in a manifest. Cross-references postgres by Service DNS.
+---
+# One-shot DB migration. Re-running is safe (idempotent); the agent/worker wait on
+# OpenFGA readiness which only passes after the schema exists.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openfga-migrate
+  labels:
+    app: openfga
+    component: migrate
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        app: openfga
+        component: migrate
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      initContainers:
+        # Block the migration until Postgres answers, so the Job doesn't burn
+        # retries racing datastore startup.
+        - name: wait-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432 -U "$POSTGRES_USER" -d openfga; do
+                echo "waiting for postgres"; sleep 2;
+              done
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: agent-secrets, key: POSTGRES_USER }
+      containers:
+        - name: migrate
+          image: openfga/openfga:v1.16.1   # pinned to match compose
+          # The openfga image is DISTROLESS (no shell) — must NOT use `sh -c`. Run the
+          # binary directly and assemble the datastore URI via k8s $(VAR) env-substitution.
+          command: ["/openfga"]
+          args: ["migrate"]
+          env:
+            - name: OPENFGA_DATASTORE_ENGINE
+              value: postgres
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: agent-secrets, key: POSTGRES_USER }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: agent-secrets, key: POSTGRES_PASSWORD }
+            - name: OPENFGA_DATASTORE_URI
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/openfga?sslmode=disable"
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openfga
+  labels:
+    app: openfga
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openfga
+  template:
+    metadata:
+      labels:
+        app: openfga
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: openfga
+          image: openfga/openfga:v1.16.1   # pinned to match compose
+          # DISTROLESS image (no shell) — run the binary directly; assemble URI via $(VAR).
+          command: ["/openfga"]
+          args: ["run"]
+          env:
+            - name: OPENFGA_DATASTORE_ENGINE
+              value: postgres
+            - name: OPENFGA_LOG_LEVEL
+              value: warn
+            - name: OPENFGA_AUTHN_METHOD
+              value: preshared
+            - name: OPENFGA_PLAYGROUND_ENABLED
+              value: "false"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: agent-secrets, key: POSTGRES_USER }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: agent-secrets, key: POSTGRES_PASSWORD }
+            # Preshared key clients must present (the agent sends OPENFGA_API_TOKEN).
+            - name: OPENFGA_AUTHN_PRESHARED_KEYS
+              valueFrom:
+                secretKeyRef: { name: agent-secrets, key: OPENFGA_API_TOKEN }
+            - name: OPENFGA_DATASTORE_URI
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/openfga?sslmode=disable"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openfga
+  labels:
+    app: openfga
+spec:
+  selector:
+    app: openfga
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 8081
+      targetPort: 8081

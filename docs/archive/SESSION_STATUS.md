@@ -1,3 +1,10 @@
+> **⚠️ ARCHIVED — HISTORICAL, DO NOT TRUST FOR CURRENT STATE.** This was the prior
+> engineering handoff log. Its "M0–M8 + M-GOV + e2e COMPLETE & proven live" tally **over-claims**:
+> a 2026-06-17 audit found FR-3.6 (verifiable user identity) is agent-vouched not JWKS-verified,
+> FR-6 (offline delivery) is unbuilt, discovery is dead code, CRL revocation is unwired, and there
+> is no `/audit` endpoint or 3-division e2e. **See `PROJECT_STATUS.md` for verified current state.**
+> Kept only for development history.
+
 # AGT Federated-RAG — Session Status & Handoff
 
 _Last updated: 2026-06-11. Product: Microsoft Agent Governance Toolkit multi-division federated RAG (DID + Ed25519 + per-action policy + Temporal approval + OpenFGA per-chunk ReBAC). This is a PRODUCTION system for real divisions/users — not a demo._

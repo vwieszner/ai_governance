@@ -17,15 +17,39 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import os
 import ssl
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import AuthorityInformationAccessOID, NameOID
 
 _DAY = datetime.timedelta(days=1)
+
+# CRL distribution point baked into issued certs (where a real deployment publishes the CRL)
+# and the default on-disk CRL path the serving context reloads. Both overridable by env so
+# config.py needn't grow a field for this revocation surface (NFR-3). Empty CRL path → no CRL
+# configured → the mTLS path behaves exactly as before (backward-compatible, fail-open only
+# when revocation was never wired). When a CRL IS configured we enforce it fail-closed.
+CRL_DISTRIBUTION_URL = os.environ.get(
+    "TLS_CRL_URL", "https://federation.local/crl/federation-ca.crl"
+)
+CRL_FILE = os.environ.get("TLS_CRL_FILE", "")
+
+# OCSP responder URL baked into issued certs via the Authority Information Access (AIA)
+# extension, so a relying party can do an ONLINE revocation check (lower latency than a CRL
+# for a freshly-revoked serial) once a responder is deployed (NFR-3). This is READINESS only:
+# it advertises WHERE the responder lives; standing up the responder + turning on stapling is
+# a deploy-time step (see ocsp_stapling_file / the OCSP note in server_context). Overridable by
+# env so config.py needn't grow a field. Empty → no AIA/OCSP extension is added (the CRL gate
+# still applies), keeping issuance backward-compatible.
+OCSP_RESPONDER_URL = os.environ.get(
+    "TLS_OCSP_URL", "http://ocsp.federation.local"
+)
 
 
 @dataclass
@@ -100,7 +124,7 @@ def generate_ca(common_name: str = "AGT Federation CA") -> tuple[ec.EllipticCurv
 def issue_division_cert(ca_key, ca_cert, division_id: str) -> CertPair:
     """Issue a CA-signed cert whose CN + SAN identify the division."""
     key = ec.generate_private_key(ec.SECP256R1())
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, division_id)]))
         .issuer_name(ca_cert.subject)
@@ -112,8 +136,27 @@ def issue_division_cert(ca_key, ca_cert, division_id: str) -> CertPair:
         .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
         .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
                        critical=False)
-        .sign(ca_key, hashes.SHA256())
+        # CRLDistributionPoints: where a relying party fetches the issuer's CRL to check this
+        # cert's revocation status. Points a real deployment at the published CRL (NFR-3); the
+        # in-process serving gate loads the CRL from disk, this advertises it in the cert itself.
+        .add_extension(x509.CRLDistributionPoints([
+            x509.DistributionPoint(
+                full_name=[x509.UniformResourceIdentifier(CRL_DISTRIBUTION_URL)],
+                relative_name=None, reasons=None, crl_issuer=None)
+        ]), critical=False)
     )
+    # AuthorityInformationAccess (OCSP): advertise the responder so a relying party can do an
+    # ONLINE revocation check / OCSP stapling once a responder is deployed (NFR-3 readiness).
+    # Added only when OCSP_RESPONDER_URL is set so issuance stays backward-compatible when it
+    # isn't. ENFORCEMENT (responder + stapling) is a deploy-time step — see server_context.
+    if OCSP_RESPONDER_URL:
+        builder = builder.add_extension(
+            x509.AuthorityInformationAccess([
+                x509.AccessDescription(
+                    AuthorityInformationAccessOID.OCSP,
+                    x509.UniformResourceIdentifier(OCSP_RESPONDER_URL)),
+            ]), critical=False)
+    cert = builder.sign(ca_key, hashes.SHA256())
     return CertPair(
         key_pem=key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                                   serialization.NoEncryption()),
@@ -138,14 +181,93 @@ def is_revoked(cert: x509.Certificate, crl: x509.CertificateRevocationList) -> b
     return crl.get_revoked_certificate_by_serial_number(cert.serial_number) is not None
 
 
-def server_context(cert_path: str, key_path: str, ca_path: str) -> ssl.SSLContext:
+def write_crl(crl: x509.CertificateRevocationList, path) -> str:
+    """Persist a CRL as PEM at ``path`` (the file the serving context reloads). Returns the path."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+    return str(p)
+
+
+# ── CRL load / refresh cache (the on-the-wire revocation gate) ─────────────────
+#
+# OpenSSL enforces revocation at the TLS layer when the verifying SSLContext has
+# VERIFY_CRL_CHECK_LEAF set AND a CRL for the presented cert's issuer is loaded into the
+# verify store. The CRL must be supplied via a verify FILE (cafile): loading it via cadata=
+# does NOT associate the CRL with its issuer, so OpenSSL then rejects every cert with
+# "unable to get certificate CRL". So we materialise one combined PEM file (CA cert + CRL)
+# and load it via cafile. The bundle is cached keyed on (ca_path, crl_path) + the CRL file's
+# mtime, so a freshly-published CRL (a newly-revoked serial) is picked up on the next context
+# build — without restarting the process — while an unchanged CRL reuses the cached file.
+
+_crl_cache_lock = threading.Lock()
+_crl_cache: dict[tuple[str, str], tuple[float, str]] = {}
+
+
+def load_crl_bundle(ca_path: str, crl_path: str) -> str:
+    """Materialise a combined ``CA-cert + CRL`` PEM verify file and return its path, refreshing
+    it when the CRL's mtime changes. Raises if the CRL path is set but absent or unparseable —
+    a configured-but-missing/corrupt CRL is a misconfiguration we must NOT silently treat as
+    "no revocations" (that would fail OPEN). Caller passes crl_path only when CRL is configured."""
+    mtime = os.path.getmtime(crl_path)        # raises FileNotFoundError → fail loud
+    key = (ca_path, crl_path)
+    with _crl_cache_lock:
+        cached = _crl_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+    ca_pem = Path(ca_path).read_bytes()
+    crl_pem = Path(crl_path).read_bytes()
+    # Validate it parses as a CRL — a corrupt/empty file must fail loud, not fail open.
+    x509.load_pem_x509_crl(crl_pem)
+    bundle_path = Path(crl_path).with_suffix(".cabundle.pem")
+    bundle_path.write_bytes(ca_pem.rstrip() + b"\n" + crl_pem)
+    with _crl_cache_lock:
+        _crl_cache[key] = (mtime, str(bundle_path))
+    return str(bundle_path)
+
+
+def server_context(cert_path: str, key_path: str, ca_path: str,
+                   crl_path: str | None = None,
+                   ocsp_staple_file: str | None = None) -> ssl.SSLContext:
     """Server SSL context that REQUIRES a client certificate signed by our CA (mTLS).
-    (check_hostname is a client-side setting; not applicable on a server context.)"""
+    (check_hostname is a client-side setting; not applicable on a server context.)
+
+    When ``crl_path`` is given, revocation is ENFORCED at the handshake: VERIFY_CRL_CHECK_LEAF
+    is set and the issuer's CRL is loaded, so a CA-signed-but-revoked client cert is rejected
+    fail-closed (NFR-3). When ``crl_path`` is None the context behaves exactly as before
+    (no revocation gate) — backward-compatible for deployments that never configured a CRL.
+
+    OCSP STAPLING (readiness, NFR-3): ``ocsp_staple_file`` is the documented config HOOK for
+    OCSP stapling — a deployment fetches a signed OCSP response for THIS server cert from the
+    responder advertised in the cert's AIA extension (OCSP_RESPONDER_URL) and points this at
+    it. NOTE / HONEST LIMITATION: Python's stdlib ``ssl`` has no API to set a stapled OCSP
+    response on a server context (only the client side can request/verify one via
+    ``SSLSocket.get_verified_chain`` / a callback), so stapling MUST be terminated at a TLS
+    front-end that supports it (nginx ``ssl_stapling on;`` + ``ssl_stapling_verify on;``, Envoy,
+    or HAProxy) — see THREAT_MODEL §3 (nginx edge) and the deploy note. We therefore VALIDATE
+    the hook (fail loud if a path is configured but absent — same posture as the CRL) but do
+    NOT silently pretend to staple. Passing it without a front-end that staples is a no-op at
+    the Python layer by design, documented here so it is never mistaken for enforcement."""
+    if ocsp_staple_file:
+        # Fail loud on a configured-but-missing staple, mirroring load_crl_bundle: a
+        # misconfigured stapling path must not be silently ignored.
+        if not Path(ocsp_staple_file).exists():
+            raise FileNotFoundError(
+                f"ocsp_staple_file configured but not found: {ocsp_staple_file!r} — OCSP "
+                f"stapling must be terminated at the TLS front-end (nginx/Envoy); this is the "
+                f"readiness hook, not stdlib-enforced. See server_context docstring."
+            )
     with _genuine_ssl():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert_path, key_path)
-        ctx.load_verify_locations(ca_path)
         ctx.verify_mode = ssl.CERT_REQUIRED      # no client cert → handshake rejected
+        if crl_path:
+            # Load CA + CRL from one combined PEM file (cafile) and turn on leaf CRL checking.
+            # Rebuilt via the mtime-keyed cache so a republished CRL is enforced on next build.
+            ctx.load_verify_locations(cafile=load_crl_bundle(ca_path, crl_path))
+            ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+        else:
+            ctx.load_verify_locations(ca_path)
     return ctx
 
 
@@ -166,12 +288,35 @@ def client_context(ca_path: str, cert_path: str | None = None, key_path: str | N
 
 # ── Settings-driven wiring (used by the API server + peer client) ──────────────
 
+def crl_path_for(s) -> str:
+    """The configured CRL path (revocation gate), or "" when none is configured.
+
+    Sourced from a ``tls_crl_file`` setting if config.py grows one, else the ``TLS_CRL_FILE``
+    env (the ``CRL_FILE`` module constant). Empty → no CRL configured → no revocation gate
+    (backward-compatible). Non-empty → revocation is ENFORCED fail-closed on the mTLS path."""
+    return getattr(s, "tls_crl_file", "") or CRL_FILE
+
+
+def ocsp_staple_file_for(s) -> str:
+    """The configured OCSP-staple file (readiness hook), or "" when none is configured.
+
+    Sourced from a ``tls_ocsp_staple_file`` setting if config.py grows one, else the
+    ``TLS_OCSP_STAPLE_FILE`` env. Empty → no stapling configured (backward-compatible). When
+    set, ``server_context`` validates the file exists (fail loud); ENFORCEMENT of stapling
+    still requires a TLS front-end (nginx/Envoy) — the stdlib can't staple (see server_context
+    docstring). This is the config point so a deployment can wire it without code changes."""
+    return getattr(s, "tls_ocsp_staple_file", "") or os.environ.get("TLS_OCSP_STAPLE_FILE", "")
+
+
 def tls_serving_kwargs(s) -> dict:
     """uvicorn ssl_* kwargs to SERVE mTLS, or {} when mTLS isn't enabled/configured.
 
     Returns CERT_REQUIRED serving (mutual TLS) so a peer with no client cert is rejected
-    at the TLS layer. Raises if require_mtls is set but the cert paths are missing — fail
-    loud rather than silently fall back to plaintext (a security downgrade).
+    at the TLS layer. When a CRL is configured (``crl_path_for``), revocation is ENFORCED at
+    the handshake via an ``ssl_context_factory`` that builds a CRL-checking server_context —
+    a CA-signed-but-revoked client cert is rejected (NFR-3). Raises if require_mtls is set but
+    the cert paths are missing — fail loud rather than silently fall back to plaintext (a
+    security downgrade).
     """
     if not getattr(s, "require_mtls", False):
         return {}
@@ -181,6 +326,18 @@ def tls_serving_kwargs(s) -> dict:
             "require_mtls=true but TLS_CERT_FILE / TLS_KEY_FILE / TLS_CA_FILE are not all set "
             "— refusing to serve plaintext. Run scripts/issue_division_certs.py."
         )
+    crl = crl_path_for(s)
+    staple = ocsp_staple_file_for(s)
+    if crl or staple:
+        # uvicorn's built-in ssl_* path can't set verify_flags / load a CRL (or validate an
+        # OCSP staple hook), so hand it a factory that returns our hardened server_context. The
+        # factory is invoked per (re)bind, so load_crl_bundle's mtime cache refreshes a
+        # republished CRL on a reload. ``staple`` is the OCSP-stapling readiness hook (validated
+        # by server_context; enforcement still needs a TLS front-end — see its docstring).
+        def _factory(_config, _default):
+            return server_context(cert, key, ca, crl_path=crl or None,
+                                  ocsp_staple_file=staple or None)
+        return {"ssl_context_factory": _factory}
     return {
         "ssl_certfile": cert,
         "ssl_keyfile": key,
@@ -211,19 +368,41 @@ def peer_tls_context(s) -> ssl.SSLContext | None:
     return client_context(ca, cert, key)
 
 
+def _write_ca_key(ca_key, path) -> str:
+    p = Path(path)
+    p.write_bytes(ca_key.private_bytes(serialization.Encoding.PEM,
+                                       serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption()))
+    return str(p)
+
+
 def issue_federation_certs(out_dir, division_ids: list[str], ca_name: str = "AGT Federation CA"):
     """Generate one shared CA + a per-division cert/key under out_dir, returning
-    {division_id: (cert_path, key_path), '_ca': ca_path}. Idempotent at the directory
-    level (overwrites). Used by scripts/issue_division_certs.py."""
-    from pathlib import Path
+    {division_id: (cert_path, key_path), '_ca': ca_path, '_ca_key': key_path, '_crl': crl_path}.
+    Also persists the CA private key + an initial (empty) CRL so revocation can be enforced and
+    later regenerated (see regenerate_crl). Idempotent at the directory level (overwrites).
+    Used by scripts/issue_division_certs.py."""
     d = Path(out_dir)
     d.mkdir(parents=True, exist_ok=True)
     ca_key, ca_cert = generate_ca(ca_name)
     ca_path = d / "federation-ca.crt"
     ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
-    result: dict = {"_ca": str(ca_path)}
+    ca_key_path = _write_ca_key(ca_key, d / "federation-ca.key")
+    # Initial empty CRL — present (so the issuer has a CRL: the gate fails-closed only on a
+    # REVOKED serial, not on every cert) but revoking nobody yet. Republished by regenerate_crl.
+    crl_path = write_crl(build_crl(ca_key, ca_cert, []), d / "federation-ca.crl")
+    result: dict = {"_ca": str(ca_path), "_ca_key": ca_key_path, "_crl": crl_path}
     for div in division_ids:
         pair = issue_division_cert(ca_key, ca_cert, div)
         crt, key = pair.write(d, div)
         result[div] = (crt, key)
     return result
+
+
+def regenerate_crl(ca_cert_path, ca_key_path, crl_path, revoked_serials: list[int]) -> str:
+    """(Re)build the CA's CRL from the persisted CA cert+key, revoking ``revoked_serials``, and
+    write it to ``crl_path``. Run after revoking a division cert; the serving context reloads it
+    (mtime cache) on next bind. Returns the CRL path."""
+    ca_cert = x509.load_pem_x509_certificate(Path(ca_cert_path).read_bytes())
+    ca_key = serialization.load_pem_private_key(Path(ca_key_path).read_bytes(), password=None)
+    return write_crl(build_crl(ca_key, ca_cert, revoked_serials), crl_path)

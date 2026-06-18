@@ -3,14 +3,14 @@ import { LoginForm } from './LoginForm'
 import { ChatArea } from './ChatArea'
 import { ApprovalInbox } from './ApprovalInbox'
 import { refreshAccessToken, AuthError, type AuthTokens } from '../api/auth'
-import type { AgentEvent, ClusterConfig } from '../types'
+import type { AgentEvent, Division } from '../types'
 
 interface Props {
-  cluster: ClusterConfig
+  division: Division
   onEvent: (e: AgentEvent) => void
 }
 
-export function UserPane({ cluster, onEvent }: Props) {
+export function UserPane({ division, onEvent }: Props) {
   const [tokens, setTokens] = useState<AuthTokens | null>(null)
   const [username, setUsername] = useState<string>('')
 
@@ -30,7 +30,7 @@ export function UserPane({ cluster, onEvent }: Props) {
     if (!tokens) return
     const delay = Math.max(0, (tokens.expiresIn - 60) * 1000)
     const timer = setTimeout(() => {
-      refreshAccessToken(cluster.authBase, cluster.clientId, tokens.refreshToken)
+      refreshAccessToken(division.authBase, division.clientId, tokens.refreshToken)
         .then((next) => setTokens(next))
         .catch((err) => {
           if (err instanceof AuthError) {
@@ -40,20 +40,20 @@ export function UserPane({ cluster, onEvent }: Props) {
         })
     }, delay)
     return () => clearTimeout(timer)
-  }, [tokens, cluster.authBase, cluster.clientId])
+  }, [tokens, division.authBase, division.clientId])
 
   return (
     <div className="user-pane">
       <div className="pane-header">
-        <span className="pane-cluster">{cluster.label}</span>
+        <span className="pane-division">{division.label}</span>
         {username && <span className="pane-user">{username}</span>}
       </div>
 
       {tokens ? (
         <>
-          <ApprovalInbox cluster={cluster} token={tokens.accessToken} />
+          <ApprovalInbox division={division} token={tokens.accessToken} />
           <ChatArea
-            cluster={cluster}
+            division={division}
             user={username}
             token={tokens.accessToken}
             onEvent={onEvent}
@@ -61,7 +61,7 @@ export function UserPane({ cluster, onEvent }: Props) {
           />
         </>
       ) : (
-        <LoginForm cluster={cluster} onLogin={handleLogin} />
+        <LoginForm division={division} onLogin={handleLogin} />
       )}
     </div>
   )

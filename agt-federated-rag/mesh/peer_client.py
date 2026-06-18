@@ -28,6 +28,8 @@ Security controls applied before any peer message is sent:
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +51,14 @@ log = structlog.get_logger(__name__)
 
 # Path on the peer cluster that receives DID-signed federation queries.
 _PEER_QUERY_PATH = "/a2a/query"
+
+# FR-3.6: lifetime of the recipient-bound user assertion. The assertion travels
+# inside the DID-signed, replay-protected envelope, so this short window is a
+# second, RECIPIENT-SCOPED bound: even within the envelope's ±5-min freshness it
+# limits how long a captured-and-re-presented assertion (e.g. one a compromised
+# receiver tried to forward onward) could be accepted. Kept ≤ the envelope replay
+# window so the two layers stay consistent.
+_USER_ASSERTION_TTL_SECONDS = 300
 
 # Outbound HTTP timeout. The peer runs a full RAG + LLM pipeline on receipt, so
 # this must exceed the peer's WORST-CASE LLM time — llm_timeout_seconds across
@@ -102,6 +112,35 @@ async def get_peer_circuit_state(peer_url: str | None = None) -> CircuitState:
     return cb.get_state()
 
 
+def _bind_user_assertion(claims: dict, *, audience: str) -> dict:
+    """Build the RECIPIENT-BOUND, time-limited user assertion (FR-3.6).
+
+    Takes the home division's already-validated identity claims (sub/email/
+    email_verified/iss) and adds the binding fields that make the assertion
+    verifiable and non-replayable AT THE RECEIVER:
+
+      * ``aud`` — the TARGET division's DID. The receiver rejects the assertion
+        unless ``aud`` equals its OWN DID, so an assertion minted for division B
+        cannot be re-presented to division C (recipient binding).
+      * ``iat`` / ``exp`` — issued-at and a short expiry (``_USER_ASSERTION_TTL_SECONDS``),
+        so the assertion is only briefly acceptable even within the envelope window.
+      * ``jti`` — a unique id (audit / future single-use tracking).
+
+    These claims ride INSIDE the existing Ed25519 DID-signed, replay-protected
+    envelope (sign_outbound_message), so they are already cryptographically
+    authenticated as coming from this division's DID — no second signature or
+    forwarded token is needed. ``iss`` is whatever the home claims carried; the
+    receiver binds it to this signer's DID.
+    """
+    now = int(time.time())
+    bound = dict(claims)
+    bound["aud"] = audience
+    bound["iat"] = now
+    bound["exp"] = now + _USER_ASSERTION_TTL_SECONDS
+    bound["jti"] = str(uuid.uuid4())
+    return bound
+
+
 async def call_peer_agent(
     query: str,
     user_id: str,
@@ -116,8 +155,12 @@ async def call_peer_agent(
     The user's VALIDATED identity claims (user_assertion: sub/email/email_verified/iss)
     are carried inside the DID-signed, replay-protected payload so the peer can bind
     the asserted issuer to this signer and make its own OpenFGA authorization decision.
-    No raw user bearer token is forwarded — so a compromised peer gets no credential it
-    could replay against the user's home division. The plain user_id is diagnostic only.
+    Before sending we make that assertion RECIPIENT-BOUND and time-limited (FR-3.6):
+    we add ``aud`` = the target peer's DID, plus ``iat``/``exp``/``jti`` (see
+    _bind_user_assertion). No raw user bearer token is forwarded — so a compromised
+    peer gets no credential it could replay against the user's home division, and the
+    `aud` binding means it cannot even forward this assertion to a THIRD division. The
+    plain user_id is diagnostic only.
     """
     if not settings.peer_agent_url:
         raise RuntimeError("No peer agent URL configured")
@@ -174,7 +217,10 @@ async def call_peer_agent(
         # (sub/email/email_verified/iss) — NOT a raw bearer token. Authenticity +
         # freshness come from the Ed25519 signature + ts/nonce on this envelope; the
         # receiver binds `iss` to this signer and re-authorizes via its own OpenFGA.
-        "user_assertion": user_assertion or {},
+        # Wave 3: the assertion is RECIPIENT-BOUND (aud = this peer's DID) and
+        # short-expiry (iat/exp/jti) so it is verifiable + non-replayable at the
+        # receiver and cannot be re-presented to a third division.
+        "user_assertion": _bind_user_assertion(user_assertion or {}, audience=peer_did),
         "context_id": context_id,
         "callback_url": callback_url,
         "source_cluster": settings.cluster_id,

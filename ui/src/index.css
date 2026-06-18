@@ -129,7 +129,7 @@ button { font-family: inherit; font-size: inherit; }
   flex-shrink: 0;
 }
 
-.pane-cluster {
+.pane-division {
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
@@ -159,6 +159,28 @@ button { font-family: inherit; font-size: inherit; }
   color: var(--text-muted);
   font-size: 13px;
   text-align: center;
+}
+
+/* Makes the user's division explicit at login (FR-2.4). */
+.login-division {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.login-division-tag {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+
+.login-division-name {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--blue);
 }
 
 .login-form form {
@@ -228,7 +250,7 @@ button { font-family: inherit; font-size: inherit; }
   color: var(--blue);
 }
 
-.chat-cluster {
+.chat-division {
   font-size: 11px;
   color: var(--text-muted);
   flex: 1;
@@ -520,8 +542,14 @@ button { font-family: inherit; font-size: inherit; }
 .ev-icon { text-align: center; }
 .ev-msg  { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.ev-cluster-agt-a { color: var(--blue);   font-weight: 600; }
-.ev-cluster-agt-b { color: var(--purple); font-weight: 600; }
+/* N-capable division coloring — MonitorPanel hashes the division id into one of these. */
+.ev-division   { font-weight: 600; }
+.ev-division-0 { color: var(--blue);   }
+.ev-division-1 { color: var(--purple); }
+.ev-division-2 { color: var(--green);  }
+.ev-division-3 { color: var(--yellow); }
+.ev-division-4 { color: var(--red);    }
+.ev-division-5 { color: var(--text);   }
 
 .ev-sent     { border-left-color: var(--blue); }
 .ev-working  { border-left-color: var(--text-muted); }

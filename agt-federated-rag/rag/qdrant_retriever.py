@@ -128,6 +128,37 @@ class HybridQdrantRetriever:
             )
         return out
 
+    async def fetch_by_chunk_ids(self, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Fetch the authoritative payload for specific chunk_ids from the store of record.
+
+        Content-integrity control (RaaS poisoning, A2d): the TEXT served into the LLM
+        context for an authorized chunk MUST come from this division's trusted Qdrant
+        store, never verbatim from an external retriever. ``check_auth`` calls this to
+        re-source text for the fused/authorized chunk_ids; a chunk_id absent here (e.g.
+        one only an external RaaS surfaced) yields nothing, so attacker-controlled text
+        cannot reach the prompt. Returns ``{chunk_id: {text, metadata}}`` for the ids
+        that exist in the trusted collection; missing ids are simply absent.
+        """
+        if not chunk_ids:
+            return {}
+        client = await self._client_conn()
+        points = await client.retrieve(
+            collection_name=settings.qdrant_collection,
+            ids=[_chunk_uuid(cid) for cid in chunk_ids],
+            with_payload=True,
+        )
+        out: dict[str, dict[str, Any]] = {}
+        for pt in points:
+            payload = pt.payload or {}
+            cid = payload.get("chunk_id")
+            if not cid:
+                continue
+            out[cid] = {
+                "text": payload.get("text", ""),
+                "metadata": {k: v for k, v in payload.items() if k not in ("text", "chunk_id")},
+            }
+        return out
+
     async def upsert_chunks(self, chunks: list[dict[str, Any]]) -> None:
         """Embed + upsert chunks. Mirrors cluster-A: explicit FastEmbed vectors.
 

@@ -90,7 +90,7 @@ def test_refresh_skips_when_not_expiring(monkeypatch):
 
 
 def test_refresh_mints_new_token_when_near_expiry(monkeypatch):
-    fake = _patch_redis(monkeypatch)
+    _patch_redis(monkeypatch)
 
     class _Resp:
         def raise_for_status(self): pass

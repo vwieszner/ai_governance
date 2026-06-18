@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import time
 from typing import Any
 
@@ -274,6 +275,12 @@ def assertion_principal(assertion: dict, expected_issuer: str) -> str:
     from asserting ANOTHER division's user (which set-membership would allow in a 3+
     division mesh). principal() then namespaces by the (now signer-bound) issuer.
 
+    NOTE: this is the ISSUER-BINDING core. The full receive path uses
+    :func:`validate_cross_division_assertion`, which additionally enforces the
+    recipient binding (``aud`` == this division's DID) and short expiry (``exp``)
+    added by the sender (mesh.peer_client._bind_user_assertion). Both are layered;
+    neither weakens the other.
+
     TRUST MODEL (be precise — this is delegated/VOUCHED identity, not receiver-verified):
     the email/email_verified in the assertion are NOT re-verified against the home
     Keycloak here (Keycloak cannot mint a token whose audience is the receiver, so there
@@ -299,6 +306,83 @@ def assertion_principal(assertion: dict, expected_issuer: str) -> str:
             f"({expected_issuer!r}) — refusing (cross-issuer impersonation guard)"
         )
     return principal(assertion)
+
+
+# Maximum forward clock skew (seconds) tolerated on the assertion's `exp`. The
+# assertion already rides inside the envelope's ±5-min ts/nonce freshness window,
+# so this only absorbs small clock drift between divisions; it does not extend the
+# sender's short TTL into a meaningful replay window.
+_ASSERTION_EXP_SKEW_SECONDS = 60
+
+
+def validate_cross_division_assertion(
+    assertion: dict,
+    expected_issuer: str,
+    expected_audience: str,
+    *,
+    now: float | None = None,
+) -> str:
+    """Validate a RECIPIENT-BOUND, time-limited cross-division user assertion and
+    return its OpenFGA principal (FR-3.6). This is the full receive-side check used by
+    /a2a/query; it composes three independent bindings, ALL fail-closed:
+
+      1. RECIPIENT BINDING — ``assertion['aud']`` MUST equal ``expected_audience``
+         (THIS division's own DID, read from mesh.agent_identity). An assertion the
+         home division minted for division B carries ``aud`` = B's DID, so B cannot
+         forward it to C (and C, checking its own DID, rejects it). This is what makes
+         the assertion non-replayable ACROSS recipients, on top of the envelope's
+         per-message ts/nonce replay guard.
+      2. EXPIRY — ``assertion['exp']`` (unix seconds, set by the sender) MUST NOT be in
+         the past (with a small ``_ASSERTION_EXP_SKEW_SECONDS`` clock-skew allowance).
+         A missing/0/non-numeric ``exp`` is rejected (no unbounded-lifetime assertions).
+      3. ISSUER BINDING — delegated via :func:`assertion_principal`: ``iss`` MUST equal
+         the issuer bound to the SIGNING peer's DID (see that function), and the email
+         must be verified. This is the cross-issuer impersonation guard.
+
+    The caller MUST have already cryptographically verified the carrying envelope
+    (Ed25519 signature + ts/nonce freshness) and resolved both ``expected_issuer`` and
+    the signer's DID for ``expected_audience``-comparison BEFORE calling this. This
+    function does not re-do envelope verification; it validates the assertion's own
+    recipient/expiry/issuer bindings.
+
+    Raises ValueError on ANY failure (callers fail closed → 401/403).
+    """
+    if not isinstance(assertion, dict):
+        raise ValueError("user assertion must be a claims object, not a token/string")
+    if not expected_audience:
+        raise ValueError("no audience (self DID) provided — cannot validate recipient binding")
+
+    # 1. Recipient binding: aud must be THIS division's DID.
+    aud = str(assertion.get("aud", ""))
+    if aud != expected_audience:
+        raise ValueError(
+            f"assertion audience {aud!r} is not this division ({expected_audience!r}) — "
+            "refusing (recipient-binding / cross-recipient replay guard)"
+        )
+
+    # 2. Expiry: exp must be present, numeric, FINITE, and not in the past (small skew
+    #    allowed). math.isfinite rejects inf/-inf/NaN: without it, float('inf') / float('nan')
+    #    (and a JSON `1e400` that json.loads coerces to inf) sail past the `<= 0` guard
+    #    (inf<=0 and nan<=0 are both False) and then the `current > exp` comparison is always
+    #    False (current > inf, current > nan) — i.e. a never-expiring assertion, defeating the
+    #    short-exp bound this layer exists to enforce. Finite-only keeps the contract: a 300.0
+    #    exp is still accepted; inf/nan/0/negative/bool are all refused.
+    raw_exp = assertion.get("exp")
+    if (
+        not isinstance(raw_exp, (int, float))
+        or isinstance(raw_exp, bool)
+        or not math.isfinite(raw_exp)
+        or raw_exp <= 0
+    ):
+        raise ValueError("assertion is missing a valid 'exp' — refusing (no unbounded assertions)")
+    current = time.time() if now is None else now
+    if current > float(raw_exp) + _ASSERTION_EXP_SKEW_SECONDS:
+        raise ValueError(
+            f"assertion expired (exp={int(raw_exp)}, now={int(current)}) — refusing (expiry guard)"
+        )
+
+    # 3. Issuer binding + verified-email + namespaced principal.
+    return assertion_principal(assertion, expected_issuer)
 
 
 # ── Claim extraction helpers ───────────────────────────────────────────────────

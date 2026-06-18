@@ -67,10 +67,10 @@ def test_upsert_env_replaces_existing_and_appends_new(tmp_path: Path):
     }, dry_run=False)
 
     text = env.read_text(encoding="utf-8")
-    lines = [l for l in text.splitlines() if l and not l.lstrip().startswith("#")]
+    lines = [line for line in text.splitlines() if line and not line.lstrip().startswith("#")]
     # existing key replaced in place (not duplicated)
     assert "PEER_AGENT_URL=http://localhost:8200" in lines
-    assert sum(1 for l in lines if l.startswith("PEER_AGENT_URL=")) == 1
+    assert sum(1 for line in lines if line.startswith("PEER_AGENT_URL=")) == 1
     # new keys appended
     assert "PEER_AGENT_DID=did:mesh:beta" in lines
     assert "TRUSTED_ISSUERS=http://localhost:8202/realms/rag" in lines

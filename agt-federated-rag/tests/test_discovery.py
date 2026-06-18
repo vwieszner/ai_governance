@@ -34,7 +34,10 @@ def _signed_registration(identity, division_id, agent_url, issuer, caps):
 def client():
     from fastapi.testclient import TestClient
     from discovery.service import _registry, app
+    # Reset BOTH the primary map and the NFR-6 capability index between tests so a
+    # stale bucket from a prior test can't leak into a bounded-lookup result.
     _registry._entries.clear()
+    _registry._by_capability.clear()
     return TestClient(app)
 
 

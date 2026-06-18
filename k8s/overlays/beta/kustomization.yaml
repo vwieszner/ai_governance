@@ -1,0 +1,61 @@
+# Division Beta overlay. Mirrors infra/divisions/beta.yml: division_id=beta,
+# trusted_peers=[alpha]. A new division = a new overlay like this; the base is unchanged.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: agt-div-beta
+
+resources:
+  - ../../base
+
+labels:
+  - pairs:
+      agt.division: beta
+    includeSelectors: false
+
+patches:
+  - target:
+      kind: Namespace
+      name: agt-div
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: agt-div-beta
+      - op: replace
+        path: /metadata/labels/agt.division
+        value: beta
+  - target:
+      kind: ConfigMap
+      name: agent-config
+    patch: |-
+      - op: add
+        path: /data/DIVISION_ID
+        value: beta
+      - op: add
+        path: /data/CLUSTER_ID
+        value: beta
+      - op: add
+        path: /data/TRUSTED_PEERS
+        value: alpha
+      - op: add
+        path: /data/OIDC_ISSUER
+        value: http://keycloak:8080/realms/rag
+      - op: add
+        path: /data/OIDC_JWKS_URI
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/certs
+      - op: add
+        path: /data/OIDC_TOKEN_ENDPOINT
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/token
+      - op: add
+        path: /data/AGENT_CLIENT_ID
+        value: agent-beta
+      - op: add
+        path: /data/AGENT_NAME
+        value: AGT RAG - Division Beta
+      - op: add
+        path: /data/TEMPORAL_TASK_QUEUE
+        value: approval-beta
+
+images:
+  - name: agt-federated-rag
+    newTag: beta

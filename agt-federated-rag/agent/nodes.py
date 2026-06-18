@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import re
 import uuid
 from typing import Any
 
@@ -72,9 +73,7 @@ from auth.openfga import AuthzDecision, OpenFGAAuth
 from config import settings
 from mesh.agent_identity import verify_peer_identity
 from mesh.peer_client import call_peer_agent as _mesh_call_peer, get_peer_circuit_state
-from rag.fusion import rrf_fuse
-from rag.neo4j_retriever import GraphRAGRetriever
-from rag.qdrant_retriever import HybridQdrantRetriever
+from rag.fusion import rrf_fuse_many
 from workflow.approval import ApprovalInput, ApprovalWorkflow
 
 log = structlog.get_logger(__name__)
@@ -94,6 +93,54 @@ _user_claims_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar(
 def set_user_claims(claims: dict) -> None:
     """Called once per request (in graph.run_query) before the graph is invoked."""
     _user_claims_ctx.set(claims or {})
+
+
+# ── FR-3.4: observable inter-agent conversation marker ─────────────────────────
+# The cross-division status_message is the only structured channel that reaches the
+# UI (it rides the single `result` SSE event → MonitorPanel). When a query is
+# DELEGATED we prepend a compact, machine-parseable marker carrying the discovered
+# peer division + capability + how it was chosen, so MonitorPanel can render the
+# discover → negotiate → delegate phases as first-class events instead of inferring
+# them from arbitrary prose. The contained "delegated" keyword also keeps the UI's
+# inferKind() classifier landing on the peer_call event kind. Format (single line):
+#   [agt:delegated division=<id> cap=<cap> via=<discovered|configured-fallback> negotiated=<0|1>]
+_DELEGATION_MARKER_PREFIX = "[agt:delegated"
+
+
+# Marker-injection guard (A4): division/capability originate from a discovered peer's
+# self-asserted control-plane fields, so a compromised-but-trusted peer can stuff marker
+# control sequences into them — a ``]`` closes the marker early, a ``[`` opens a forged
+# second marker, and a `` key=`` token injects fake fields (e.g. a forged
+# ``negotiated=1 via=discovered`` trust signal) the UI would render. We strip the bracket
+# delimiters entirely and neutralise any `` <word>=`` token by removing the ``=`` so it
+# can no longer masquerade as a marker key. ``src`` and ``negotiated`` are agent-set
+# (closed vocab), not peer-supplied, so they are not a vector — but sanitising the
+# peer-supplied fields is the fix.
+_MARKER_INJECT_RE = re.compile(r"\s+(\w+)=")
+
+
+def _sanitize_marker_field(value: str) -> str:
+    """Strip marker delimiters / key=value injection sequences from a peer-supplied field."""
+    # Remove the bracket delimiters that frame a marker token, plus newlines/CR (the
+    # marker is a single line). Then break any `` key=`` pair so it can't forge a field.
+    cleaned = value.replace("[", "").replace("]", "").replace("\r", " ").replace("\n", " ")
+    cleaned = _MARKER_INJECT_RE.sub(r" \1", cleaned)
+    # Collapse runs of whitespace so the single-line marker stays compact + parseable.
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _delegation_marker(summary: dict[str, Any] | None) -> str:
+    """Build the structured FR-3.4 delegation marker from a discovery_summary, or ''."""
+    if not summary:
+        return ""
+    division = _sanitize_marker_field(str(summary.get("division") or "peer")) or "peer"
+    cap = _sanitize_marker_field(str(summary.get("capability") or ""))
+    src = str(summary.get("source") or "")
+    negotiated = "1" if summary.get("negotiated") else "0"
+    return (
+        f"{_DELEGATION_MARKER_PREFIX} division={division} cap={cap} "
+        f"via={src} negotiated={negotiated}]"
+    )
 
 
 # ── AGT PolicyEvaluator singleton ─────────────────────────────────────────────
@@ -167,8 +214,7 @@ async def _enforce(action: str, context: dict[str, Any]) -> None:
 
 # ── Service singletons (double-checked asyncio.Lock locking) ──────────────────
 
-_qdrant: HybridQdrantRetriever | None = None
-_graph: GraphRAGRetriever | None = None
+_retrievers: list[Any] | None = None    # the configured retriever fan-out (qdrant/neo4j/RaaS)
 _openfga: OpenFGAAuth | None = None
 _llm: ChatOpenAI | None = None
 _intent_llm: ChatOpenAI | None = None
@@ -177,36 +223,28 @@ _intent_llm: ChatOpenAI | None = None
 _INTENT_MODEL = "meta/llama-3.1-8b-instruct"
 _temporal_client: TemporalClient | None = None
 
-_qdrant_lock: asyncio.Lock = asyncio.Lock()
-_graph_lock: asyncio.Lock = asyncio.Lock()
+_retrievers_lock: asyncio.Lock = asyncio.Lock()
 _openfga_lock: asyncio.Lock = asyncio.Lock()
 _llm_lock: asyncio.Lock = asyncio.Lock()
 _intent_llm_lock: asyncio.Lock = asyncio.Lock()
 _temporal_lock: asyncio.Lock = asyncio.Lock()
 
 
-async def _get_qdrant() -> HybridQdrantRetriever:
-    global _qdrant
-    if _qdrant is not None:
-        return _qdrant
-    async with _qdrant_lock:
-        if _qdrant is None:
-            inst = HybridQdrantRetriever()
-            await inst.ensure_collection()  # idempotent; matches the retriever API
-            _qdrant = inst
-    return _qdrant
+async def _get_retrievers() -> list[Any]:
+    """Build + cache the configured retriever fan-out (qdrant / neo4j seam / any
+    RaaS). One-time ``setup()`` per retriever (collection/index/egress check).
+    See rag/retriever.py for the governance contract."""
+    global _retrievers
+    if _retrievers is not None:
+        return _retrievers
+    async with _retrievers_lock:
+        if _retrievers is None:
+            from rag.retriever import build_retrievers
 
-
-async def _get_graph() -> GraphRAGRetriever:
-    global _graph
-    if _graph is not None:
-        return _graph
-    async with _graph_lock:
-        if _graph is None:
-            inst = GraphRAGRetriever()
-            await inst._ensure_init()
-            _graph = inst
-    return _graph
+            insts = build_retrievers()
+            await asyncio.gather(*[r.setup() for r in insts])
+            _retrievers = insts
+    return _retrievers
 
 
 async def _get_openfga() -> OpenFGAAuth:
@@ -304,21 +342,27 @@ async def retrieve_local(state: AgentState) -> dict[str, Any]:
     log.debug("node_retrieve_local", query_len=len(state["query"]))
     query = state["query"]
 
+    # Fan out across ALL configured retrievers (qdrant + neo4j seam + any RaaS).
     # Retrieve WITHOUT an ACL pre-filter (allowed_chunk_ids=None): per-chunk
     # authorization is decided next in check_auth via OpenFGA. Passing an empty
     # list here would build a MatchAny(any=[]) filter that matches zero points,
     # silently returning no results (the cause of the empty-answer bug).
-    qdrant_results, graph_results = await asyncio.gather(
-        (await _get_qdrant()).retrieve(query),
-        (await _get_graph()).retrieve_context(query),
-    )
+    retrievers = await _get_retrievers()
+    results_per_retriever = await asyncio.gather(*[r.retrieve(query) for r in retrievers])
 
-    fused = rrf_fuse(qdrant_results, graph_results, final_limit=settings.qdrant_final_k)
+    by_name = {r.name: res for r, res in zip(retrievers, results_per_retriever)}
+    fused = rrf_fuse_many(results_per_retriever, final_limit=settings.qdrant_final_k)
+
+    # Observability fields stay meaningful: qdrant_results = the qdrant backend's raw
+    # hits; graph_results = every other retriever's hits (neo4j seam + any RaaS).
+    # fused_chunks (built from ALL retrievers) is the source of truth for check_auth.
+    qdrant_results = by_name.get("qdrant", [])
+    graph_results = [c for name, res in by_name.items() if name != "qdrant" for c in res]
 
     log.info(
         "retrieve_local_done",
-        qdrant_count=len(qdrant_results),
-        graph_count=len(graph_results),
+        retrievers=[r.name for r in retrievers],
+        counts={name: len(res) for name, res in by_name.items()},
         fused_count=len(fused),
     )
     return {
@@ -497,6 +541,41 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     # spans.
     serveable_ids = set(allowed) | set(pending)
     pruned_chunks = [c for c in fused if c.get("chunk_id") in serveable_ids]
+
+    # A2d — content-integrity: re-source the TEXT served into the LLM from this
+    # division's TRUSTED store of record (Qdrant), NOT verbatim from whatever retriever
+    # the fusion happened to keep first. Per-chunk authz gates WHICH ids are served; it
+    # does not authenticate WHAT an external retriever claims those ids contain. A
+    # compromised/malicious RaaS that returns an authorized chunk_id with attacker text
+    # would otherwise have that poisoned text flow straight into generate_answer.
+    # External retrievers still add value: they contribute candidate ids + ranking (the
+    # fused set), but the trusted store supplies the content for every served id. A
+    # serveable id the trusted store does NOT hold (e.g. one only an external RaaS
+    # surfaced) has no authoritative text → it is dropped from the served context
+    # (fail-closed) rather than serving unverified retriever text.
+    from rag.retriever import fetch_trusted_text
+
+    retrievers = await _get_retrievers()
+    trusted_text = await fetch_trusted_text(retrievers, list(serveable_ids))
+    reconciled: list[dict[str, Any]] = []
+    dropped_untrusted: list[str] = []
+    for c in pruned_chunks:
+        cid = c.get("chunk_id")
+        src = trusted_text.get(cid)
+        if src is None:
+            # Authorized id with no trusted content — external-only / not in store of
+            # record. Exclude it: we will not serve unauthenticated retriever text.
+            dropped_untrusted.append(cid)
+            continue
+        reconciled.append({**c, "text": src["text"], "metadata": src["metadata"]})
+    if dropped_untrusted:
+        log.warning(
+            "served_text_untrusted_dropped",
+            chunk_ids=dropped_untrusted[:50],
+            count=len(dropped_untrusted),
+            agt_audit=True,
+        )
+    pruned_chunks = reconciled
 
     result: dict[str, Any] = {
         "flow": flow,
@@ -753,11 +832,22 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
 # ── Node: call_peer_agent ─────────────────────────────────────────────────────
 
 async def call_peer_agent(state: AgentState) -> dict[str, Any]:
-    """Send the query to the configured peer cluster via AGT AgentMesh IATP.
+    """Discover a capable peer, negotiate, then delegate the query (FR-3.1/3.2).
 
     AGT policy enforced: ``peer.send_message``
     Context fields include peer_circuit_state so the peer-comms-policy can
     gate on CircuitState.OPEN before any gRPC call is attempted (ASI-08).
+
+    Delegation target selection (FR-3.1/3.2): instead of blindly using the
+    configured peer, query the discovery broker for a peer advertising the
+    query's capability and negotiate before committing (mesh/discovery.py).
+    GRACEFUL DEGRADATION: if the broker is unreachable / returns nothing / the
+    discovered peer isn't a configured trust partner, fall back to the configured
+    peer so existing single-peer federation never regresses. The signed transport
+    (mesh/peer_client.call_peer_agent) is unchanged — it sends to the configured
+    peer; we delegate through it only when the discovered target resolves to that
+    peer (the demo's single trusted partner). The discovered target is recorded in
+    ``discovery_summary`` for the observable inter-agent conversation (FR-3.4).
 
     Security: user_token is read from _user_token_ctx, never from state.
     The peer_client layer handles DID verification, trust-score gating,
@@ -769,6 +859,42 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
             "flow": FlowDecision.REMOTE_DENIED,
             "status_message": "No remote cluster available.",
         }
+
+    # ── FR-3.1/3.2: discover → negotiate → resolve the delegation target ──────
+    # Never raises (graceful degradation to the configured peer inside the helper).
+    from mesh.discovery import resolve_delegation_target
+    target = await resolve_delegation_target(state["query"])
+
+    # HONESTY GUARD: the signed transport (_mesh_call_peer) sends to the configured
+    # peer. If discovery selected a peer that is NOT the configured one (possible only
+    # in a future multi-peer mesh, never in the single-peer demo), we cannot route
+    # there through this transport — so we report it as a configured-fallback for THIS
+    # send rather than claim a hop that didn't happen. The discovered division is kept
+    # in the marker for observability of WHAT WAS DISCOVERED.
+    source = target.source
+    if source == "discovered" and not target.is_configured_peer():
+        log.warning("discovered_peer_not_configured_transport_fallback",
+                    discovered_url=target.agent_url, discovered_did=target.agent_did)
+        source = "configured-fallback"
+
+    # Structured marker the UI MonitorPanel parses into discovered/negotiated/
+    # delegated rows (FR-3.4) — explicit signal, not inferred from arbitrary prose.
+    discovery_summary = {
+        "source": source,                        # "discovered" | "configured-fallback"
+        "division": target.division_id,
+        "capability": target.capability or "",
+        "negotiated": target.negotiated,
+        "candidates": len(target.candidates),
+    }
+    log.info(
+        "delegation_target_resolved",
+        source=source,
+        peer_division=target.division_id,
+        capability=target.capability,
+        negotiated=target.negotiated,
+        candidates=len(target.candidates),
+        agt_audit=True,
+    )
 
     # Include circuit breaker state in policy context (ASI-08, peer-comms-policy)
     circuit_state = await get_peer_circuit_state(str(settings.peer_agent_url))
@@ -829,6 +955,7 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
             "error": str(exc),
             "flow": FlowDecision.REMOTE_DENIED,
             "status_message": "Remote cluster call failed.",
+            "discovery_summary": discovery_summary,
         }
 
     log.info(
@@ -842,6 +969,7 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
         "peer_task_id": peer_response.task_id,
         "peer_status": peer_response.status,
         "peer_answer": peer_response.answer,
+        "discovery_summary": discovery_summary,
     }
 
 
@@ -1030,4 +1158,16 @@ async def format_response(state: AgentState) -> dict[str, Any]:
             "status_message": "blocked_credential_leak",
         }
 
-    return {"answer": answer, "status_message": status or "completed"}
+    # FR-3.4: prepend the structured delegation marker on the cross-division path so
+    # the UI MonitorPanel can surface the discovered peer + negotiation + delegation
+    # as explicit events. Skipped for check_only polls (they keep terse status words
+    # the requester-side poll maps directly). The marker is a separate first line; the
+    # human prose follows unchanged.
+    final_status = status or "completed"
+    summary = state.get("discovery_summary")
+    if summary and not state.get("check_only"):
+        marker = _delegation_marker(summary)
+        if marker and not final_status.startswith(_DELEGATION_MARKER_PREFIX):
+            final_status = f"{marker} {final_status}"
+
+    return {"answer": answer, "status_message": final_status}

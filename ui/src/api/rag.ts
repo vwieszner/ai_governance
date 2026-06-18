@@ -1,4 +1,4 @@
-import type { AgentEvent, ClusterConfig, EventKind, NormalizedTask, TaskState } from '../types'
+import type { AgentEvent, Division, EventKind, NormalizedTask, TaskState } from '../types'
 
 export type TaskCallback = (task: NormalizedTask) => void
 export type EventCallback = (event: AgentEvent) => void
@@ -28,7 +28,7 @@ export class RagError extends Error {
 }
 
 function makeEvent(
-  cluster: ClusterConfig,
+  division: Division,
   user: string,
   kind: EventKind,
   taskId: string,
@@ -37,7 +37,7 @@ function makeEvent(
   return {
     id: crypto.randomUUID(),
     timestamp: new Date(),
-    cluster: cluster.id,
+    division: division.id,
     user,
     kind,
     taskId,
@@ -144,10 +144,10 @@ function blankTask(id: string, query: string): NormalizedTask {
 }
 
 
-// ── AGT cluster: POST /query → status / result / done SSE events ─────────────
+// ── AGT division: POST /query → status / result / done SSE events ─────────────
 
 async function submitQueryAGT(
-  cluster: ClusterConfig,
+  division: Division,
   user: string,
   token: string,
   query: string,
@@ -159,9 +159,9 @@ async function submitQueryAGT(
   // Show the query bubble immediately — don't wait for the first SSE event
   const task = blankTask(taskId, query)
   onTask({ ...task })
-  onEvent(makeEvent(cluster, user, 'query_sent', taskId, query))
+  onEvent(makeEvent(division, user, 'query_sent', taskId, query))
 
-  const res = await fetch(`${cluster.apiBase}/query`, {
+  const res = await fetch(`${division.apiBase}/query`, {
     method: 'POST',
     credentials: 'include',
     headers: {
@@ -194,7 +194,7 @@ async function submitQueryAGT(
       task.state = 'working'
       task.updatedAt = new Date()
       onTask({ ...task })
-      onEvent(makeEvent(cluster, user, 'agent_working', taskId, 'working'))
+      onEvent(makeEvent(division, user, 'agent_working', taskId, 'working'))
       continue
     }
 
@@ -209,7 +209,7 @@ async function submitQueryAGT(
       task.statusMessage = message
       task.updatedAt = new Date()
       onTask({ ...task })
-      onEvent(makeEvent(cluster, user, 'failed', taskId, message))
+      onEvent(makeEvent(division, user, 'failed', taskId, message))
       continue
     }
 
@@ -248,7 +248,7 @@ async function submitQueryAGT(
       task.serverTaskId = serverTaskId ?? task.serverTaskId
       task.updatedAt = new Date()
       onTask({ ...task })
-      onEvent(makeEvent(cluster, user, inferKind(statusMessage, state), taskId, statusMessage || state))
+      onEvent(makeEvent(division, user, inferKind(statusMessage, state), taskId, statusMessage || state))
       continue
     }
 
@@ -258,16 +258,16 @@ async function submitQueryAGT(
 
 // ── Unified entry point ───────────────────────────────────────────────────────
 
-// AGT clusters speak POST /query with status/result/done SSE events.
+// AGT divisions speak POST /query with status/result/done SSE events.
 export function submitQuery(
-  cluster: ClusterConfig,
+  division: Division,
   user: string,
   token: string,
   query: string,
   onTask: TaskCallback,
   onEvent: EventCallback,
 ): Promise<void> {
-  return submitQueryAGT(cluster, user, token, query, onTask, onEvent)
+  return submitQueryAGT(division, user, token, query, onTask, onEvent)
 }
 
 // ── Approval outcome polling (requester side) ────────────────────────────────
@@ -285,12 +285,12 @@ export interface ApprovalOutcome {
 }
 
 export async function pollApprovalResult(
-  cluster: ClusterConfig,
+  division: Division,
   token: string,
   taskId: string,
 ): Promise<ApprovalOutcome> {
   const res = await fetch(
-    `${cluster.apiBase}/tasks/${encodeURIComponent(taskId)}/result`,
+    `${division.apiBase}/tasks/${encodeURIComponent(taskId)}/result`,
     { credentials: 'include', headers: authHeaders(token, false) },
   )
   if (!res.ok) {
@@ -304,8 +304,8 @@ export async function pollApprovalResult(
 // The data owner (this logged-in user) fetches the access requests they are
 // entitled to decide and records an approve/deny decision. Backend verifies the
 // caller is the designated owner (real attribution); the requester never learns
-// the request_id. Temporal's namespace is shared across clusters, so polling
-// this user's own cluster surfaces requests that originated on either cluster.
+// the request_id. Temporal's namespace is shared across divisions, so polling
+// this user's own division surfaces requests that originated on any division.
 
 export interface PendingApproval {
   requestId: string
@@ -314,10 +314,10 @@ export interface PendingApproval {
 }
 
 export async function listPendingApprovals(
-  cluster: ClusterConfig,
+  division: Division,
   token: string,
 ): Promise<PendingApproval[]> {
-  const res = await fetch(`${cluster.apiBase}/approvals/pending`, {
+  const res = await fetch(`${division.apiBase}/approvals/pending`, {
     credentials: 'include', headers: authHeaders(token, false),
   })
   if (!res.ok) {
@@ -332,13 +332,13 @@ export async function listPendingApprovals(
 }
 
 export async function decideApproval(
-  cluster: ClusterConfig,
+  division: Division,
   token: string,
   requestId: string,
   decision: 'approve' | 'deny',
 ): Promise<void> {
   const res = await fetch(
-    `${cluster.apiBase}/approvals/${encodeURIComponent(requestId)}/decision`,
+    `${division.apiBase}/approvals/${encodeURIComponent(requestId)}/decision`,
     {
       method: 'POST',
       credentials: 'include',

@@ -3,12 +3,27 @@ from __future__ import annotations
 
 import os
 
-from pydantic import AnyHttpUrl, Field, model_validator
+from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # RAG_ENV_FILE selects which env file to load, so the SAME codebase runs as two
 # federated AGT clusters (cluster-a -> .env, cluster-b -> .env.cluster-b).
 _ENV_FILE = os.environ.get("RAG_ENV_FILE", ".env")
+
+
+class RaasEndpoint(BaseModel):
+    """One external retrieval-as-a-service backend (Pattern A: it FINDS chunks; the
+    agent still authorizes each returned chunk_id against OpenFGA downstream).
+
+    The service MUST return stable ``chunk_id``s that key this division's OpenFGA
+    tuples, and MUST NOT be relied on to filter per-user (that stays in check_auth).
+    Configured as JSON, e.g.
+    ``RAG_RAAS_ENDPOINTS='[{"name":"acme","url":"https://raas.internal","top_k":10}]'``.
+    """
+    name: str                       # label used in fusion / logs (keep unique)
+    url: str                        # base URL; the adapter POSTs to <url>/retrieve
+    api_key: str = ""               # optional bearer token
+    top_k: int = 10                 # default result count requested
 
 
 class Settings(BaseSettings):
@@ -97,6 +112,19 @@ class Settings(BaseSettings):
     llm_context_token_budget: int = 6000
     max_query_length: int = 4096
 
+    # ── Retrieval backends (pluggable, multi-retriever) ───────────────────────
+    # Which retrievers fan out per query; results are RRF-fused (rag/fusion.py) and
+    # then EACH returned chunk_id is authorized per-user against OpenFGA in
+    # check_auth — so adding retrievers never widens access. Built-ins: "qdrant",
+    # "neo4j" (inert seam). External services are added via raas_endpoints below.
+    # Default preserves the historical qdrant + neo4j-seam fan-out.
+    retriever_backends: list[str] = ["qdrant", "neo4j"]
+    # Zero or more external retrieval-as-a-service backends (each becomes a fused
+    # retriever). See RaasEndpoint. Refused in residency_mode=local if the URL is
+    # an external (out-of-boundary) endpoint.
+    raas_endpoints: list[RaasEndpoint] = Field(default_factory=list)
+    raas_timeout_seconds: float = 10.0
+
     # ── Qdrant ────────────────────────────────────────────────────────────────
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = Field(default="")   # optional for local instances
@@ -132,6 +160,11 @@ class Settings(BaseSettings):
     temporal_namespace: str = "default"
     temporal_task_queue: str = "approval-queue"
     approval_timeout_seconds: int = 86400
+    # FR-7.1 access lifecycle: TTL (seconds) applied to a grant created by an APPROVAL.
+    # 0 = permanent (legacy behaviour); >0 = the approved viewer grant expires after this
+    # window via the OpenFGA `non_expired` conditional tuple, so the requester must
+    # re-ask (and re-enter approval) once it lapses. Default 0 to preserve behaviour.
+    approval_grant_ttl_seconds: int = 0
 
     # ── OIDC / JWT — user authentication (Keycloak) ───────────────────────────
     # AGT handles agent-to-agent identity via DIDs.

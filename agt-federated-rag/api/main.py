@@ -53,11 +53,11 @@ import agent.nodes as agent_nodes
 import mesh.agent_identity as agent_identity
 from auth.token_validator import (
     AuthServiceUnavailable,
-    assertion_principal,
     extract_groups,
     issuer_namespace,
     minimal_assertion_claims,
     principal,
+    validate_cross_division_assertion,
     validate_token,
 )
 from config import settings
@@ -204,6 +204,48 @@ class _CorrelationIdMiddleware:
             structlog.contextvars.unbind_contextvars("request_id")
 
 
+# ── Non-finite JSON number guard (trust boundary) ─────────────────────────────
+
+
+def _has_non_finite_number(obj: Any) -> bool:
+    """True if ``obj`` (a json.loads result) contains a non-finite float anywhere.
+
+    Python's default json.loads accepts the non-standard tokens ``Infinity`` /
+    ``-Infinity`` / ``NaN`` AND silently coerces an overflowing literal like ``1e400`` to
+    ``float('inf')`` — in BOTH cases the value lands as a Python ``float('inf'/'nan')``. An
+    ``exp`` of inf/nan would slip past the assertion expiry guard (never-expiring assertion),
+    so we walk the parsed structure and reject any non-finite number at the trust boundary.
+    """
+    import math
+    if isinstance(obj, float):
+        return not math.isfinite(obj)
+    if isinstance(obj, dict):
+        return any(_has_non_finite_number(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_has_non_finite_number(v) for v in obj)
+    return False
+
+
+def _loads_finite(raw: bytes | str) -> Any:
+    """json.loads that REFUSES non-finite numbers anywhere in the document.
+
+    Used at the /a2a/query trust boundary (after Starlette's default-settings parse) and as
+    a standalone strict parser. parse_constant rejects the named tokens
+    ``Infinity``/``-Infinity``/``NaN``; the parsed result is then walked for any ``1e400``-style
+    overflow that the default float parser turns into ``inf``.
+    """
+    import json
+
+    def _no_constant(_tok: str) -> float:
+        raise ValueError("non-finite JSON constant rejected")
+
+    data = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+    parsed = json.loads(data, parse_constant=_no_constant)
+    if _has_non_finite_number(parsed):
+        raise ValueError("non-finite JSON number rejected")
+    return parsed
+
+
 # ── Redis task store (double-checked locking singleton) ───────────────────────
 
 _redis: aioredis.Redis | None = None  # type: ignore[type-arg]
@@ -263,7 +305,6 @@ async def _update_task(task_id: str, updates: dict[str, Any]) -> None:
         log.warning("redis_update_task_not_found", task_id=task_id)
         return
     merged = {**existing, **updates}
-    owner_id: str = existing.get("_owner_id", "")
     try:
         r = await _get_redis()
         import json
@@ -275,6 +316,47 @@ async def _update_task(task_id: str, updates: dict[str, Any]) -> None:
     except Exception as exc:
         log.error("redis_update_task_failed", task_id=task_id, error=str(exc))
         raise HTTPException(status_code=503, detail="Task store temporarily unavailable")
+
+
+# ── Runtime kill-switch (FR-4.3) ──────────────────────────────────────────────
+# The settings flag (settings.agent_kill_switch_engaged) is a DEPLOY-TIME lever — it is
+# read once at startup and needs a restart to change. FR-4.3 wants a RUNTIME lever, so we
+# add a per-division Redis flag (agt:killswitch:<division_id>) that any request can consult
+# live. The agent is halted if EITHER is true (fail-closed): the settings flag stays an
+# always-on override, and the Redis flag can be flipped without a restart via
+# POST /admin/kill-switch. A Redis error fails CLOSED (engaged) — a governance halt must
+# not be silently lifted by an unavailable store.
+
+def _killswitch_key(division_id: str) -> str:
+    return f"agt:killswitch:{division_id}"
+
+
+async def _runtime_kill_switch_engaged() -> bool:
+    """True if the kill-switch is engaged by EITHER the deploy-time settings flag OR the
+    runtime Redis flag for this division. Fail-closed on a Redis error."""
+    if settings.agent_kill_switch_engaged:
+        return True
+    try:
+        r = await _get_redis()
+        val = await r.get(_killswitch_key(settings.division_id))
+    except Exception as exc:
+        # Fail closed: if we cannot confirm the runtime flag is OFF, treat the path as halted.
+        log.error("kill_switch_check_failed_failing_closed", error=str(exc))
+        return True
+    return str(val) == "1"
+
+
+async def _set_runtime_kill_switch(engaged: bool) -> None:
+    """Engage/disengage the runtime kill-switch for this division (Redis flag).
+
+    Engaging is durable (no TTL) so a halt survives until an admin explicitly lifts it.
+    Disengaging deletes the key (the settings override, if set, still halts the path)."""
+    r = await _get_redis()
+    key = _killswitch_key(settings.division_id)
+    if engaged:
+        await r.set(key, "1")
+    else:
+        await r.delete(key)
 
 
 # ── Rate limiting (Finding #7) ────────────────────────────────────────────────
@@ -391,6 +473,55 @@ async def _get_bearer_token(authorization: str | None) -> tuple[str, dict[str, A
     return token, claims
 
 
+# ── Division-admin gate (FR-2.2 role: division admin) ──────────────────────────
+
+# The realm-role convention used across this product (see onboarding + tests/test_identity):
+# users carry "member", "data-owner", "division-admin". Admin-only endpoints require the
+# "division-admin" role. We read it from BOTH the configured groups/roles claim (via the
+# existing extract_groups helper) AND the standard Keycloak realm_access.roles, so the gate
+# works whether the IdP maps roles through a groups protocol-mapper or the default realm_access
+# block — without adding a config field.
+_ADMIN_ROLE = "division-admin"
+
+
+def _is_division_admin(claims: dict[str, Any]) -> bool:
+    """True iff the verified claims carry the division-admin role.
+
+    Reuses extract_groups (the configured groups/roles claim, already used by the data
+    path) and additionally inspects Keycloak's realm_access.roles. Fail-closed: any shape
+    that doesn't clearly assert the role returns False.
+    """
+    if _ADMIN_ROLE in set(extract_groups(claims)):
+        return True
+    realm_access = claims.get("realm_access")
+    if isinstance(realm_access, dict):
+        roles = realm_access.get("roles")
+        if isinstance(roles, (list, tuple)) and _ADMIN_ROLE in roles:
+            return True
+    return False
+
+
+async def _require_admin(authorization: str | None) -> tuple[str, dict[str, Any]]:
+    """Validate the bearer token AND require the division-admin role.
+
+    Returns (caller_principal, claims). 401 on missing/invalid token or an
+    unbuildable principal; 403 (audited) when the caller is not a division admin.
+    """
+    _, claims = await _get_bearer_token(authorization)
+    try:
+        caller = principal(claims)
+    except ValueError as exc:
+        log.warning("admin_principal_unbuildable", error=str(exc))
+        raise HTTPException(
+            status_code=401,
+            detail="Token lacks a verified email required for authorization",
+        )
+    if not _is_division_admin(claims):
+        log.warning("admin_endpoint_forbidden_not_admin", caller=caller, agt_audit=True)
+        raise HTTPException(status_code=403, detail="Division-admin role required")
+    return caller, claims
+
+
 # ── Application lifespan ──────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -398,6 +529,40 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # M8: hook the tamper-evident audit chain into structlog (captures agt_audit events)
     import audit_log
     audit_log.configure_audit_logging(settings.division_id, "agent", settings.audit_log_dir)
+
+    # Surface the documented deployment residuals at runtime so operators see them on every
+    # boot (THREAT_MODEL: these are known limits, not regressions — make them visible).
+    #
+    # 1) Audit anchoring: an empty AUDIT_ANCHOR_URL leaves the chain anchored only to a LOCAL
+    #    sibling file. The chain is a keyless SHA256, so a host-compromise attacker who can
+    #    rewrite BOTH the chain and the local anchor in lock-step gets verified:true. A remote
+    #    append-only collector is the only sink such an attacker cannot reach.
+    import os
+    if not os.environ.get("AUDIT_ANCHOR_URL", "").strip():
+        log.warning(
+            "audit_anchor_local_only",
+            detail="AUDIT_ANCHOR_URL is unset — audit chain is anchored to a LOCAL file only; "
+            "tamper-evidence is not tamper-PROOF against a host/filesystem compromise. Set "
+            "AUDIT_ANCHOR_URL to a remote append-only collector for off-host anchoring.",
+            agt_audit=True,
+        )
+    # 2) mTLS without a CRL: require_mtls enforces a client cert (CERT_REQUIRED) but with no
+    #    TLS_CRL_FILE there is NO revocation gate — a revoked-yet-CA-signed cert is accepted.
+    if settings.require_mtls:
+        try:
+            from transport.mtls import crl_path_for
+            crl = crl_path_for(settings)
+        except Exception:
+            crl = ""
+        if not crl:
+            log.warning(
+                "mtls_without_crl",
+                detail="require_mtls is set but no CRL is configured (TLS_CRL_FILE empty) — "
+                "client certs are required but NOT checked for revocation; a revoked CA-signed "
+                "cert would be accepted. Configure TLS_CRL_FILE (and ssl_crl at the nginx edge) "
+                "to enforce NFR-3 revocation.",
+                agt_audit=True,
+            )
 
     # Initialise AgentMesh identity — resolves or creates the DID
     await agent_identity.get_mesh()
@@ -560,7 +725,9 @@ async def query(
     """
     # Kill-switch: refuse the whole query path before doing any work. /health
     # stays 200 (the process is up); only this query surface is disabled.
-    if settings.agent_kill_switch_engaged:
+    # FR-4.3: consults the RUNTIME flag (Redis) in addition to the deploy-time settings
+    # flag, so an operator can halt this path via POST /admin/kill-switch with no restart.
+    if await _runtime_kill_switch_engaged():
         log.warning("kill_switch_refused_query", agt_audit=True)
         raise HTTPException(
             status_code=503,
@@ -665,6 +832,44 @@ async def query(
 
         import json as _json
         await _update_task(task_id, {"status": result.get("status_message", "completed")})
+
+        # FR-6.1: the instant a request PARKS on approval it becomes an offline-deliverable
+        # outcome. Write a DURABLE, account-bound "pending" record now (keyed by the
+        # requester's namespaced principal) so it is waiting on next login regardless of
+        # whether this browser tab stays open — independent of any client poll loop. The
+        # record carries the full question so GET /inbox can REGENERATE the answer through
+        # the governed pipeline at delivery (FR-6.2); its live status (pending → completed /
+        # declined) is recomputed there. Cross-division parks (peer-originated) are delivered
+        # to the requester's HOME store by that division's callback, not here. Best-effort:
+        # a store hiccup must not break the live SSE response (the user is still online here).
+        result_flow = (result.get("flow") or "").lower()
+        # Callback-binding (FR-6.6, callback-injection guard): when a request PARKS as a
+        # FEDERATED/REMOTE task (delegated to a peer for the owner's decision), record the
+        # delegate peer's DID + a federated flag ON THE TASK RECORD. POST /tasks/{id}/callback
+        # then accepts an outcome write ONLY from that delegate DID for a federated task —
+        # so a trusted-but-unrelated peer can neither overwrite a victim's pending outcome
+        # (DoS-on-delivery) nor inject an outcome onto a purely-local task. A "remote" flow is
+        # the only one whose outcome legitimately arrives via a peer callback.
+        if "remote" in result_flow:
+            try:
+                await _update_task(
+                    task_id,
+                    {"_federated": True, "_delegate_did": settings.peer_agent_did or ""},
+                )
+            except Exception as exc:
+                log.warning("query_federation_mark_failed", task_id=task_id, error=str(exc))
+        if "needs_approval" in result_flow:
+            try:
+                import outcome_store
+                await outcome_store.put(
+                    principal_id=user_id,
+                    task_id=task_id,
+                    question=raw_query,
+                    status="pending",
+                )
+                await outcome_store.bump_badge(user_id)
+            except Exception as exc:
+                log.warning("query_outcome_seed_failed", task_id=task_id, error=str(exc))
 
         yield {
             "event": "result",
@@ -771,6 +976,146 @@ async def task_result(
     })
 
 
+# ── Regenerate-at-delivery helper (shared by /tasks/{id}/result and /inbox) ────
+
+async def _regenerate_outcome(
+    user_id: str,
+    question: str,
+    claims: dict[str, Any],
+    task_id: str,
+    declined_message: str = "Your request was declined or you no longer have access.",
+) -> dict[str, Any]:
+    """Re-run the governed pipeline (check_only) for ``user_id``'s ``question`` and map the
+    result to a delivery outcome. This is the FR-6.2 fail-closed re-check: the answer is
+    (re)generated server-side under the CALLER's CURRENT authorization at delivery time, so a
+    revoked/expired grant between decision and login cannot leak stale data.
+
+    Returns one of:
+        {"status": "pending"}
+        {"status": "completed", "answer": "..."}
+        {"status": "denied", "message": "..."}
+    """
+    if not question:
+        # No question to re-run (e.g. a denial record carrying only a message). Treat as a
+        # terminal declined outcome rather than fabricating access.
+        return {"status": "denied", "message": declined_message}
+    fwd_claims = minimal_assertion_claims(claims)
+    try:
+        result = await agent_graph.run_query(
+            query=question,
+            user_id=user_id,
+            user_claims=fwd_claims,
+            task_id=task_id,
+            context_id="",
+            check_only=True,
+            user_groups=extract_groups(claims),
+        )
+    except PermissionError:
+        return {"status": "denied", "message": "Request denied by governance policy"}
+    flow = (result.get("flow") or "").lower()
+    answer = result.get("answer") or ""
+    if "needs_approval" in flow:
+        return {"status": "pending"}
+    if ("allowed" in flow or "approved" in flow) and answer:
+        return {"status": "completed", "answer": answer}
+    return {"status": "denied", "message": declined_message}
+
+
+# ── GET /inbox ────────────────────────────────────────────────────────────────
+
+@app.get("/inbox")
+async def inbox(
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """FR-6: the requester's durable, account-bound outcome inbox — surfaced on NEXT LOGIN.
+
+    Returns every waiting outcome for the AUTHENTICATED caller (keyed by their namespaced
+    principal — IDOR-safe, a user only ever sees their OWN inbox), retrieved from the durable
+    store with NO short TTL and NO dependence on a client poll loop (FR-6.1/6.4). Each item is
+    presented against its original question.
+
+    REGENERATE-AT-DELIVERY (FR-6.2): for every record carrying a question we RE-RUN the full
+    governed pipeline in check_only mode at this moment, so the delivered status reflects
+    CURRENT authorization — an approval whose grant was since revoked/expired delivers
+    "declined", not a stale answer; a still-open request stays "pending"; a granted one
+    regenerates the actual answer. A denial record (FR-6.3) returns its declined message.
+
+    Also returns the in-app badge count (FR-6.5). Read-only — never mutates authz state.
+    """
+    _, claims = await _get_bearer_token(authorization)
+    try:
+        user_id = principal(claims)
+    except ValueError as exc:
+        log.warning("inbox_principal_unbuildable", error=str(exc))
+        raise HTTPException(
+            status_code=401,
+            detail="Token lacks a verified email required for authorization",
+        )
+    await _check_rate_limit(user_id)        # each item re-runs the pipeline — bound it
+
+    import outcome_store
+    records = await outcome_store.list_outcomes(user_id)
+
+    items: list[dict[str, Any]] = []
+    for rec in records:
+        task_id = rec.get("task_id", "")
+        question = rec.get("question", "")
+        stored_status = rec.get("status", "pending")
+        item: dict[str, Any] = {
+            "task_id": task_id,
+            "question": question,
+            "decided_at": rec.get("decided_at"),
+            "acknowledged": rec.get("acknowledged", False),
+        }
+        if stored_status == "denied" and not question:
+            # Terminal declined record with no question to re-run — deliver as recorded.
+            item["status"] = "denied"
+            item["message"] = rec.get("answer_or_message") \
+                or "Your request was declined or you no longer have access."
+        else:
+            # Regenerate live status under the caller's CURRENT authorization (FR-6.2).
+            try:
+                outcome = await _regenerate_outcome(user_id, question, claims, task_id)
+            except Exception as exc:
+                log.error("inbox_regenerate_failed", task_id=task_id, error=str(exc))
+                # Fail closed: do not deliver an answer we could not re-authorize.
+                outcome = {"status": "pending"}
+            item.update(outcome)
+        items.append(item)
+
+    badge = await outcome_store.read_badge(user_id)
+    log.info("inbox_listed", count=len(items), badge=badge, agt_audit=True)
+    return JSONResponse(content={"items": items, "badge": badge}, status_code=200)
+
+
+# ── POST /inbox/{task_id}/ack ─────────────────────────────────────────────────
+
+@app.post("/inbox/{task_id}/ack")
+async def inbox_acknowledge(
+    task_id: str,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Acknowledge (clear) one inbox outcome so it leaves the default next-login view.
+
+    Authenticated; the namespaced principal is the inbox key, so a caller can only ack
+    their OWN outcomes (IDOR-safe). Idempotent — acking an absent/already-acked item is a
+    no-op 'acknowledged: false/true' result, never an error. Decrements the in-app badge.
+    """
+    _validate_safe_id(task_id, "task_id")
+    _, claims = await _get_bearer_token(authorization)
+    try:
+        user_id = principal(claims)
+    except ValueError as exc:
+        log.warning("inbox_ack_principal_unbuildable", error=str(exc))
+        raise HTTPException(
+            status_code=401,
+            detail="Token lacks a verified email required for authorization",
+        )
+    import outcome_store
+    acked = await outcome_store.acknowledge(user_id, task_id)
+    return JSONResponse(content={"acknowledged": acked}, status_code=200)
+
+
 # ── POST /a2a/query ───────────────────────────────────────────────────────────
 
 @app.post("/a2a/query")
@@ -798,11 +1143,31 @@ async def a2a_query(request: Request) -> JSONResponse:
         {status, answer, task_id, approval_request_id, _agentmesh}
     where status ∈ {"completed", "input_required", "failed"}.
     """
-    # Parse body
+    # Kill-switch (FR-4.3): halt the WHOLE division's governed path, not just the user
+    # /query surface — refuse inbound cross-division requests before any work. Consults
+    # the RUNTIME flag (Redis) plus the deploy-time settings flag, so an operator halt via
+    # POST /admin/kill-switch takes effect here with no restart. Fail-closed (503).
+    if await _runtime_kill_switch_engaged():
+        log.warning("kill_switch_refused_a2a_query", agt_audit=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Agent administratively disabled (kill-switch engaged)",
+        )
+
+    # Parse body, then reject any non-finite JSON number anywhere in the document
+    # (Infinity/-Infinity/NaN and any literal like 1e400 that json.loads coerces to inf).
+    # Starlette's request.json() uses json.loads with DEFAULT settings, which accept those
+    # non-standard tokens; an inf/nan `exp` would then defeat the assertion expiry guard
+    # (never-expiring assertion). Post-validating the parsed structure closes that at the
+    # edge so the malformed value never enters the system (defence-in-depth alongside the
+    # finite check in validate_cross_division_assertion).
     try:
         payload: dict[str, Any] = await request.json()
     except Exception:
         raise HTTPException(status_code=422, detail="Request body must be valid JSON")
+    if _has_non_finite_number(payload):
+        log.warning("a2a_query_non_finite_number", agt_audit=True)
+        raise HTTPException(status_code=422, detail="Request body contains a non-finite number")
 
     # ── DID authentication: verify the Ed25519 signature on the payload ──────
     sig_verified, signer_did = await agent_identity.verify_signed_message(payload)
@@ -839,24 +1204,33 @@ async def a2a_query(request: Request) -> JSONResponse:
             detail=f"Query exceeds maximum length of {settings.max_query_length} characters",
         )
 
-    # M2 (FR-3.6), security-hardened: derive the AUTHORITATIVE user identity from the
-    # DID-signed user-assertion CLAIMS in the (already signature-verified, replay-
-    # protected) envelope — NOT a forwarded raw bearer token (which a compromised peer
-    # could replay against the user's HOME APIs). The assertion is a claims object; we
-    # bind its issuer to THIS specific signing peer (peer_issuer, from the per-DID trust
-    # map), so a compromised-but-trusted peer cannot assert ANOTHER division's user — even
-    # with N trusted peers. The identity WITHIN that signer's namespace is vouched by the
-    # DID-authenticated home agent (see assertion_principal's trust-model note), not
-    # re-verified against the home Keycloak. assertion_principal fails closed if peer_issuer
-    # is empty (a map entry missing its issuer never widens acceptance).
+    # M2/Wave-3 (FR-3.6), security-hardened: derive the AUTHORITATIVE user identity from the
+    # RECIPIENT-BOUND, time-limited user-assertion CLAIMS in the (already signature-verified,
+    # replay-protected) envelope — NOT a forwarded raw bearer token (which a compromised peer
+    # could replay against the user's HOME APIs). validate_cross_division_assertion enforces,
+    # all fail-closed:
+    #   • aud == THIS division's own DID (recipient binding) — so an assertion minted for
+    #     another division cannot be forwarded here (cross-recipient replay guard);
+    #   • exp not passed (short-lived) — bounded acceptance even inside the envelope window;
+    #   • iss bound to THIS specific signing peer (peer_issuer, from the per-DID trust map) —
+    #     so a compromised-but-trusted peer cannot assert ANOTHER division's user even with N
+    #     peers; it fails closed if peer_issuer is empty (a half-populated map entry never
+    #     widens acceptance).
+    # The identity WITHIN the signer's namespace is vouched by the DID-authenticated home
+    # agent (see assertion_principal's trust-model note), not re-verified against home Keycloak.
     assertion = payload.get("user_assertion")
     if not isinstance(assertion, dict):
         raise HTTPException(
             status_code=401,
             detail="Missing cross-division user assertion — identity required",
         )
+    self_did = await agent_identity.get_did()   # the audience the assertion must be bound to
     try:
-        user_id = assertion_principal(assertion, peer_issuer)
+        user_id = validate_cross_division_assertion(
+            assertion,
+            expected_issuer=peer_issuer,
+            expected_audience=self_did,
+        )
     except Exception as exc:
         log.warning("a2a_query_assertion_invalid", error=str(exc), agt_audit=True)  # M8
         raise HTTPException(status_code=401, detail="Invalid cross-division user assertion")
@@ -1059,8 +1433,100 @@ async def task_callback(
     if not state:
         raise HTTPException(status_code=422, detail="Callback payload missing 'status.state'")
 
-    # Update task in Redis
+    # ── Task↔delegate binding (callback-injection guard) ─────────────────────
+    # The signature gate above proves the caller is SOME trusted peer — it does NOT prove
+    # the caller is the peer THIS task was delegated to, nor that the task was federated at
+    # all. Without a binding, any one trusted peer could drive an outcome onto any task_id
+    # it can guess: overwrite a victim's legitimately-parked 'pending' with a terminal denial
+    # (DoS-on-delivery) or inject an outcome onto a purely-local task (inbox/badge spam). We
+    # bind here, fail-closed: accept the callback ONLY when the task was recorded federated
+    # AND the signing peer's DID equals the delegate DID recorded at park time (see /query
+    # event_stream). Read the record once and reuse it for delivery below.
+    rec = await _load_task(task_id)
+    is_federated = bool(rec.get("_federated")) if rec is not None else False
+    delegate_did = (rec.get("_delegate_did", "") if rec is not None else "")
+    if not is_federated or not delegate_did or sender_did != delegate_did:
+        log.warning(
+            "callback_task_delegate_unbound",
+            task_id=task_id,
+            sender_did=sender_did,
+            delegate_did=delegate_did,
+            federated=is_federated,
+            agt_audit=True,                                          # M8: callback-injection attempt
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Callback peer is not the delegate this task was federated to",
+        )
+
+    # Update task in Redis (only after the binding holds)
     await _update_task(task_id, {"peer_status": state, "peer_message": message})
+
+    # ── FR-6.6: deliver the cross-division outcome to the REQUESTER's account ─────
+    # This callback arrives in the REQUESTER's HOME division (this is alice's division;
+    # the owner who decided lives in the peer division that signed this message). The
+    # original /query task here recorded the requester's namespaced principal (_owner_id)
+    # and the full question (query_full), so we write a DURABLE, account-bound outcome to
+    # THIS division's store — exactly as a same-division park does — so it is waiting on
+    # alice's next login regardless of any open tab (no shared client state, no short TTL).
+    #
+    # FAIL-CLOSED / no stale data: on an APPROVED callback we record a "pending" outcome
+    # carrying the question, NOT the answer — GET /inbox re-runs the governed pipeline
+    # (which re-delegates to the peer with a fresh authorization re-check) at delivery
+    # (FR-6.2). A denial/timeout records the declined message (FR-6.3). The peer's
+    # decision is the SIGNATURE-VERIFIED, trust-gated message handled above; this reuses
+    # that path and adds no new trust.
+    if rec is not None:
+        requester = rec.get("_owner_id", "")
+        question = rec.get("query_full") or rec.get("query") or ""
+        decision = str(payload.get("decision", "")).lower()
+        if requester:
+            try:
+                import outcome_store
+                # Idempotency (replay guard): a replayed/retried signed callback must not
+                # resurrect an already-delivered outcome (outcome_store.put resets
+                # acknowledged=False and re-bumps the badge). Skip the write entirely if a
+                # terminal ('completed'/'denied') OR an acknowledged record already exists
+                # for this task — the first delivery is authoritative.
+                existing = await outcome_store.get(requester, task_id)
+                if existing is not None and (
+                    existing.get("status") in ("completed", "denied")
+                    or existing.get("acknowledged") is True
+                ):
+                    log.info(
+                        "callback_outcome_idempotent_skip",
+                        task_id=task_id,
+                        existing_status=existing.get("status"),
+                        agt_audit=True,
+                    )
+                else:
+                    # Deliver only when BOTH signals agree the request was approved AND the
+                    # peer task completed; a 'denied' decision (even with state=='completed')
+                    # or an unfinished state records a denial — the more permissive signal
+                    # must NOT win (denial-confusion guard).
+                    if decision == "approved" and state == "completed":
+                        await outcome_store.put(
+                            principal_id=requester,
+                            task_id=task_id,
+                            question=question,
+                            status="pending",   # regenerated at /inbox under a fresh authz re-check
+                        )
+                    else:
+                        await outcome_store.put(
+                            principal_id=requester,
+                            task_id=task_id,
+                            question=question,
+                            status="denied",
+                            answer_or_message=message
+                            or "Your cross-division request was declined.",
+                        )
+                    await outcome_store.bump_badge(requester)
+            except Exception as exc:
+                # The peer callback itself succeeds (202) even if the local store write
+                # fails — the peer must not retry a delivered decision; we log loudly so
+                # the missed durable write is visible.
+                log.error("callback_outcome_store_failed", task_id=task_id, error=str(exc),
+                          agt_audit=True)
 
     log.info(
         "peer_callback_received",
@@ -1342,6 +1808,96 @@ async def revoke_access(
                         status_code=200)
 
 
+# ── GET /audit ────────────────────────────────────────────────────────────────
+
+@app.get("/audit")
+async def get_audit(
+    authorization: str | None = Header(default=None),
+    event: str | None = Query(default=None, description="Optional exact event-name filter"),
+    limit: int = Query(default=500, ge=1, le=10000,
+                       description="Most-recent N entries to return (chain still fully verified)"),
+) -> JSONResponse:
+    """FR-8.1 / NFR-9: admin-queryable export of THIS division's tamper-evident audit trail.
+
+    Read-only. Surfaces the per-division hash-chained log (previously CLI-only via
+    scripts/verify_audit.py) as an admin API, with a chain-verification status so the
+    export itself carries tamper-evidence.
+
+    Authn/authz: a valid user JWT (validate_token) AND the division-admin role — the same
+    token-validation dependency the data path uses, gated by _require_admin. Non-admin → 403.
+
+    Division-scoped (NFR-2): only ``settings.division_id``'s own chains are read, so an admin
+    can never export another division's trail. Optional ?event= filter and ?limit= slice
+    (the slice is the most-recent N; verification always covers the full chain).
+    """
+    caller, _ = await _require_admin(authorization)
+    await _check_rate_limit(caller)
+
+    import audit_log
+    try:
+        result = audit_log.read_division_chain(
+            settings.division_id,
+            base_dir=settings.audit_log_dir,
+            event=event,
+            limit=limit,
+        )
+    except Exception as exc:
+        log.error("audit_export_failed", error=str(exc))
+        raise HTTPException(status_code=503, detail="Could not read audit trail")
+
+    log.info("audit_exported", division=settings.division_id, count=result.get("count"),
+             verified=result.get("verified"), agt_audit=True)
+    return JSONResponse(content=result, status_code=200)
+
+
+# ── POST /admin/kill-switch ───────────────────────────────────────────────────
+
+@app.post("/admin/kill-switch")
+async def admin_kill_switch(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """FR-4.3: engage/disengage the RUNTIME kill-switch for this division — no restart.
+
+    Sets/clears the per-division Redis flag (agt:killswitch:<division_id>) that /query
+    consults live. The deploy-time settings flag remains an always-on override: when it is
+    set, the path stays halted regardless of what this endpoint does (and the response
+    reports that effective state).
+
+    Authn/authz: valid JWT AND the division-admin role (_require_admin). Non-admin → 403.
+    Body: ``{"engaged": true|false}``. Audited.
+    """
+    caller, _ = await _require_admin(authorization)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body must be valid JSON")
+    engaged = body.get("engaged")
+    if not isinstance(engaged, bool):
+        raise HTTPException(status_code=400, detail="'engaged' must be a boolean")
+
+    try:
+        await _set_runtime_kill_switch(engaged)
+    except Exception as exc:
+        log.error("kill_switch_set_failed", error=str(exc))
+        raise HTTPException(status_code=503, detail="Could not update kill-switch")
+
+    # Effective state = runtime flag OR the deploy-time settings override.
+    effective = engaged or settings.agent_kill_switch_engaged
+    log.warning("kill_switch_set", engaged=engaged, by=caller,
+                division_id=settings.division_id, agt_audit=True)
+    return JSONResponse(
+        content={
+            "division_id": settings.division_id,
+            "runtime_engaged": engaged,
+            "settings_override": settings.agent_kill_switch_engaged,
+            "effective_engaged": effective,
+        },
+        status_code=200,
+    )
+
+
 # ── Exception handlers ────────────────────────────────────────────────────────
 
 @app.exception_handler(PermissionError)
@@ -1363,10 +1919,14 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
 def run() -> None:
     # M7: serve mutual TLS when require_mtls is set (client cert REQUIRED). Empty dict
     # in the default localhost-demo posture (plain HTTP). Fails loud if enabled without certs.
-    from transport.mtls import tls_serving_kwargs
+    # When a CRL is configured the serving context enforces revocation (NFR-3): a revoked
+    # client cert is rejected at the handshake (ssl_context_factory → CRL-checking context).
+    from transport.mtls import crl_path_for, tls_serving_kwargs
     ssl_kwargs = tls_serving_kwargs(settings)
     if ssl_kwargs:
-        log.info("serving_mtls", cert=settings.tls_cert_file, client_cert="required")
+        crl = crl_path_for(settings)
+        log.info("serving_mtls", cert=settings.tls_cert_file, client_cert="required",
+                 crl_revocation="enforced" if crl else "none", crl_file=crl or None)
     uvicorn.run(
         "api.main:app",
         host=settings.host,

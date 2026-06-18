@@ -10,7 +10,7 @@ import (no code):
 | On-prem Active Directory / LDAP | **User federation** — Keycloak verifies credentials against AD; users stay in AD | `ldap-ad-user-federation.json` |
 | Entra ID (Azure AD) | **Identity brokering** — "Login" redirects to Entra (incl. MFA), returns to us | `oidc-broker-entra.json` |
 | Okta / Auth0 / any OIDC | **Identity brokering** — same, against their OIDC IdP | `oidc-broker-okta.json` |
-| (any of the above) **+ group-based access** | **Groups mapper** — emit the `groups` claim so [group grants](../../TEMPLATE_TASKS.md) resolve | `groups-mapper.json` |
+| (any of the above) **+ group-based access** | **Groups mapper** — emit the `groups` claim so group grants resolve | `groups-mapper.json` |
 
 You can also skip Keycloak entirely and point the agent **directly** at the customer IdP
 (`OIDC_ISSUER` + the `PRINCIPAL_CLAIM`/`REQUIRE_VERIFIED_PRINCIPAL`/`GROUPS_CLAIM` config) —

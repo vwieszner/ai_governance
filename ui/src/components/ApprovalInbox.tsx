@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { listPendingApprovals, decideApproval, RagError, type PendingApproval } from '../api/rag'
-import type { ClusterConfig } from '../types'
+import type { Division } from '../types'
 
 interface Props {
-  cluster: ClusterConfig
+  division: Division
   token: string
 }
 
-export function ApprovalInbox({ cluster, token }: Props) {
+export function ApprovalInbox({ division, token }: Props) {
   const [pending, setPending] = useState<PendingApproval[]>([])
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
@@ -15,7 +15,7 @@ export function ApprovalInbox({ cluster, token }: Props) {
 
   const refresh = useCallback(async () => {
     try {
-      setPending(await listPendingApprovals(cluster, token))
+      setPending(await listPendingApprovals(division, token))
       setError('')
     } catch (e) {
       // A 401 means the token is expired — retrying will just repeat the error,
@@ -28,7 +28,7 @@ export function ApprovalInbox({ cluster, token }: Props) {
       }
       setError(e instanceof Error ? e.message : 'Failed to load approvals')
     }
-  }, [cluster, token])
+  }, [division, token])
 
   useEffect(() => {
     void refresh()
@@ -42,7 +42,7 @@ export function ApprovalInbox({ cluster, token }: Props) {
     setBusy(requestId)
     setError('')
     try {
-      await decideApproval(cluster, token, requestId, decision)
+      await decideApproval(division, token, requestId, decision)
       setPending((prev) => prev.filter((p) => p.requestId !== requestId))
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Decision failed')

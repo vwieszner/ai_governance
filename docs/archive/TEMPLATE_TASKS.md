@@ -1,3 +1,8 @@
+> **⚠️ ARCHIVED — HISTORICAL.** Record of the earlier "production-grade template" effort
+> (14 tasks marked complete). Superseded by the multi-division product framing in
+> `PRODUCT_REQUIREMENTS.md` / `IMPLEMENTATION_PLAN.md`. Its "ALL 14 tasks COMPLETE" status is a
+> snapshot of that effort, not current product state — **see `PROJECT_STATUS.md`.** Kept for history.
+
 # Template-Completion Task List
 
 _Goal: make this a **general, secure, easy-to-deploy template** — every integration seam

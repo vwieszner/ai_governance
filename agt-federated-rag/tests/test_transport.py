@@ -11,9 +11,12 @@ the same technique CPython's own ssl test suite uses) pin the security propertie
 from __future__ import annotations
 
 import ssl
+import time
+from pathlib import Path
 
 import pytest
 
+from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import NameOID
 
@@ -34,7 +37,7 @@ def pki(tmp_path):
     r_crt, r_key = mtls.issue_division_cert(rogue_key, rogue_ca, "evil").write(tmp_path, "rogue")
     return {"ca": str(ca_path), "s_crt": s_crt, "s_key": s_key, "c_crt": c_crt, "c_key": c_key,
             "r_crt": r_crt, "r_key": r_key, "ca_key": ca_key, "ca_cert": ca_cert,
-            "client_cert": client.cert}
+            "client_cert": client.cert, "tmp_path": tmp_path}
 
 
 def _handshake_ok(server_ctx: ssl.SSLContext, client_ctx: ssl.SSLContext,
@@ -99,6 +102,113 @@ def test_revoked_cert_detected(pki):
     assert mtls.is_revoked(pki["client_cert"], crl) is True
     other = mtls.issue_division_cert(pki["ca_key"], pki["ca_cert"], "gamma")
     assert mtls.is_revoked(other.cert, crl) is False        # non-revoked cert not flagged
+
+
+def _write_crl(pki, revoked_serials, name="fed.crl"):
+    """Build + persist a CRL for the fixture CA revoking the given serials; return its path."""
+    crl = mtls.build_crl(pki["ca_key"], pki["ca_cert"], revoked_serials)
+    return mtls.write_crl(crl, pki["tmp_path"] / name)
+
+
+def test_revoked_client_cert_rejected_at_handshake(pki):
+    # NFR-3: a CA-signed but REVOKED client cert must be rejected fail-closed by the serving
+    # context — not merely detectable by the helper. Proven via a real (MemoryBIO) handshake.
+    crl_path = _write_crl(pki, [pki["client_cert"].serial_number])
+    sctx = mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"], crl_path=crl_path)
+    revoked = mtls.client_context(pki["ca"], pki["c_crt"], pki["c_key"])
+    assert _handshake_ok(sctx, revoked) is False
+
+
+def test_unrevoked_client_cert_still_accepted_with_crl(pki):
+    # Positive control: with CRL checking ON, a CA-signed cert that is NOT on the CRL still
+    # handshakes (the gate rejects only revoked serials, not every cert).
+    crl_path = _write_crl(pki, [])                       # empty CRL — nobody revoked
+    sctx = mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"], crl_path=crl_path)
+    good = mtls.client_context(pki["ca"], pki["c_crt"], pki["c_key"])
+    assert _handshake_ok(sctx, good) is True
+
+
+def test_crl_refresh_picks_up_newly_revoked_serial(pki):
+    # The serving context reloads a republished CRL (mtime cache): a client that handshakes
+    # now is rejected after its serial is added to the CRL at the same path.
+    crl_path = _write_crl(pki, [], name="refresh.crl")    # initially empty
+    s1 = mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"], crl_path=crl_path)
+    good = mtls.client_context(pki["ca"], pki["c_crt"], pki["c_key"])
+    assert _handshake_ok(s1, good) is True                # accepted before revocation
+
+    time.sleep(0.01)                                      # ensure the republished CRL has a new mtime
+    _write_crl(pki, [pki["client_cert"].serial_number], name="refresh.crl")  # republish revoking it
+    s2 = mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"], crl_path=crl_path)
+    revoked = mtls.client_context(pki["ca"], pki["c_crt"], pki["c_key"])
+    assert _handshake_ok(s2, revoked) is False            # rejected after refresh
+
+
+def test_no_crl_configured_behaves_as_before(pki):
+    # Backward-compatible: with NO crl_path, the context has no revocation gate — a cert that
+    # WOULD be revoked still handshakes (we never silently weaken; we just don't gate when
+    # revocation was never configured). The CRL gate only activates when a CRL is supplied.
+    sctx = mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"])   # no crl_path
+    client = mtls.client_context(pki["ca"], pki["c_crt"], pki["c_key"])
+    assert _handshake_ok(sctx, client) is True
+
+
+def test_missing_crl_file_fails_loud(pki):
+    # A configured-but-absent CRL must fail loud, NOT fail open (silently "no revocations").
+    with pytest.raises(FileNotFoundError):
+        mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"],
+                            crl_path=str(pki["tmp_path"] / "does-not-exist.crl"))
+
+
+def test_issued_cert_carries_crl_distribution_point(pki):
+    # NFR-3: issued certs advertise where the CRL is published (CRLDistributionPoints), so a
+    # real relying party can locate the revocation list.
+    ext = pki["client_cert"].extensions.get_extension_for_class(x509.CRLDistributionPoints)
+    uris = [n.value for dp in ext.value for n in (dp.full_name or [])]
+    assert any(u.startswith("http") for u in uris)
+
+
+def test_issued_cert_carries_aia_ocsp_url(pki):
+    # NFR-3 OCSP readiness: issued certs advertise an OCSP responder via the Authority
+    # Information Access extension, so a deployed responder is reachable for online revocation
+    # checks / stapling (enforcement is a deploy-time step — responder + front-end stapling).
+    from cryptography.x509.oid import AuthorityInformationAccessOID
+    ext = pki["client_cert"].extensions.get_extension_for_class(x509.AuthorityInformationAccess)
+    ocsp_urls = [ad.access_location.value for ad in ext.value
+                 if ad.access_method == AuthorityInformationAccessOID.OCSP]
+    assert ocsp_urls and any(u.startswith("http") for u in ocsp_urls)
+
+
+def test_ocsp_staple_hook_validated_fail_loud(pki):
+    # OCSP stapling readiness hook: a configured-but-missing staple file fails loud (mirrors the
+    # CRL posture), never silently ignored. Enforcement still needs a TLS front-end (the stdlib
+    # can't staple) — server_context VALIDATES the hook only.
+    with pytest.raises(FileNotFoundError):
+        mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"],
+                            ocsp_staple_file=str(pki["tmp_path"] / "no-such-staple.ocsp"))
+
+
+def test_ocsp_staple_file_for_reads_env(monkeypatch):
+    # The deploy wiring point: ocsp_staple_file_for sources from the env when config.py has no
+    # field, so a deployment can wire stapling without code changes.
+    monkeypatch.setenv("TLS_OCSP_STAPLE_FILE", "/etc/agt/alpha.ocsp")
+    assert mtls.ocsp_staple_file_for(_S(require_mtls=False)) == "/etc/agt/alpha.ocsp"
+
+
+def test_issue_federation_certs_emits_enforceable_crl(tmp_path):
+    # End-to-end: issuance also writes the CA key + an (empty) CRL, and regenerate_crl can
+    # revoke a division so the serving context rejects it at the handshake.
+    out = mtls.issue_federation_certs(tmp_path, ["alpha", "beta"])
+    assert Path(out["_crl"]).exists() and Path(out["_ca_key"]).exists()
+    # un-revoked beta handshakes against alpha's CRL-checking server.
+    s_ok = mtls.server_context(out["alpha"][0], out["alpha"][1], out["_ca"], crl_path=out["_crl"])
+    beta = mtls.client_context(out["_ca"], out["beta"][0], out["beta"][1])
+    assert _handshake_ok(s_ok, beta) is True
+    # revoke beta's serial → regenerate the CRL → beta is now rejected.
+    beta_cert = x509.load_pem_x509_certificate(Path(out["beta"][0]).read_bytes())
+    mtls.regenerate_crl(out["_ca"], out["_ca_key"], out["_crl"], [beta_cert.serial_number])
+    s_rev = mtls.server_context(out["alpha"][0], out["alpha"][1], out["_ca"], crl_path=out["_crl"])
+    beta2 = mtls.client_context(out["_ca"], out["beta"][0], out["beta"][1])
+    assert _handshake_ok(s_rev, beta2) is False
 
 
 def test_cert_identifies_division(pki):

@@ -1,0 +1,62 @@
+# Division Gamma overlay. Mirrors infra/divisions/gamma.yml: division_id=gamma,
+# trusted_peers=[alpha, beta]. Proves N divisions (N>2) onboard with no collisions —
+# a third overlay, no base edits (the k8s analogue of adding a third manifest).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: agt-div-gamma
+
+resources:
+  - ../../base
+
+labels:
+  - pairs:
+      agt.division: gamma
+    includeSelectors: false
+
+patches:
+  - target:
+      kind: Namespace
+      name: agt-div
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: agt-div-gamma
+      - op: replace
+        path: /metadata/labels/agt.division
+        value: gamma
+  - target:
+      kind: ConfigMap
+      name: agent-config
+    patch: |-
+      - op: add
+        path: /data/DIVISION_ID
+        value: gamma
+      - op: add
+        path: /data/CLUSTER_ID
+        value: gamma
+      - op: add
+        path: /data/TRUSTED_PEERS
+        value: alpha,beta
+      - op: add
+        path: /data/OIDC_ISSUER
+        value: http://keycloak:8080/realms/rag
+      - op: add
+        path: /data/OIDC_JWKS_URI
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/certs
+      - op: add
+        path: /data/OIDC_TOKEN_ENDPOINT
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/token
+      - op: add
+        path: /data/AGENT_CLIENT_ID
+        value: agent-gamma
+      - op: add
+        path: /data/AGENT_NAME
+        value: AGT RAG - Division Gamma
+      - op: add
+        path: /data/TEMPORAL_TASK_QUEUE
+        value: approval-gamma
+
+images:
+  - name: agt-federated-rag
+    newTag: gamma

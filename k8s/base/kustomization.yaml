@@ -1,0 +1,36 @@
+# Base: ONE division's full isolated stack (decision D-3). Every overlay
+# (k8s/overlays/<id>) reuses this base unchanged and patches only the per-division
+# values (namespace, division id, OIDC issuer host, peer wiring, image tag) — so
+# adding a division is a new overlay, NEVER a base edit (mirrors the compose
+# manifest-driven onboarding ethos).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  # secret.yaml is intentionally NOT managed by kustomize — the per-division
+  # `agent-secrets` is created out-of-band from infra/generated/<id>/ (real values,
+  # never committed). See secret.yaml's header for the create command.
+  - postgres.yaml
+  - openfga.yaml
+  - keycloak.yaml
+  - temporal.yaml
+  - qdrant.yaml
+  - redis.yaml
+  - agent.yaml
+  - worker.yaml
+  - networkpolicy.yaml
+
+# Labels applied to every object — identifies the whole stack as one product.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: agt-federated-rag
+    includeSelectors: false
+
+# Image ref is parameterized here. Overlays override the tag (or the whole ref) via
+# their own images: entry — e.g. a per-division registry path / immutable digest.
+images:
+  - name: agt-federated-rag
+    newName: agt-federated-rag
+    newTag: local

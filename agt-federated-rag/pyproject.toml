@@ -91,6 +91,16 @@ ingest  = "rag.ingest:cli"
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint.per-file-ignores]
+# api/main.py and workflow/worker.py both call truststore.inject_into_ssl() at
+# module top BEFORE importing any ssl-using libraries (httpx, fastapi, temporalio,
+# the AGT clients). Those imports must therefore sit below that call — reordering
+# them to the top would break the truststore patch and load OpenSSL's default
+# trust store instead of the OS one. E402 (module import not at top) is expected
+# and intentional in these two entrypoints, so suppress it for them.
+"api/main.py" = ["E402"]
+"workflow/worker.py" = ["E402"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"

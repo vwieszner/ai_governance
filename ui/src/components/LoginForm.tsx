@@ -1,15 +1,15 @@
 import { useState, type FormEvent } from 'react'
 import { getToken, AuthError, type AuthTokens } from '../api/auth'
 import { beginLogin, readEnvConfig } from '../api/oidc'
-import type { ClusterConfig } from '../types'
+import type { Division } from '../types'
 
 interface Props {
-  cluster: ClusterConfig
+  division: Division
   onLogin: (tokens: AuthTokens, username: string) => void
 }
 
-export function LoginForm({ cluster, onLogin }: Props) {
-  const [username, setUsername] = useState(cluster.defaultUser)
+export function LoginForm({ division, onLogin }: Props) {
+  const [username, setUsername] = useState(division.defaultUser)
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -20,8 +20,9 @@ export function LoginForm({ cluster, onLogin }: Props) {
   if (oidc) {
     return (
       <div className="login-form">
+        <DivisionBadge division={division} />
         <p className="login-hint">
-          Sign in to <strong>{cluster.label}</strong>
+          Sign in to <strong>{division.label}</strong>
         </p>
         <button
           type="button"
@@ -40,7 +41,8 @@ export function LoginForm({ cluster, onLogin }: Props) {
     setError('')
     setLoading(true)
     try {
-      const tokens = await getToken(cluster.authBase, cluster.clientId, username, password)
+      // Authenticate against THIS division's OIDC issuer (per-division audience/issuer).
+      const tokens = await getToken(division.authBase, division.clientId, username, password)
       onLogin(tokens, username)
     } catch (err) {
       setError(err instanceof AuthError ? err.message : 'Login failed — check credentials')
@@ -51,8 +53,9 @@ export function LoginForm({ cluster, onLogin }: Props) {
 
   return (
     <div className="login-form">
+      <DivisionBadge division={division} />
       <p className="login-hint">
-        Connect to <strong>{cluster.id}</strong>
+        Sign in to <strong>{division.label}</strong>
       </p>
       <form onSubmit={handleSubmit}>
         <label>
@@ -85,6 +88,17 @@ export function LoginForm({ cluster, onLogin }: Props) {
           {loading ? 'Connecting…' : 'Login'}
         </button>
       </form>
+    </div>
+  )
+}
+
+// Makes the user's division explicit at login (FR-2.4): a clearly-labeled badge naming
+// the division this credential authenticates against (its own issuer/audience).
+function DivisionBadge({ division }: { division: Division }) {
+  return (
+    <div className="login-division" data-division={division.id}>
+      <span className="login-division-tag">Division</span>
+      <span className="login-division-name">{division.label}</span>
     </div>
   )
 }

@@ -1,3 +1,9 @@
+> **⚠️ ARCHIVED — HISTORICAL, EXECUTED PLAN.** This was the milestone plan for the multi-division
+> build. As of 2026-06-17 it is **fully executed** (M0–M8 + M-GOV + the six gap-closures + an
+> independent red-team), so it no longer describes pending work — and some of it is stale (e.g. the
+> "real k8s/Helm" M7 item was never done; the deployment is Docker Compose, not k8s; decision D-2 was
+> superseded). **For current state see `PROJECT_STATUS.md`.** Kept only for development history.
+
 # AGT Federated-RAG — Multi-Division Implementation Plan
 
 ## Context
@@ -30,6 +36,15 @@ outcome on next login, cross-division, no 1h cap).
 | **D-5** | **No third-party libraries folded in** unless production-grade AND development-accelerating. ZeroID / ANP are **context only**, not dependencies. Token exchange = Keycloak; discovery service = built in-house to production quality. | User constraint. |
 | **D-6** | **Offline delivery re-generates at delivery time**, not push-at-approval — re-runs the full governed pipeline (re-delegate → far side re-authorizes → regenerate) on next login, so a revoked/expired grant (FR-7) cannot leak stale data (FR-6.2). | Couples FR-6 × FR-7 correctly. |
 | **D-7** | **Tamper-evident audit = a durable hash-chained store** (`audit/store.py`), not `structlog agt_audit=True`. | FR-8.2 / NFR-9. |
+
+> **⚠️ As-built reconciliation (2026-06-17 audit — see `PROJECT_STATUS.md`).** Two items in this
+> plan have drifted from the code: **(1) D-2 is stale** — the shipped cross-division user identity
+> is *agent-vouched* (receiver checks `iss` + `email_verified` only), **not** the home-issuer-JWKS
+> validation (signature/issuer/expiry) described above; that JWKS path was not built. **(2) The
+> requirement→test traceability matrix below is aspirational, not actual** — roughly ten of its
+> named test files/functions do not exist (`test_offline`, `test_lifecycle`, `test_mesh`,
+> `test_monitor`, `test_scaling`, `test_perf`, `test_iac`, `test_portability`, `test_durability`,
+> `test_approval_inbox`, and several named functions). Treat the matrix as a TODO list.
 
 **Open items needing a human call during execution (do not block planning):** cross-division
 issuer-trust bootstrap shape (verify Keycloak token-exchange cross-realm audience in M2 spike);
@@ -176,11 +191,12 @@ Tests live under `agt-federated-rag/tests/` (pytest + pytest-asyncio, already co
 **After every milestone**, before it is "done," spawn **three review agents in parallel**, each
 seeing the milestone diff. Any **VULNERABLE** or critical finding **blocks** the milestone → fix →
 re-run the gate. Reuse the `redteam/` model (verdicts DEFENDED / VULNERABLE / EXPECTED / FINDING,
-appended to `RED_FINDINGS.md`).
+recorded under `redteam/` — e.g. `M0_REVIEW_{security,prod,quality}.md`; legacy probe findings
+are archived in `docs/archive/redteam-legacy/`).
 
 | Perspective | What it checks (tailored per milestone) | Output |
 |---|---|---|
-| **Security** | Extends `redteam/` with new `probe_*` functions for the milestone's new surface: tenant-isolation breakout (M0/M1), foreign-division token acceptance (M1), **user-assertion forgery / token-exchange & delegation abuse / replay** (M2), unsigned/forged discovery registration + multi-peer DID spoof + SSRF (M3), outcome-store IDOR + cross-user delivery + notification spoofing (M4), stale-grant reuse after revoke (M5), egress leak in "local" mode (M6), mTLS/revocation bypass + secret exposure (M7), audit-chain forgery/truncation (M8). | Verdicts in `RED_FINDINGS.md`; VULNERABLE blocks. |
+| **Security** | Extends `redteam/` with new `probe_*` functions for the milestone's new surface: tenant-isolation breakout (M0/M1), foreign-division token acceptance (M1), **user-assertion forgery / token-exchange & delegation abuse / replay** (M2), unsigned/forged discovery registration + multi-peer DID spoof + SSRF (M3), outcome-store IDOR + cross-user delivery + notification spoofing (M4), stale-grant reuse after revoke (M5), egress leak in "local" mode (M6), mTLS/revocation bypass + secret exposure (M7), audit-chain forgery/truncation (M8). | Verdicts in the milestone's `redteam/*_REVIEW_*.md`; VULNERABLE blocks. |
 | **Production-readiness** | Fail-closed on every new gate; durability across process/host restart; idempotency (esp. Temporal activities, outcome writes, grant revokes); observability (structured logs, OTel, `sre.py` SLO events); resource bounds (registry/inbox lookups not super-linear — NFR-6); rollback/feature-flag; graceful degradation (discovery/peer down → local still serves). | Findings list + must-fix blockers. |
 | **Code-quality** | `ruff check`, `mypy --strict` clean; **reuse vs duplication** (e.g. reuse `_delete_tuple`, `sign_outbound_message`, existing `_enforce`); fail-closed correctness review; test adequacy vs the traceability row; no dead/decorative policy rules. | PR-style review; blockers fixed. |
 

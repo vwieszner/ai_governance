@@ -18,6 +18,29 @@ relay lesson). Per-server ``auth_mode`` selects how the call authenticates:
   - "service_rebac" : a service credential + agent-side OpenFGA filtering of results.
 The actual transport is injected (``caller``) so this module stays testable and
 protocol-agnostic; a real deployment passes an MCP/HTTP client.
+
+CANONICAL PER-SERVER AUTH (the documented default — THREAT_MODEL §4.2). A live MCP server +
+IdP OBO endpoint isn't available to build against here, so this is the CONTRACT a deployment's
+injected ``caller`` MUST implement, per the server's ``auth_mode``:
+
+  oauth_obo  (server is an OAuth 2.0 resource server) — the caller performs an RFC 8693
+    token EXCHANGE at the IdP: it presents the AGENT's own credential together with the
+    user's subject token and receives a NEW, audience-restricted access token scoped to the
+    target MCP server. ONLY that exchanged token is sent. The user's original token is the
+    INPUT to the exchange at the IdP — it is never placed on the wire to the MCP server. The
+    MCP server (the resource owner) then enforces the user's OWN permissions. This is the
+    preferred mode whenever the server speaks OAuth.
+
+  service_rebac  (legacy / non-OAuth server) — the caller authenticates with a SERVICE
+    credential (the agent's identity, not the user's) and the agent mediates authorization
+    itself: results are mapped to OpenFGA authorization objects and filtered per-user (ReBAC)
+    before anything reaches the LLM (gate 3 below). The user's token never leaves the agent.
+
+In BOTH modes the raw user token stops at the agent boundary. This module enforces that
+boundary structurally: ``call_mcp_tool`` has no user-token parameter, so the executor CANNOT
+forward one, and it guards the outbound ``arguments`` against an accidentally-threaded
+credential (see ``_assert_no_user_credential``). Token acquisition lives in the injected
+``caller`` precisely so the no-forward invariant is provable at THIS layer.
 """
 from __future__ import annotations
 
@@ -68,6 +91,31 @@ class McpToolError(Exception):
     pass
 
 
+# Argument keys that would smuggle a raw user credential into the outbound call. The executor
+# never threads a user token (it has no such parameter), but a buggy caller could put one in
+# the tool ARGUMENTS — this catches that fail-closed so the no-forward invariant (§4.2) holds
+# structurally, not just by convention.
+_CREDENTIAL_ARG_KEYS = frozenset({
+    "authorization", "access_token", "id_token", "refresh_token", "bearer", "token",
+    "user_token", "jwt", "assertion", "api_key", "apikey", "password", "secret",
+})
+
+
+def _assert_no_user_credential(arguments: dict) -> None:
+    """Refuse to execute if the tool arguments carry a raw credential (fail-closed).
+
+    Guards the §4.2 'never forward the raw user token' invariant at the OUTBOUND boundary:
+    auth belongs in the injected ``caller`` (OBO exchange / service credential), NEVER in the
+    tool arguments. Case-insensitive key match; raises ``McpToolError`` on a hit."""
+    for k in arguments:
+        if isinstance(k, str) and k.strip().lower() in _CREDENTIAL_ARG_KEYS:
+            raise McpToolError(
+                f"refusing to forward MCP arguments containing a credential field {k!r} — "
+                f"auth must be acquired by the caller (OBO/service credential), not passed "
+                f"through tool arguments (THREAT_MODEL §4.2)."
+            )
+
+
 async def call_mcp_tool(
     server: str,
     tool: str,
@@ -81,6 +129,9 @@ async def call_mcp_tool(
     from agent.nodes import _enforce  # local import: avoids a heavy import cycle at module load
 
     args = arguments or {}
+    # Boundary invariant (§4.2): the outbound arguments must not smuggle a user credential —
+    # auth is the caller's job (OBO exchange / service credential), never tool arguments.
+    _assert_no_user_credential(args)
     # Gate 1: policy engine (default-deny).
     await _enforce("mcp.call", {"server": server, "tool": tool})
 

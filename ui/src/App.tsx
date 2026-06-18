@@ -3,7 +3,7 @@ import { UserPane } from './components/UserPane'
 import { BffPane } from './components/BffPane'
 import { MonitorPanel } from './components/MonitorPanel'
 import type { AgentEvent } from './types'
-import { CLUSTERS, CLUSTER_AGT_A } from './types'
+import { DIVISIONS, PRIMARY_DIVISION } from './types'
 import { readEnvConfig, parseCallback, completeLogin } from './api/oidc'
 import { bffEnabled } from './api/session'
 
@@ -12,6 +12,8 @@ export default function App() {
   const [monitorOpen, setMonitorOpen] = useState(false)
   // Production auth (BFF): one division per browser session, no token in the browser.
   const bff = bffEnabled()
+  // TODO(inbox): when the /inbox retrieval endpoint lands, wire per-division offline
+  // delivery off Division.apiBase here. Left for the inbox-backend work.
 
   // PKCE/SSO: if we returned from the IdP with ?code=&state=, exchange it for tokens.
   // (Additive — does nothing in the default password-grant demo mode.)
@@ -54,13 +56,13 @@ export default function App() {
       <main className={`app-main ${monitorOpen ? 'main-monitor-open' : ''}`}>
         {bff ? (
           // BFF mode: ONE division per browser session (the production multi-user model —
-          // open the other division in a separate browser). No token ever in the browser.
-          <BffPane cluster={CLUSTER_AGT_A} onEvent={addEvent} />
+          // open another division in a separate browser). No token ever in the browser.
+          <BffPane division={PRIMARY_DIVISION} onEvent={addEvent} />
         ) : (
-          CLUSTERS.map((cluster, i) => (
-            <Fragment key={cluster.id}>
+          DIVISIONS.map((division, i) => (
+            <Fragment key={division.id}>
               {i > 0 && <div className="pane-divider" />}
-              <UserPane cluster={cluster} onEvent={addEvent} />
+              <UserPane division={division} onEvent={addEvent} />
             </Fragment>
           ))
         )}

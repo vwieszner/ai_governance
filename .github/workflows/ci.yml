@@ -1,0 +1,90 @@
+name: CI
+
+# Enforces the project's verification gates (see README "Verification") on every
+# push and pull request. Three BLOCKING gates keep `main` green:
+#   1. ruff   — backend lint must stay clean
+#   2. pytest — backend test suite must pass
+#   3. UI     — npm ci + vitest + production build must succeed
+# One NON-BLOCKING informational step:
+#   4. mypy   — a ratchet for NEW code; the legacy codebase still has ~924
+#               pre-existing `--strict` findings, so it is not a gate yet.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (ruff + pytest + mypy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # The project is run from agt-federated-rag/ (conftest.py + pyproject.toml
+        # live here; the README runs `cd agt-federated-rag; ... pytest tests -q`).
+        working-directory: agt-federated-rag
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pinned dependencies
+        # requirements.lock.txt pins ruff, pytest, pytest-asyncio, mypy and the
+        # full runtime stack — the same versions used for local verification.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock.txt
+
+      # ── Gate 1 (BLOCKING): backend lint must stay clean ──────────────────────
+      - name: Ruff lint
+        run: ruff check .
+
+      # ── Gate 2 (BLOCKING): backend test suite ────────────────────────────────
+      # The 3 live-stack tests self-skip when divisions aren't running (see README).
+      - name: Pytest
+        run: pytest tests -q
+
+      # ── Informational (NON-BLOCKING): mypy ratchet for NEW code ──────────────
+      # The legacy codebase has ~924 pre-existing `--strict` findings, so mypy is
+      # not yet a merge gate — it ratchets new modules (see [tool.mypy] override
+      # in pyproject.toml). continue-on-error keeps it informational.
+      - name: Mypy (informational)
+        continue-on-error: true
+        run: mypy .
+
+  ui:
+    name: UI (vitest + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # ── Gate 3 (BLOCKING): UI deps + unit tests + production build ────────────
+      # e2e (`npm run e2e`) is intentionally excluded — it needs a live browser
+      # and running division stacks, which CI does not provision.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build

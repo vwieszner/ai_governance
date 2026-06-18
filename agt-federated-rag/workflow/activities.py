@@ -42,7 +42,7 @@ from __future__ import annotations
 import hashlib
 import hmac as hmac_lib
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -249,23 +249,48 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
 async def grant_access_in_openfga(inp: GrantAccessInput) -> None:
     """Grant viewer relation and revoke pending_approval for approved chunks.
 
+    FR-7.1 access lifecycle: when ``settings.approval_grant_ttl_seconds > 0`` the
+    viewer grant is TIME-BOUND — written via ``grant_viewer_until`` as a
+    ``non_expired`` conditional tuple expiring at now + ttl. OpenFGA stops treating
+    it as access once ``current_time >= expiry`` (enforced at check() time, no
+    sweeper), so the requester must re-ask (and re-enter approval) once it lapses.
+    When ttl == 0 (default/legacy) the grant is PERMANENT via ``grant_viewer``.
+
+    The expiry is an ISO-8601 UTC timestamp — the same basis OpenFGA's check()
+    supplies as ``current_time`` (datetime.now(timezone.utc).isoformat()), so the
+    two are directly comparable.
+
     Uses the module-level OpenFGA singleton (TM-2).
     Emits AGT audit event.
     """
+    ttl = settings.approval_grant_ttl_seconds
     log.info(
         "activity_grant_access",
         user_id=inp.user_id,
         chunk_count=len(inp.chunk_ids),
+        ttl_seconds=ttl,
         agt_audit=True,
     )
     auth = await _get_openfga()
+
+    # Compute the expiry once (replay-safe — derived from a snapshotted setting and a
+    # single now()), using the same ISO-8601 UTC format check() compares against.
+    expiry_iso: str | None = None
+    if ttl > 0:
+        from datetime import datetime, timedelta, timezone
+        expiry_iso = (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat()
+
     for chunk_id in inp.chunk_ids:
-        await auth.grant_viewer(inp.user_id, chunk_id)
+        if expiry_iso is not None:
+            await auth.grant_viewer_until(inp.user_id, chunk_id, expiry_iso)
+        else:
+            await auth.grant_viewer(inp.user_id, chunk_id)
         await auth.revoke_pending_approval(inp.user_id, chunk_id)
     log.info(
         "openfga_access_granted",
         user_id=inp.user_id,
         count=len(inp.chunk_ids),
+        expiry=expiry_iso,
         agt_audit=True,
     )
 
@@ -296,19 +321,58 @@ async def revoke_pending_in_openfga(inp: RevokeApprovalInput) -> None:
 
 @activity.defn
 async def notify_user_of_decision(inp: NotifyUserInput) -> None:
-    """Log an in-app notification to the user about the approval decision.
+    """Deliver the approval outcome to the requester's durable, account-bound inbox
+    (FR-6.1/6.4) and fire the in-app notification badge (FR-6.5).
 
-    In production this would integrate with a push-notification service,
-    WebSocket channel, or email gateway.  The structured log entry is
-    sufficient for the AGT audit trail.
+    This is the requester-side delivery for SAME-DIVISION approvals. ``inp.user_id`` is
+    the requester's NAMESPACED principal (email|issuer-ns) — the inbox key — and the
+    decision text in ``inp.message`` carries the status. The durable outcome record was
+    written to the per-user store at /query parking time (api/main.py), so it is already
+    waiting on next login regardless of whether a browser tab is open (no client poll, no
+    short TTL); on resolution this activity RAISES THE UNSEEN BADGE so the SPA surfaces it.
+
+    Cross-division (FR-6.6) is handled elsewhere: when ``callback_task_id`` is set the
+    requester lives in ANOTHER division, so the home-division callback handler
+    (api/main.py::task_callback) writes to THEIR store — writing here would deposit the
+    outcome in the owner's division where the requester never logs in. So in that case
+    we only keep the audit log (the peer callback does the requester-side delivery).
+
+    FAIL-CLOSED on stale data: a "completed" record stores NO answer — GET /inbox
+    regenerates it through the full governed pipeline at delivery (FR-6.2). A denial
+    persists the declined message (FR-6.3). The structured audit log is retained.
     """
+    # Derive the durable status from the deterministic decision message. The approval
+    # workflow emits exactly three shapes (approved / denied / timed-out); only the
+    # approved path becomes "completed" (answer regenerated at delivery) — denial and
+    # timeout are both "denied" (the requester lost / never gained access).
+    msg_l = inp.message.lower()
+    status = "completed" if "approved" in msg_l else "denied"
+
     log.info(
         "activity_notify_user",
         user_id=inp.user_id,
         callback_task_id=inp.callback_task_id,
+        status=status,
         message_preview=inp.message[:100],
         agt_audit=True,
     )
+
+    # Cross-division origin → the requester is not in THIS division; the peer callback
+    # (api/main.py::task_callback) delivers to their HOME store and badge. Writing here
+    # would deposit the outcome in the owner's division, where the requester never logs in.
+    if inp.callback_task_id:
+        return
+
+    # Same-division requester. The DURABLE outcome record was created at /query parking
+    # time (api/main.py — it has the task_id + the full question needed to REGENERATE the
+    # answer at delivery, FR-6.2), so it is already waiting independent of any browser/poll.
+    # The record's LIVE status is recomputed by GET /inbox at delivery (a granted request
+    # regenerates to an answer; a denied/timed-out one re-checks to "declined", FR-6.3) — so
+    # this activity does not write a competing record (which, lacking the question, could not
+    # regenerate). Its job on resolution is to RAISE THE IN-APP BADGE (FR-6.5) so the
+    # requester learns on next login that an answer is waiting, without re-asking.
+    import outcome_store
+    await outcome_store.bump_badge(inp.user_id)
 
 
 @activity.defn

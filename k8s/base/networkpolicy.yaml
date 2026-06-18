@@ -1,0 +1,71 @@
+# NetworkPolicy — the Kubernetes-native division boundary (NFR-2, decision D-3).
+#
+# "Physically isolated, no shared point crosses a division boundary" is expressed in
+# k8s as: a dedicated Namespace PLUS a default-deny posture where the ONLY traffic that
+# may cross the namespace boundary is the agent's federation route (peer /a2a/* +
+# /tasks/*/callback). Everything else — Postgres, OpenFGA, Qdrant, Redis, Keycloak,
+# Temporal — is reachable ONLY from inside this division's namespace, so one division
+# can never read another's store (the k8s analogue of the per-project compose network).
+#
+# Two policies:
+#   1. default-deny-ingress  — deny ALL ingress to every pod in the namespace.
+#   2. allow-intra + agent-federation — re-allow (a) same-namespace pod-to-pod, and
+#      (b) ONLY the agent pod, ONLY on :8000, from pods in any agt-federated-rag
+#      division namespace (the cross-division peer call). Stores get NO cross-namespace
+#      exception, so the boundary holds even though federation is allowed.
+#
+# Egress is intentionally NOT locked down here: the agent must reach external peers
+# (other clusters/load-balancers), the IdP, and the hosted LLM, whose addresses are
+# deployment-specific. Tightening egress to an explicit allowlist is an operator step
+# (see k8s/README.md) — the confidentiality boundary above is enforced on ingress.
+#
+# REQUIRES a CNI that enforces NetworkPolicy (Calico, Cilium, etc.). On a CNI without
+# enforcement these objects are accepted but inert — the operator MUST verify (README).
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}          # every pod in the namespace
+  policyTypes: ["Ingress"]
+  # No ingress rules ⇒ deny all inbound. Re-allowed selectively below.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+spec:
+  podSelector: {}          # every pod in the namespace
+  policyTypes: ["Ingress"]
+  ingress:
+    # (a) Same-namespace traffic: any pod in THIS division may talk to any other
+    # (agent↔openfga↔qdrant↔redis↔temporal↔keycloak↔postgres). The empty podSelector
+    # under `from` (with no namespaceSelector) means "pods in this namespace".
+    - from:
+        - podSelector: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-agent-federation
+spec:
+  # (b) ONLY the agent pod, ONLY on :8000, may be reached from another division's
+  # namespace — the cross-division peer call (/a2a/query, /tasks/<id>/callback).
+  # The DID/Ed25519 signature + mTLS gate still authenticate the caller at the app
+  # layer; this just narrows WHO can open the socket. Stores have no such rule.
+  podSelector:
+    matchLabels:
+      app: agent
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # Every division namespace carries this label (set in the overlay's
+              # namespace patch), so peers — and only peers — match. Non-division
+              # namespaces (kube-system, other tenants) do not.
+              app.kubernetes.io/part-of: agt-federated-rag
+      ports:
+        - protocol: TCP
+          port: 8000

@@ -29,8 +29,10 @@ def test_detects_tampered_field(tmp_path: Path):
     c.append("auth_decision", {"flow": "local_allowed", "allowed": 1})
     # Tamper: flip a denied decision to allowed in the stored data (hash won't match).
     lines = p.read_text().splitlines()
-    rec = json.loads(lines[0]); rec["data"]["allowed"] = 1
-    lines[0] = json.dumps(rec); p.write_text("\n".join(lines) + "\n")
+    rec = json.loads(lines[0])
+    rec["data"]["allowed"] = 1
+    lines[0] = json.dumps(rec)
+    p.write_text("\n".join(lines) + "\n")
     ok, detail = verify_chain(p)
     assert not ok and "hash mismatch" in detail
 
@@ -83,7 +85,7 @@ def test_processor_records_only_agt_audit(tmp_path: Path, monkeypatch):
                                      {"event": "openfga.check", "agt_audit": True, "allowed": True})
     assert out["event"] == "openfga.check"            # processor returns event_dict unchanged
     audit_log._audit_processor(None, "info", {"event": "debug_noise", "x": 1})
-    entries = [json.loads(l) for l in chain.path.read_text().splitlines() if l.strip()]
+    entries = [json.loads(line) for line in chain.path.read_text().splitlines() if line.strip()]
     assert len(entries) == 1 and entries[0]["event"] == "openfga.check"
     assert "agt_audit" not in entries[0]["data"]      # control field stripped
     ok, _ = verify_chain(chain.path)
@@ -135,7 +137,7 @@ def test_processor_allowlist_drops_unexpected_fields(tmp_path: Path, monkeypatch
         "user_id": "alice@x|ns", "allowed": True,          # allowlisted -> kept
         "access_token": "SECRET", "answer": "leak me",      # not allowlisted -> dropped
     })
-    rec = [json.loads(l) for l in chain.path.read_text().splitlines() if l.strip()][0]
+    rec = [json.loads(line) for line in chain.path.read_text().splitlines() if line.strip()][0]
     assert rec["data"]["user_id"] == "alice@x|ns"
     assert "access_token" not in rec["data"] and "answer" not in rec["data"]
     assert rec["data"]["count_dropped"] == 2               # how many, never what

@@ -1,0 +1,115 @@
+# Agent — the FastAPI/uvicorn governance + RAG service (api.main on :8000). Built from
+# the repo Dockerfile (agt-federated-rag/Dockerfile). The image ref is parameterized
+# via the kustomize `images:` transformer (default agt-federated-rag:local) — it must
+# be built and pushed/loaded into the cluster first (see k8s/README.md).
+#
+# Non-secret env from the agent-config ConfigMap; secrets from the agent-secrets Secret.
+# The Service is named `agent`; peers reach it cross-division as
+# http://agent.<peer-namespace>.svc.cluster.local:8000 (the only cross-namespace route
+# the NetworkPolicy permits, for /a2a/* + /tasks/*/callback federation).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+  labels:
+    app: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent
+  template:
+    metadata:
+      labels:
+        app: agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000        # appuser in the Dockerfile
+        fsGroup: 1000
+      initContainers:
+        # Don't start serving until this division's OpenFGA answers — the data-path
+        # authorization store must be reachable before the agent accepts queries.
+        - name: wait-openfga
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://openfga:8080/healthz >/dev/null 2>&1; do
+                echo "waiting for openfga"; sleep 2;
+              done
+      containers:
+        - name: agent
+          image: agt-federated-rag:local   # overridden by kustomize images: (overlay sets the tag)
+          command: ["python", "-m", "api.main"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: agent-config
+            - secretRef:
+                name: agent-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # fastembed downloads its model at first run to this cache (matches the
+            # compose div-fastembed-cache volume). emptyDir is fine — re-downloaded
+            # on a fresh pod; swap for a PVC if cold-start time matters.
+            - name: fastembed-cache
+              mountPath: /cache/fastembed
+            # readOnlyRootFilesystem=true → give the process writable scratch + the
+            # audit log dir (config.audit_log_dir defaults to ./audit_logs under /app).
+            - name: tmp
+              mountPath: /tmp
+            - name: audit-logs
+              mountPath: /app/audit_logs
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 45
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+      volumes:
+        - name: fastembed-cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: audit-logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent
+  labels:
+    app: agent
+spec:
+  selector:
+    app: agent
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
