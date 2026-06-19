@@ -28,7 +28,23 @@ data:
   # ── LLM (NVIDIA NIM by default; key comes from the Secret) ───────────────────
   OPENAI_API_BASE: "https://integrate.api.nvidia.com/v1"
   LLM_MODEL: "meta/llama-3.3-70b-instruct"
+
+  # ── Embeddings (SERVED API, not an in-pod model) ─────────────────────────────
+  # On Kubernetes the dense vector comes from an OpenAI-compatible embeddings
+  # endpoint (same NVIDIA NIM base as the LLM; key comes from the Secret), so the
+  # pod never downloads the 1.3GB model. BM25 sparse retrieval stays local.
+  # For data-residency mode, self-host this endpoint in-cluster (NIM/TEI Service)
+  # exactly like the LLM and point EMBEDDING_API_BASE at it.
+  EMBEDDING_PROVIDER: "api"
   EMBEDDING_MODEL: "nvidia/nv-embedqa-e5-v5"
+  EMBEDDING_API_BASE: "https://integrate.api.nvidia.com/v1"
+
+  # Retrieval cutoff TUNED FOR nv-embedqa-e5-v5 (api mode): its cosine scores run
+  # much lower than bge-large — relevant chunks land ~0.30, not ~0.55 — so the
+  # bge-tuned default of 0.55 would filter every real hit ("no relevant info").
+  # If you switch to bge-large / local mode, raise this back to ~0.55. (Compose
+  # local-mode divisions don't read this ConfigMap, so they're unaffected.)
+  QDRANT_SCORE_THRESHOLD: "0.25"
 
   # ── In-cluster service endpoints (Kubernetes DNS, internal ports) ────────────
   # These resolve inside THIS division's namespace only — the NetworkPolicy blocks

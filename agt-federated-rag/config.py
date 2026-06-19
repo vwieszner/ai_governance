@@ -125,6 +125,32 @@ class Settings(BaseSettings):
     raas_endpoints: list[RaasEndpoint] = Field(default_factory=list)
     raas_timeout_seconds: float = 10.0
 
+    # ── Embeddings (pluggable DENSE backend) ──────────────────────────────────
+    # The DENSE embedding can run LOCAL (FastEmbed ONNX, default) or be served by an
+    # OpenAI-compatible /embeddings API (e.g. NVIDIA NIM nvidia/nv-embedqa-e5-v5). The
+    # 1.3GB local bge-large model must download into the pod, which fails on k8s; the
+    # api provider sidesteps that by calling a served endpoint. The SPARSE BM25 vector
+    # stays LOCAL in both modes (it's tiny). See rag/embeddings.py.
+    embedding_provider: str = "local"   # "local" | "api"
+    # API-mode endpoint + key. Empty → fall back to openai_api_base / openai_api_key
+    # (the LLM endpoint) via effective_embedding_base / effective_embedding_key, so a
+    # single NVIDIA NIM deployment can serve both chat and embeddings with one config.
+    embedding_api_base: str = ""
+    embedding_api_key: str = ""
+    # Served embedding model id — used ONLY in api mode. Must emit qdrant_dense_size dims.
+    embedding_model: str = "nvidia/nv-embedqa-e5-v5"
+    # NVIDIA nv-embedqa is ASYMMETRIC: it REQUIRES an `input_type` ("query" | "passage")
+    # and rejects a request without it (400 "'input_type' parameter is required for
+    # asymmetric models"). When True (the default — the default model is asymmetric), the
+    # api backend sends input_type; chunks embed as "passage", queries as "query" (using the
+    # wrong type degrades retrieval). Set False for symmetric OpenAI-compatible models
+    # (e.g. text-embedding-3) which don't accept input_type — then it's omitted from the body.
+    embedding_asymmetric: bool = True
+    # NVIDIA nv-embedqa caps input at 512 tokens and 400s on longer chunks unless told how
+    # to truncate. "END" keeps the head (sent only in asymmetric/api mode). Set "" to omit
+    # (symmetric OpenAI models reject the field); "NONE"/"START"/"END" per the NIM API.
+    embedding_truncate: str = "END"
+
     # ── Qdrant ────────────────────────────────────────────────────────────────
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = Field(default="")   # optional for local instances
@@ -294,6 +320,17 @@ class Settings(BaseSettings):
     # Dev default: Vite's local dev server.  In production set CORS_ORIGINS to
     # the actual UI origin, e.g. "https://rag.example.com".
     cors_origins: str = "http://localhost:5173"
+
+    @property
+    def effective_embedding_base(self) -> str:
+        """API-mode embedding base URL — embedding_api_base, or openai_api_base when unset
+        (so one NVIDIA NIM endpoint serves both chat + embeddings with no extra config)."""
+        return (self.embedding_api_base or self.openai_api_base).rstrip("/")
+
+    @property
+    def effective_embedding_key(self) -> str:
+        """API-mode embedding bearer key — embedding_api_key, or openai_api_key when unset."""
+        return self.embedding_api_key or self.openai_api_key
 
     @property
     def cors_origins_list(self) -> list[str]:

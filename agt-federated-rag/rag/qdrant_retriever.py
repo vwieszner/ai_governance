@@ -61,6 +61,8 @@ class HybridQdrantRetriever:
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Hybrid dense + sparse retrieval with server-side RRF and ACL filter."""
+        from rag.embeddings import embed_dense
+
         client = await self._client_conn()
         filter_: Filter | None = None
         if allowed_chunk_ids is not None:
@@ -68,12 +70,18 @@ class HybridQdrantRetriever:
                 must=[FieldCondition(key="chunk_id", match=MatchAny(any=allowed_chunk_ids))]
             )
 
+        # Precompute the dense query vector via the pluggable embedding backend (local
+        # FastEmbed OR a served /embeddings API) so BOTH dense uses below — the relevance
+        # probe and the dense Prefetch — share one vector. The sparse BM25 vector stays
+        # client-side (models.Document) via Qdrant's local FastEmbed.
+        qv = (await embed_dense([query], input_type="query"))[0]
+
         # Relevance gate (see federated-rag/rag/qdrant_retriever.py for rationale):
         # drop chunks whose dense cosine score is below the threshold so an
         # off-topic document never enters the result set.
         dense_results = await client.query_points(
             collection_name=settings.qdrant_collection,
-            query=models.Document(text=query, model=settings.qdrant_dense_model),
+            query=qv,
             using="dense",
             limit=settings.qdrant_top_k,
             query_filter=filter_,
@@ -96,7 +104,7 @@ class HybridQdrantRetriever:
 
         prefetch = [
             models.Prefetch(
-                query=models.Document(text=query, model=settings.qdrant_dense_model),
+                query=qv,
                 using="dense",
                 limit=(limit or settings.qdrant_final_k) * 3,
                 filter=filter_,
@@ -160,18 +168,21 @@ class HybridQdrantRetriever:
         return out
 
     async def upsert_chunks(self, chunks: list[dict[str, Any]]) -> None:
-        """Embed + upsert chunks. Mirrors cluster-A: explicit FastEmbed vectors.
+        """Embed + upsert chunks. The DENSE vector comes from the pluggable embedding
+        backend (rag.embeddings.embed_dense — local FastEmbed OR a served /embeddings API);
+        the SPARSE BM25 vector stays LOCAL (it's tiny).
 
         qdrant-client 1.16 mis-assigns batched lazy models.Document inference
         across points (distinct ids collapse to one), so we embed explicitly.
         """
         client = await self._client_conn()
-        from fastembed import SparseTextEmbedding, TextEmbedding
+        from fastembed import SparseTextEmbedding
 
-        dense_model = TextEmbedding(model_name=settings.qdrant_dense_model)
+        from rag.embeddings import embed_dense
+
         sparse_model = SparseTextEmbedding(model_name=settings.qdrant_sparse_model)
         texts = [chunk["text"] for chunk in chunks]
-        dense_vecs = list(dense_model.embed(texts))
+        dense_vecs = await embed_dense(texts, input_type="passage")
         sparse_vecs = list(sparse_model.embed(texts))
 
         points = [
@@ -183,7 +194,7 @@ class HybridQdrantRetriever:
                     **chunk.get("metadata", {}),
                 },
                 vector={
-                    "dense": dvec.tolist(),
+                    "dense": dvec,
                     "sparse": models.SparseVector(
                         indices=svec.indices.tolist(),
                         values=svec.values.tolist(),
