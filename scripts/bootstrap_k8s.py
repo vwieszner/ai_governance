@@ -226,6 +226,22 @@ def federate(ctx: str, divisions: list[str]) -> None:
             "OIDC_ISSUER": facts[d].issuer,                       # unique per division
             "AGENT_IDENTITY_PATH": "/identity/agent_identity.json",
         }}
+        # Governed cross-agent TOOL wiring (capability-based delegation), derived from
+        # the manifests' local_tools so a fresh `--federate` is always correctly wired:
+        #   * AGT_LOCAL_TOOLS — the capabilities THIS division serves locally (manifest
+        #     local_tools). Absent (None) => leave the base ConfigMap default (serve ALL);
+        #     an explicit list (incl. []) is asserted so a consumer truly serves none.
+        #   * PEER_TOOL_MAP — capability -> provider-peer DID for every capability this
+        #     division LACKS but a trusted peer serves (fd.compute_peer_tool_map). The DID
+        #     is resolved against PEER_TRUST_MAP above (correct cross-namespace agent_url),
+        #     so delegation needs no discovery broker. Reuses the SAME helper as the compose
+        #     federate path — identical wiring, two deployment targets.
+        if facts[d].m.local_tools is not None:
+            cm_patch["data"]["AGT_LOCAL_TOOLS"] = ",".join(facts[d].m.local_tools)
+        tool_map = fd.compute_peer_tool_map(facts[d], facts)
+        if tool_map:
+            cm_patch["data"]["PEER_TOOL_MAP"] = _json.dumps(tool_map, separators=(",", ":"))
+            print(f"   {d}: tool routing {', '.join(f'{c}->{t[:18]}…' for c, t in tool_map.items())}")
         kubectl(ctx, "-n", ns, "patch", "configmap", "agent-config", "--type=merge",
                 "-p", _json.dumps(cm_patch))
         # Mount the identity Secret read-only into agent + worker.

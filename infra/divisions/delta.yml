@@ -6,6 +6,13 @@ docs_dir: tests/docs/cluster-b
 residency_mode: external
 seed_viewer: technical_architecture
 seed_approval: q4_financial_results
+# SELF-SUFFICIENT DEPARTMENT (Risk/Data-Governance). It keeps its OWN data (per-division
+# Qdrant + OpenFGA) AND owns DISTINCT governed tools: the EU AI Act risk-tier classifier
+# (tool.risk) and the data-classification/sensitivity tool (tool.classify). Departments
+# collaborate BOTH ways: delta serves risk/classify to gamma, and delegates
+# tool.pii/tool.compliance to gamma (compute_peer_tool_map derives delta's PEER_TOOL_MAP
+# -> gamma's DID for the capabilities delta does NOT serve locally).
+local_tools: [tool.risk, tool.classify]
 # Federation: pre-authorize gamma's seeded user to reach delta's data (proves the
 # cross-division path on Kubernetes — the analogue of alpha's alice reaching beta).
 cross_grants:

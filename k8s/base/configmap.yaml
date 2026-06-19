@@ -66,3 +66,18 @@ data:
   ALLOWED_JWT_ALGORITHMS: "RS256"
 
   CORS_ORIGINS: "http://localhost:5173"
+
+  # ── Governed cross-agent tools (capability-based delegation) ─────────────────
+  # AGT_LOCAL_TOOLS: CSV of the tool capabilities THIS division SERVES locally
+  # (full ids like "tool.pii" or short names like "pii"). Empty here = the base
+  # default; each overlay sets its own. A PROVIDER division lists the capabilities
+  # it owns (e.g. gamma = "tool.pii,tool.compliance"); a pure CONSUMER sets "" so it
+  # serves none locally and must delegate. (Read by tools.local_tools._enabled_*.)
+  #
+  # PEER_TOOL_MAP: JSON {"<capability>": "<provider_peer_DID>"} — for a capability a
+  # division does NOT serve locally, route the delegated tool call to this peer DID.
+  # The DID is resolved against PEER_TRUST_MAP (the data-path trust anchor wired by
+  # federation), so NO discovery broker is needed. Empty here = no static routes; the
+  # consumer overlay (or the bootstrap federate step) fills it with the provider's DID.
+  AGT_LOCAL_TOOLS: ""
+  PEER_TOOL_MAP: ""

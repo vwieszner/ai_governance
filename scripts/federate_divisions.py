@@ -87,6 +87,31 @@ class DivisionFacts:
         return store_id, token
 
 
+def compute_peer_tool_map(facts: DivisionFacts,
+                          by_id: dict[str, DivisionFacts]) -> dict[str, str]:
+    """Build this division's PEER_TOOL_MAP: ``{capability: provider_peer_DID}``.
+
+    For every tool capability this division does NOT serve locally but a TRUSTED peer
+    (in ``trusted_peers``) DOES serve (per that peer's manifest ``local_tools``), route
+    the capability to that peer's provisioned DID. The DID is later resolved against the
+    data-path trust anchor (PEER_TRUST_MAP) at call time, so this needs no broker.
+
+    A division with ``local_tools = None`` (serve ALL) needs nothing routed; one with an
+    explicit list only routes the capabilities it lacks. First trusted peer that serves a
+    capability wins (deterministic by trusted_peers order)."""
+    own = set(facts.m.local_tools or [])
+    out: dict[str, str] = {}
+    for peer_id in facts.m.trusted_peers:
+        peer = by_id.get(peer_id)
+        if peer is None or not peer.onboarded:
+            continue
+        for cap in (peer.m.local_tools or []):
+            if cap and cap not in own and cap not in out:
+                pdid, _ = peer.did_jwk()
+                out[cap] = pdid
+    return out
+
+
 def _upsert_env(env_path: Path, updates: dict[str, str], dry_run: bool) -> list[str]:
     """Replace existing KEY=… lines (or append) so federation is re-runnable. Returns
     the human-readable change list."""
@@ -213,10 +238,19 @@ def federate(only: list[str] | None, dry_run: bool) -> int:
                 "TRUSTED_ISSUERS": ",".join(by_id[p].issuer for p in peers),
                 "PEER_TRUST_MAP": json.dumps(trust_map, separators=(",", ":")),
             }
+            # CONFIGURED (broker-less) tool routing: map each capability this division lacks
+            # locally to the trusted peer that serves it. Resolved against PEER_TRUST_MAP
+            # above at call time (find_peer_for_capability), so cross-agent tool delegation
+            # works with no discovery broker — the same wiring the k8s overlays carry.
+            tool_map = compute_peer_tool_map(f, by_id)
+            if tool_map:
+                updates["PEER_TOOL_MAP"] = json.dumps(tool_map, separators=(",", ":"))
             for ch in _upsert_env(f.env_path, updates, dry_run):
                 log(ch)
             if len(peers) > 1:
                 log(f"  multi-peer trust map: {len(trust_map)} peers ({', '.join(peers)})")
+            if tool_map:
+                log(f"  tool routing: {', '.join(f'{c}->{d[:18]}…' for c, d in tool_map.items())}")
         # cross-grants land in THIS division's store
         asyncio.run(_apply_cross_grants(f, by_id, dry_run))
 

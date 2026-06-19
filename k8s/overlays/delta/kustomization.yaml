@@ -1,5 +1,7 @@
-# Division Delta overlay (mirrors infra/divisions/delta.yml). A 4th division as a new
-# overlay, no base edits — and the peer that gamma federates with in the k8s federation test.
+# Division Delta overlay (Risk/Data-Governance department). Mirrors infra/divisions/delta.yml.
+# A self-sufficient department: its own data (Qdrant + OpenFGA) AND distinct governed tools
+# (tool.risk + tool.classify), collaborating two-way with gamma (it delegates
+# tool.pii/tool.compliance there). A new department = a new overlay; the base is never edited.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -55,6 +57,21 @@ patches:
       - op: add
         path: /data/TEMPORAL_TASK_QUEUE
         value: approval-delta
+      # SELF-SUFFICIENT DEPARTMENT (Risk/Data-Governance). delta keeps its OWN data (Qdrant +
+      # OpenFGA in this namespace) AND owns DISTINCT tools: the EU AI Act risk-tier classifier
+      # + the data-classification tool. tools.local_tools registers only these, and the agent
+      # auto-advertises them so gamma can delegate tool.risk/tool.classify here.
+      - op: add
+        path: /data/AGT_LOCAL_TOOLS
+        value: tool.risk,tool.classify
+      # TWO-WAY collaboration: for the tools delta does NOT serve (pii/compliance), route them
+      # to gamma (the department that owns them). The value maps capability -> gamma's DID;
+      # that DID is resolved against PEER_TRUST_MAP (wired by federation) for the data-path
+      # call, so no broker is needed. DID = gamma's provisioned id (infra/generated/gamma);
+      # `bootstrap_k8s.py --federate` re-derives + re-patches this from live DIDs at deploy time.
+      - op: add
+        path: /data/PEER_TOOL_MAP
+        value: '{"tool.pii":"did:mesh:c5839df170c888e68a804abed0a46af4","tool.compliance":"did:mesh:c5839df170c888e68a804abed0a46af4"}'
 
 images:
   - name: agt-federated-rag

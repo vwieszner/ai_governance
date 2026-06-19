@@ -57,11 +57,29 @@ kubectl -n agt-div-gamma port-forward svc/keycloak 9202:8080   # mint a user tok
 >   `EMBEDDING_TRUNCATE` (default `END`) — `nv-embedqa` returns HTTP 400 on inputs
 >   over its 512-token limit without it. The default works; no manifest change needed.
 
-**Federation across k8s divisions** (cross-DID trust) is not yet folded into `bootstrap_k8s.py`
-— each division comes up standalone + serving. To federate, run the cross-grant + peer-wiring step
-(`scripts/federate_divisions.py` against the divisions' OpenFGA, plus the peer config in each
-overlay's ConfigMap). Same-cluster, the peer URL is the cross-namespace Service DNS
-(`agent.agt-div-<peer>.svc.cluster.local:8000`), which the `allow-agent-federation` NetworkPolicy permits.
+**Federation across k8s divisions** (cross-DID trust) is folded into `bootstrap_k8s.py --federate`:
+after the divisions are up and their DIDs exist, it mounts each division's stable DID identity,
+patches every division's ConfigMap with the peer trust map + unique issuer, applies the
+cross-grants to each division's OpenFGA, and restarts the agents. Same-cluster, the peer URL is the
+cross-namespace Service DNS (`agent.agt-div-<peer>.svc.cluster.local:8000`), which the
+`allow-agent-federation` NetworkPolicy permits.
+
+```bash
+# bring up gamma + delta AND federate them in one command:
+python scripts/bootstrap_k8s.py --divisions gamma,delta --federate --context kind-agt
+```
+
+**Governed cross-agent tool delegation** rides the same `--federate` step. Each division is a
+**self-sufficient department**: its own data (per-division Qdrant + OpenFGA) AND its own distinct
+governed tools, declared via `AGT_LOCAL_TOOLS` (from its manifest `local_tools`). The federate step
+computes each division's `PEER_TOOL_MAP` (`{capability: provider_DID}`) for every capability it does
+**not** serve but a trusted peer does — building a **bidirectional** tool mesh with **no discovery
+broker**. On the cluster: gamma (Security/Legal) serves `tool.pii,tool.compliance` and delegates
+`tool.risk,tool.classify` to delta; delta (Risk/Data-Gov) serves `tool.risk,tool.classify` and
+delegates `tool.pii,tool.compliance` to gamma — so each department uses the other's tools under
+governance. The extensibility walkthrough — **add a tool**, **add a RaaS retrieval connector**, **add
+a department** — with the exact `POST /solve` curls for both directions is in
+[`examples/cross-agent-pii/README.md`](../examples/cross-agent-pii/README.md).
 
 ---
 
@@ -101,7 +119,7 @@ k8s/
     networkpolicy.yaml      # default-deny + intra-namespace + agent-federation
     kustomization.yaml
   overlays/
-    alpha/  beta/  gamma/   # one overlay per division (mirrors infra/divisions/*.yml)
+    alpha/  beta/  gamma/  delta/   # one overlay per division (mirrors infra/divisions/*.yml)
   README.md
 ```
 
@@ -144,6 +162,11 @@ This mirrors the Compose onboarding ethos (a new division is a new
    name/label to `delta`, the ConfigMap patch values (`DIVISION_ID`, `CLUSTER_ID`,
    `TRUSTED_PEERS`, `AGENT_CLIENT_ID`, `TEMPORAL_TASK_QUEUE`, `OIDC_*`), and the
    `images:` tag to `delta`.
+
+To assign **governed tools** to a division, add `AGT_LOCAL_TOOLS` (CSV of capabilities it
+serves) to its ConfigMap patch — see `overlays/gamma` (serves `tool.pii,tool.compliance`)
+and `overlays/delta` (serves none, carries a `PEER_TOOL_MAP` routing those capabilities to
+gamma). Full walkthrough: [`examples/cross-agent-pii/README.md`](../examples/cross-agent-pii/README.md).
 
 The `base/` is never edited.
 

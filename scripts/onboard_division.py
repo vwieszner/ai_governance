@@ -75,6 +75,12 @@ class Manifest:
     trusted_peers: list[str] = field(default_factory=list)
     seed_viewer: str = ""    # doc title alice may view directly
     seed_approval: str = ""  # doc title that needs the owner's approval (bob owns)
+    # Governed tool capabilities this division SERVES locally (e.g. [tool.pii,
+    # tool.compliance] for the compliance division; [] for a pure consumer). Written
+    # to the agent env as AGT_LOCAL_TOOLS (CSV); tools.local_tools reads it to decide
+    # which capabilities to register + advertise. Unset/missing key (None) = serve ALL
+    # tools (the back-compat default — distinct from an explicit empty list = serve none).
+    local_tools: list[str] | None = None
     # Cross-division pre-authorizations (FR-3.7): grant a named EXTERNAL user (from a
     # peer division) a relation on one of THIS division's docs, applied by
     # scripts/federate_divisions.py. Each item: {user_email, home_division, relation, doc}.
@@ -123,6 +129,16 @@ def load_manifest(path: str | Path) -> Manifest:
     peers = data.get("trusted_peers") or []
     if isinstance(peers, str):
         peers = [p.strip() for p in peers.split(",") if p.strip()]
+    # local_tools: distinguish "key absent" (None -> serve ALL tools, back-compat) from
+    # an explicit "[]" / "" (serve NONE locally -> the consumer that must delegate). A
+    # CSV string ("tool.pii,tool.compliance") is accepted alongside a YAML list.
+    lt_raw = data.get("local_tools", None)
+    if lt_raw is None:
+        local_tools: list[str] | None = None
+    elif isinstance(lt_raw, str):
+        local_tools = [t.strip() for t in lt_raw.split(",") if t.strip()]
+    else:
+        local_tools = [str(t).strip() for t in lt_raw if str(t).strip()]
     return Manifest(
         division_id=div,
         display_name=str(data.get("display_name", div)),
@@ -132,6 +148,7 @@ def load_manifest(path: str | Path) -> Manifest:
         trusted_peers=list(peers),
         seed_viewer=str(data.get("seed_viewer", "")),
         seed_approval=str(data.get("seed_approval", "")),
+        local_tools=local_tools,
         cross_grants=[g for g in (data.get("cross_grants") or []) if isinstance(g, dict)],
     )
 
@@ -212,6 +229,15 @@ def render_agent_env(
     at THIS division's own stack ports + store — that is the physical isolation."""
     kc = f"http://localhost:{ports['keycloak']}/realms/{REALM}"
     peers = ",".join(manifest.trusted_peers)
+    # Governed local tools (compose parity with the k8s base ConfigMap). Only emit the
+    # var when the manifest declares local_tools — absent (None) leaves it unset so
+    # tools.local_tools keeps its serve-ALL default; an explicit [] writes the empty
+    # value (serve none -> this division delegates). PEER_TOOL_MAP is added separately
+    # by federate_divisions.py once the peers' provider DIDs are known.
+    local_tools_line = (
+        "" if manifest.local_tools is None
+        else f"AGT_LOCAL_TOOLS={','.join(manifest.local_tools)}\n"
+    )
     return (
         f"CLUSTER_ID={manifest.division_id}\n"
         f"DIVISION_ID={manifest.division_id}\n"
@@ -245,6 +271,7 @@ def render_agent_env(
         f"AGENT_IDENTITY_PATH=./agent_identity_{manifest.division_id}.json\n"
         f"AGENT_TRUST_THRESHOLD=0.6\nSRE_ENABLED=true\nLOG_LEVEL=info\n"
         f"CORS_ORIGINS=http://localhost:5173\n"
+        f"{local_tools_line}"
     )
 
 

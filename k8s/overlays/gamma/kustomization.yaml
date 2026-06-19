@@ -1,6 +1,7 @@
-# Division Gamma overlay. Mirrors infra/divisions/gamma.yml: division_id=gamma,
-# trusted_peers=[alpha, beta]. Proves N divisions (N>2) onboard with no collisions —
-# a third overlay, no base edits (the k8s analogue of adding a third manifest).
+# Division Gamma overlay (Security/Legal department). Mirrors infra/divisions/gamma.yml.
+# A self-sufficient department: its own data (Qdrant + OpenFGA) AND distinct governed tools
+# (tool.pii + tool.compliance), collaborating two-way with delta (it delegates
+# tool.risk/tool.classify there). A new department = a new overlay; the base is never edited.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -37,7 +38,7 @@ patches:
         value: gamma
       - op: add
         path: /data/TRUSTED_PEERS
-        value: alpha,beta
+        value: alpha,beta,delta
       - op: add
         path: /data/OIDC_ISSUER
         value: http://keycloak:8080/realms/rag
@@ -56,6 +57,21 @@ patches:
       - op: add
         path: /data/TEMPORAL_TASK_QUEUE
         value: approval-gamma
+      # SELF-SUFFICIENT DEPARTMENT (Security/Legal). gamma keeps its OWN data (Qdrant +
+      # OpenFGA in this namespace) AND owns DISTINCT tools: the PII/DLP screen + the EU AI
+      # Act/GDPR compliance lookup. tools.local_tools registers only these, and the agent
+      # auto-advertises them so delta can delegate tool.pii/tool.compliance here.
+      - op: add
+        path: /data/AGT_LOCAL_TOOLS
+        value: tool.pii,tool.compliance
+      # TWO-WAY collaboration: for the tools gamma does NOT serve (risk/classify), route them
+      # to delta (the department that owns them). The value maps capability -> delta's DID;
+      # that DID is resolved against PEER_TRUST_MAP (wired by federation) for the data-path
+      # call, so no broker is needed. DID = delta's provisioned id (infra/generated/delta);
+      # `bootstrap_k8s.py --federate` re-derives + re-patches this from live DIDs at deploy time.
+      - op: add
+        path: /data/PEER_TOOL_MAP
+        value: '{"tool.risk":"did:mesh:4b0bf91aea366a9602c781f7dd9ff5ca","tool.classify":"did:mesh:4b0bf91aea366a9602c781f7dd9ff5ca"}'
 
 images:
   - name: agt-federated-rag
