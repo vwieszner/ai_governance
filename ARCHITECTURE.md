@@ -215,7 +215,59 @@ pattern — no token in the browser, only an `HttpOnly` cookie.
 
 ---
 
-## 6. Where it lives (code map)
+## 6. Cross-agent tool delegation (governed)
+
+When an agent hits a sub-problem needing a **tool capability it lacks** (e.g. arithmetic via
+`tool.calc`, unit conversion via `tool.units`), it doesn't fail — it discovers the peer that
+**advertises** that capability and delegates the *tool call* over a DID-signed `/a2a/tool`
+channel. The peer runs **its own** governed tool and returns a signed result. This is the same
+security envelope as `/a2a/query` (kill-switch → Ed25519 verify + replay guard → trust gate →
+recipient-bound assertion → policy → governed execution → signed reply), applied to a tool call
+instead of a query.
+
+`solve_with_tools` (`agent/nodes.py`) is the orchestrator: it routes the sub-problem to a
+capability, runs it **locally first** when this division serves it (`run_local_tool` through the
+three MCP gates), and only delegates when it doesn't. The local tools are **deterministic and
+sandboxed** — `calc` evaluates an **AST allowlist** (no `eval`; names/attribute-access/calls
+outside a fixed grammar are rejected), `units` is a fixed table. The delegation loop is **bounded**
+(`max_tool_delegations`) so a capability gap can't trigger a runaway peer-call chain.
+
+Two invariants carry over from federation unchanged: **no raw user token is ever forwarded** (the
+delegated identity travels as a recipient-bound, short-TTL *assertion* — `aud` = the peer's DID —
+minted from the per-request claims ContextVar, never a bearer token); and the peer **re-runs its
+own default-deny policy on the delegated user** before executing, so delegation never bypasses the
+peer's authorization. A tool/policy failure returns a **signed `status="failed"`**, never a 500.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as alice (Division A)
+    participant A as agent A
+    participant D as discovery
+    participant B as agent B
+    participant POL as policy + OpenFGA (B)
+    participant T as governed tool (B)
+
+    U->>A: POST /query (JWT) — sub-problem needs a tool A lacks
+    A->>A: route capability (e.g. tool.calc)<br/>local? server_for_capability → no
+    A->>D: discover peer advertising tool.calc (signed)
+    D-->>A: candidate DID(s)
+    A->>A: negotiate (capability match) ·<br/>resolve url+DID from peer_trust anchor (broker untrusted)
+    A->>B: POST /a2a/tool — Ed25519-signed envelope<br/>{capability, arguments} + recipient-bound assertion (aud=B, exp, jti)
+    B->>B: kill-switch · verify sig + replay guard · trust gate
+    B->>B: validate assertion (aud=B, signer-bound iss) → delegated user_id
+    B->>POL: _enforce mcp.call on the DELEGATED user (default-deny)
+    POL-->>B: allow
+    B->>T: run_local_tool(calc) through the 3 gates
+    T-->>B: result (deterministic, AST-sandboxed)
+    B-->>A: DID-signed result {status, result, capability}
+    A->>A: verify response signature (signer == B) — fail closed
+    A-->>U: compose answer using the delegated tool result
+```
+
+---
+
+## 7. Where it lives (code map)
 
 | Concern | Module(s) |
 |---|---|
@@ -224,11 +276,12 @@ pattern — no token in the browser, only an `HttpOnly` cookie.
 | Retrieval (pluggable, multi + RaaS) | `rag/retriever.py`, `rag/fusion.py`, `rag/qdrant_retriever.py` |
 | Per-chunk authorization (ReBAC) | `auth/openfga.py` |
 | Identity (token + cross-division assertion) | `auth/token_validator.py` |
-| Federation (sign/verify, discover, delegate) | `mesh/agent_identity.py`, `mesh/peer_client.py`, `mesh/discovery.py`, `discovery/` |
+| Federation (sign/verify, discover, delegate) | `mesh/agent_identity.py`, `mesh/peer_client.py` (`call_peer_agent`, `call_peer_tool`), `mesh/discovery.py` (`find_peer_for_capability`), `discovery/` |
+| Governed tools + cross-agent delegation | `tools/mcp.py`, `tools/local_tools.py` (AST-sandboxed `calc`, `units`), `agent/nodes.py` `solve_with_tools`, `api/main.py` `/a2a/tool` |
 | Approvals + offline delivery | `workflow/`, `outcome_store.py` |
 | Transport / mTLS / CRL | `transport/mtls.py`, `scripts/issue_division_certs.py` |
 | Tamper-proof audit | `audit_log.py` |
 | Deployment | `infra/` (Compose IaC), `k8s/` (kustomize) |
 
-Each box above has tests under `agt-federated-rag/tests/` (254 collected); see
+Each box above has tests under `agt-federated-rag/tests/` (344 collected); see
 `PROJECT_STATUS.md` for the requirement→test mapping.

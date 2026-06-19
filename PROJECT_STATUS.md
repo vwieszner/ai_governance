@@ -46,6 +46,43 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
     `GET /health` → **200** with its DID. Fixed two real manifest bugs en route (the distroless
     `openfga` image can't use `sh -c`; a missing `AGENT_SPONSOR_EMAIL`). Per-namespace NetworkPolicy
     isolation (NFR-2). Remaining: a production cluster with a NetworkPolicy-enforcing CNI + HA stores.
+- **Wave 7 (governed cross-agent tool delegation, closed 2026-06-19):** an agent that hits a
+  sub-problem needing a **tool capability it lacks** now discovers the peer that advertises it and
+  delegates the *tool call* over a DID-signed `/a2a/tool` channel; the peer runs **its own** governed
+  tool and returns a signed result.
+  - **In-process governed tool registry** (`tools/local_tools.py`) behind the existing 3-gate MCP
+    executor — `calc` is an **AST-allowlist sandbox** (no `eval`; names/attribute-access/calls outside
+    a fixed grammar rejected) and `units` is a fixed conversion table; both deterministic, no I/O.
+  - **`/a2a/tool` secure channel** (`api/main.py`) — replicates the `/a2a/query` envelope **exactly,
+    in order**: kill-switch → non-finite-number reject → Ed25519 verify + replay guard → trust gate →
+    recipient-bound assertion (`aud`=this DID) → **default-deny policy on the DELEGATED user** →
+    `run_local_tool` → **DID-signed** result (a tool/policy failure returns a signed `status="failed"`,
+    never a 500). Sender `mesh.peer_client.call_peer_tool` reuses the same signing/mTLS/breaker +
+    response-signature-verify path as `call_peer_agent`.
+  - **Capability discovery by tool** (`mesh/discovery.py` `find_peer_for_capability`) reuses
+    discover→negotiate; trust/url/DID come from the operator-curated `peer_trust` anchor (the broker is
+    untrusted). **Orchestration** (`agent/nodes.py` `solve_with_tools`) routes the capability, runs
+    **locally first** when served, else delegates, and **bounds the loop** (`max_tool_delegations`).
+  - **Security invariants preserved:** no raw user token ever forwarded (identity travels as a
+    recipient-bound, short-TTL assertion minted from the per-request claims ContextVar); the peer
+    re-runs its **own** default-deny authorization on the delegated user (delegation never bypasses
+    authz); all responses DID-signed and verified fail-closed; the calc AST allowlist is the sandbox
+    boundary. Every branch audited (`agt_audit=True` → the tamper-evident chain).
+  - **Security review fix — F2 (HIGH availability):** the `/a2a/tool` result was signed inside a
+    try/except but **serialized outside it** — a tool result containing `inf`/`nan` (JSONResponse uses
+    `allow_nan=False`) or an oversized int (CPython's int→str digit limit) raised UNCAUGHT in
+    `render()` → HTTP 500 instead of the contract's signed `status="failed"`. Fixed defence-in-depth:
+    the computed RESULT is now validated (`_result_is_json_safe` — non-finite floats + int bit-length
+    cap) and the final sign+serialize is wrapped, so an unserializable/sign-time failure degrades to a
+    signed failure, never a 500. Regression-tested (`test_a2a_tool.py`: inf/nan/oversized-int via the
+    tool and via a real `pow(2, 50000)` expression). (Separately, the tools-builder bounds pow/exp at
+    the sandbox — two independent guards.)
+  - **Tests:** `tests/test_a2a_tool.py` (19 — 503/422/401-unsigned/403-low-trust/401-wrong-audience/
+    signed-failed-unconfigured/signed-failed-policy-denied/happy-path/oversized-args/no-body-user_id +
+    the F2 unserializable-result cases) and `tests/test_tool_orchestration.py` (18 — local-first,
+    delegate-and-return, degrade paths, cap, router, discovery, and the no-raw-token-on-the-wire
+    invariant), plus the tools-builder's `test_local_tools.py`. Full backend suite **343 passed,
+    1 skipped**; `ruff check` clean.
 
 ---
 
@@ -206,10 +243,13 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
 
 ## Test reality
 
-- Full backend suite: **252 passed, 2 skipped (254 collected)** (was 138/2 at first audit; +114
-  from this session's retriever feature + gap-fix + red-team + hardening regression tests).
-- The 2 skips are honest abstentions: cross-store isolation + admin lifecycle (both need live
-  division stacks).
+- Full backend suite: **343 passed, 1 skipped** (as of 2026-06-19, post Wave-7 cross-agent tool
+  delegation + its F2 security-review fix; was **252 passed, 2 skipped** at the 2026-06-17 audit,
+  itself up from 138/2 at first audit — the growth is this session's retriever feature + gap-fix +
+  red-team + hardening + Wave-7 governed-tool-delegation regression tests).
+- The remaining skip is an honest abstention: `test_scaling.py` — discovery `registry.find()` is an
+  O(N) in-memory scan, not a bounded point read (NFR-6; the bounded lookup is the Redis approval
+  index). The earlier cross-store-isolation / admin-lifecycle skips now run when live stacks exist.
 - UI: vitest unit tests (auth/PKCE/SSE) + Playwright e2e (local / federated / approval-with-tab-open)
   exist and pass per prior runs (not re-run in this audit).
 - **The plan's requirement→test traceability matrix is aspirational, not actual** — roughly ten
