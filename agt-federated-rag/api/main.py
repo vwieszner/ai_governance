@@ -226,6 +226,37 @@ def _has_non_finite_number(obj: Any) -> bool:
     return False
 
 
+# Cap (in bits) on any integer in an OUTBOUND tool result. CPython refuses to str()/json-
+# serialize an int wider than ``sys.get_int_max_str_digits()`` (default 4300 DIGITS ≈ 14284
+# bits) and raises ValueError mid-serialization. We bound by bit_length WELL below that so an
+# oversized result (e.g. pow(2, 50000)) is caught as a clean tool FAILURE before it can blow
+# up json.dumps inside JSONResponse.render() and surface as an uncaught HTTP 500.
+_MAX_RESULT_INT_BITS = 8192
+
+
+def _result_is_json_safe(obj: Any) -> bool:
+    """True if a tool result can be SAFELY serialized by JSONResponse (allow_nan=False).
+
+    Defence-in-depth for the /a2a/tool result path (F2): a governed tool's OUTPUT — not just
+    the request body — must serialize, or json.dumps raises mid-``render()`` (AFTER the handler
+    returns) and the contract's signed status="failed" degrades into an uncaught 500. Rejects:
+      * any non-finite float anywhere (inf/nan — JSONResponse uses allow_nan=False), and
+      * any int wider than ``_MAX_RESULT_INT_BITS`` (CPython's int→str digit limit).
+    Walks dicts/lists recursively. A False result routes through _signed_tool_failure."""
+    if isinstance(obj, bool):
+        return True
+    if isinstance(obj, float):
+        import math
+        return math.isfinite(obj)
+    if isinstance(obj, int):
+        return obj.bit_length() <= _MAX_RESULT_INT_BITS
+    if isinstance(obj, dict):
+        return all(_result_is_json_safe(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return all(_result_is_json_safe(v) for v in obj)
+    return True
+
+
 def _loads_finite(raw: bytes | str) -> Any:
     """json.loads that REFUSES non-finite numbers anywhere in the document.
 
@@ -1331,6 +1362,297 @@ async def a2a_query(request: Request) -> JSONResponse:
     signed_response = await agent_identity.sign_outbound_message(response_payload)
     log.info("a2a_query_responding", task_id=task_id, status=peer_status)
     return JSONResponse(content=signed_response)
+
+
+# ── POST /a2a/tool ─────────────────────────────────────────────────────────────
+
+# Bound the delegated tool ARGUMENTS so an oversized payload can't be smuggled across
+# the channel (DoS / pathological-parse guard). The canonical JSON of the arguments must
+# fit this many bytes; the local tools themselves (calc/units) also bound their own inputs.
+_MAX_TOOL_ARGS_BYTES = 8192
+
+
+@app.post("/a2a/tool")
+async def a2a_tool(request: Request) -> JSONResponse:
+    """Cross-agent GOVERNED TOOL DELEGATION endpoint — DID-authenticated, not user-JWT.
+
+    This is the receiving side of the /a2a/tool channel. A peer that lacks a TOOL
+    capability discovers an agent that advertises it and POSTs a DID-signed delegation
+    here (mesh.peer_client.call_peer_tool). We run OUR OWN governed tool — authorizing
+    the DELEGATED USER for the capability so the peer does NOT bypass authz — and return
+    a DID-SIGNED result. The envelope is IDENTICAL to /a2a/query (so the two channels can
+    never diverge); only the body differs (a tool capability + arguments, not a query).
+
+    Security envelope, in order (each step mirrors the same step in a2a_query):
+      1. kill-switch (FR-4.3) → 503;
+      2. parse JSON; reject non-finite numbers → 422;
+      3. verify the Ed25519 signature (-> signer DID); fail closed → 401;
+      4. registry trust-score gate on the verified signer → 403;
+      5. resolve the signer's bound issuer from the per-DID trust map;
+      6. extract + type/size-validate the tool request (capability OR server+tool, +args);
+      7. derive the user from the RECIPIENT-BOUND signed assertion (aud == self DID) → 401;
+      8. authorize the DELEGATED user for mcp.call (default-deny) THEN run our governed tool;
+      9. audit every received/authorized/executed/denied case (agt_audit=True);
+     10. build {status, result, tool, capability, task_id, _agentmesh} and SIGN it.
+
+    A tool-level failure (unconfigured capability, bad arguments, policy denial) returns a
+    SIGNED ``status="failed"`` result — never a 500 leak — so the caller always gets a
+    verifiable answer it can act on.
+    """
+    # ── Step 1: kill-switch — halt the whole division before any work (503) ──
+    if await _runtime_kill_switch_engaged():
+        log.warning("kill_switch_refused_a2a_tool", agt_audit=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Agent administratively disabled (kill-switch engaged)",
+        )
+
+    # ── Step 2: parse + reject non-finite numbers (never-expiring-assertion guard) ──
+    try:
+        payload: dict[str, Any] = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body must be valid JSON")
+    if _has_non_finite_number(payload):
+        log.warning("a2a_tool_non_finite_number", agt_audit=True)
+        raise HTTPException(status_code=422, detail="Request body contains a non-finite number")
+
+    # ── Step 3: DID authentication — verify the Ed25519 signature on the payload ──
+    sig_verified, signer_did = await agent_identity.verify_signed_message(payload)
+    if not sig_verified or not signer_did:
+        log.warning("a2a_tool_signature_invalid", agt_audit=True)   # M8: forged/unsigned peer msg
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing AgentMesh message signature",
+        )
+
+    # ── Step 4: registry trust-score gate on the verified signer (defence in depth) ──
+    verified, trust_score = await agent_identity.verify_peer_identity(signer_did)
+    if not verified or trust_score < settings.agent_trust_threshold:
+        log.warning(
+            "a2a_tool_peer_identity_rejected",
+            signer_did=signer_did,
+            trust_score=trust_score,
+            agt_audit=True,                                          # M8: rejected peer identity
+        )
+        raise HTTPException(status_code=403, detail="Peer identity verification failed")
+
+    # ── Step 5: resolve the signer's bound issuer for the per-DID assertion binding ──
+    peer_issuer = settings.peer_trust.get(signer_did, {}).get("issuer", "")
+
+    # ── Step 6: extract + validate the delegated TOOL request from the SIGNED payload ──
+    # The caller names a CAPABILITY (e.g. "tool.calc") — resolved to OUR local server here,
+    # never the peer's server name — OR an explicit server+tool pair. Arguments must be a
+    # dict and bounded in size (DoS guard). All type/size failures are 400 (malformed request).
+    from tools.local_tools import (
+        capability_for as _capability_for,
+        server_for_capability as _server_for_capability,
+    )
+    capability = payload.get("capability")
+    server = payload.get("server")
+    tool = payload.get("tool")
+    arguments = payload.get("arguments", {})
+    if not isinstance(arguments, dict):
+        raise HTTPException(status_code=400, detail="'arguments' must be a JSON object")
+    import json
+    try:
+        args_size = len(json.dumps(arguments))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="'arguments' must be JSON-serialisable")
+    if args_size > _MAX_TOOL_ARGS_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'arguments' exceed the maximum size of {_MAX_TOOL_ARGS_BYTES} bytes",
+        )
+    if capability is not None:
+        if not isinstance(capability, str) or not capability.strip():
+            raise HTTPException(status_code=400, detail="'capability' must be a non-empty string")
+        resolved_server = _server_for_capability(capability)
+        if resolved_server is None:
+            # Unconfigured capability → SIGNED "failed", not a 500/raw error (per the contract).
+            log.warning("a2a_tool_unconfigured_capability", signer_did=signer_did,
+                        capability=capability, agt_audit=True)
+            return await _signed_tool_failure(
+                capability=capability, tool=None,
+                reason=f"capability '{capability}' is not served by this agent",
+            )
+        server = resolved_server
+        # The local registry maps a server to exactly one tool of the same domain; pick it.
+        tool = tool if isinstance(tool, str) and tool.strip() else _default_tool_for(server)
+    else:
+        # Explicit server+tool (no capability hint). Both must be non-empty strings.
+        if not (isinstance(server, str) and server.strip()
+                and isinstance(tool, str) and tool.strip()):
+            raise HTTPException(
+                status_code=400,
+                detail="provide a 'capability' OR an explicit 'server'+'tool'",
+            )
+        capability = _capability_for(server)   # may be None for a non-local server (audited)
+
+    # ── Step 7: derive the user from the RECIPIENT-BOUND signed assertion (401 on failure) ──
+    # The user_id comes ONLY from the signed, recipient-bound assertion (aud == self DID),
+    # NEVER an unsigned body field or a raw token — same guarantee as a2a_query.
+    assertion = payload.get("user_assertion")
+    if not isinstance(assertion, dict):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing cross-division user assertion — identity required",
+        )
+    self_did = await agent_identity.get_did()   # the audience the assertion must be bound to
+    try:
+        user_id = validate_cross_division_assertion(
+            assertion,
+            expected_issuer=peer_issuer,
+            expected_audience=self_did,
+        )
+    except Exception as exc:
+        log.warning("a2a_tool_assertion_invalid", error=str(exc), agt_audit=True)  # M8
+        raise HTTPException(status_code=401, detail="Invalid cross-division user assertion")
+
+    task_id = str(uuid.uuid4())
+    source_division = str(payload.get("source_division", "")) or "unknown"
+
+    log.info(
+        "a2a_tool_received",
+        signer_did=signer_did,
+        trust_score=trust_score,
+        user_id=user_id,
+        capability=capability,
+        server=server,
+        tool=tool,
+        source_division=source_division,
+        division_id=settings.division_id,
+    )
+
+    # ── Step 8: GOVERNED EXECUTION — authorize the DELEGATED user, THEN run our tool ──
+    # Default-deny policy gate (the SAME engine call_mcp_tool uses), extended with the
+    # delegated user_id + source_division so the decision is policy-decidable + audited —
+    # the peer cannot bypass OUR authorization by reaching in over /a2a/tool.
+    try:
+        await agent_nodes._enforce(
+            "mcp.call",
+            {
+                "server": server,
+                "tool": tool,
+                "user_id": user_id,
+                "source_division": source_division,
+                "capability": capability,
+            },
+        )
+    except PermissionError as exc:
+        log.warning("a2a_tool_policy_denied", signer_did=signer_did, user_id=user_id,
+                    capability=capability, server=server, tool=tool, error=str(exc),
+                    agt_audit=True)
+        return await _signed_tool_failure(
+            capability=capability, tool=tool, task_id=task_id,
+            reason="policy denied the delegated tool call",
+        )
+
+    # Run OUR governed local tool (which itself re-runs the executor's three gates).
+    from tools.local_tools import run_local_tool
+    try:
+        result = await run_local_tool(server, tool, arguments)
+    except Exception as exc:  # noqa: BLE001 — a tool error must NOT leak as a 500
+        log.warning("a2a_tool_execution_failed", signer_did=signer_did, user_id=user_id,
+                    capability=capability, server=server, tool=tool,
+                    error_type=type(exc).__name__, error=str(exc), agt_audit=True)
+        return await _signed_tool_failure(
+            capability=capability, tool=tool, task_id=task_id,
+            reason="tool execution failed",
+        )
+
+    # ── Step 10: VALIDATE the result, then build + SIGN it ───────────────────
+    # F2 (defence-in-depth): the inbound _has_non_finite_number guard only checks the REQUEST
+    # body — a governed tool can still COMPUTE a value JSONResponse can't serialize (inf/nan
+    # under allow_nan=False, or an int past CPython's str-digit limit). That ValueError would
+    # fire inside render() AFTER this handler returns, defeating the try/except around execution
+    # and surfacing as an uncaught 500 instead of the contract's signed status="failed". So we
+    # reject an unserializable result HERE and route it through the same signed-failure path.
+    if not _result_is_json_safe(result):
+        log.warning("a2a_tool_result_unserializable", signer_did=signer_did, user_id=user_id,
+                    capability=capability, server=server, tool=tool, agt_audit=True)
+        return await _signed_tool_failure(
+            capability=capability, tool=tool, task_id=task_id,
+            reason="tool produced an unserializable result",
+        )
+
+    log.info(
+        "a2a_tool_executed",
+        signer_did=signer_did,
+        user_id=user_id,
+        capability=capability,
+        server=server,
+        tool=tool,
+        source_division=source_division,
+        agt_audit=True,
+    )
+
+    response_obj: dict[str, Any] = {
+        "status": "completed",
+        "result": result,
+        "tool": tool,
+        "capability": capability,
+        "task_id": task_id,
+        "source_division": settings.division_id,
+    }
+    # Belt-and-suspenders: even with the validation above, ANY error while signing or
+    # constructing the response must degrade to a signed failure, never a 500. We pre-render
+    # the JSON here (the SAME json.dumps settings JSONResponse uses) so a serialization error
+    # is caught in THIS try/except rather than later inside Starlette's render().
+    try:
+        signed = await agent_identity.sign_outbound_message(response_obj)
+        import json
+        body = json.dumps(signed, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except Exception as exc:  # noqa: BLE001 — a sign/serialize error must NOT leak as a 500
+        log.warning("a2a_tool_response_build_failed", signer_did=signer_did, user_id=user_id,
+                    capability=capability, tool=tool, error_type=type(exc).__name__,
+                    agt_audit=True)
+        return await _signed_tool_failure(
+            capability=capability, tool=tool, task_id=task_id,
+            reason="failed to build the signed tool result",
+        )
+    log.info("a2a_tool_responding", task_id=task_id, status="completed")
+    return Response(content=body, media_type="application/json")
+
+
+def _default_tool_for(server: str) -> str:
+    """The default tool name a local capability-server exposes (its first registered tool).
+
+    A capability maps to exactly one local server, and each local server exposes one tool of
+    the same domain; this returns that tool when the caller named only the capability. Falls
+    back to the server name's suffix so an unconfigured server still yields a stable string
+    (run_local_tool then fails it CLOSED through the governed executor)."""
+    from tools.local_tools import local_server_configs
+    for cfg in local_server_configs():
+        if cfg.get("name") == server:
+            tools = cfg.get("tools") or []
+            if tools:
+                return str(tools[0])
+    return server.rsplit("-", 1)[-1]
+
+
+async def _signed_tool_failure(
+    *,
+    capability: str | None,
+    tool: str | None,
+    reason: str,
+    task_id: str | None = None,
+) -> JSONResponse:
+    """Build + DID-SIGN a ``status="failed"`` /a2a/tool result (never a 500 leak).
+
+    Every delegated-tool failure (unconfigured capability, policy denial, tool error) is
+    returned to the caller as a SIGNED result it can verify — the reason is a generic,
+    non-leaky string (no stack traces / internal identifiers reach the peer)."""
+    response_obj: dict[str, Any] = {
+        "status": "failed",
+        "result": None,
+        "tool": tool,
+        "capability": capability,
+        "task_id": task_id or str(uuid.uuid4()),
+        "reason": reason,
+        "source_division": settings.division_id,
+    }
+    signed = await agent_identity.sign_outbound_message(response_obj)
+    return JSONResponse(content=signed)
 
 
 # ── POST /tasks/{task_id}/callback ────────────────────────────────────────────

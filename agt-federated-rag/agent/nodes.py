@@ -1171,3 +1171,164 @@ async def format_response(state: AgentState) -> dict[str, Any]:
             final_status = f"{marker} {final_status}"
 
     return {"answer": answer, "status_message": final_status}
+
+
+# ── GOVERNED CROSS-AGENT TOOL DELEGATION (solve_with_tools) ───────────────────
+#
+# When the agent faces a sub-problem needing a TOOL capability, it solves it through the
+# governed tool path: run it LOCALLY if we serve the capability, else DISCOVER a peer that
+# advertises it and DELEGATE the tool call over the DID-signed /a2a/tool channel (the peer
+# runs ITS governed tool, we verify the signed result). Every branch is policy-audited; the
+# delegation count is hard-capped (settings.max_tool_delegations) to stop runaway loops.
+
+# Simple, deterministic capability ROUTER for the demo. PLUGGABLE: replace _route_capability
+# with an LLM tool-router (return the capability string) without touching solve_with_tools.
+# Kept transparent (no model call) so the demo is reproducible and the routing is auditable.
+_CALC_EXPR_RE = re.compile(r"^\s*[-+0-9.\s()*/%^a-z,]+\s*$", re.IGNORECASE)
+_UNITS_RE = re.compile(
+    r"convert\s+(?P<value>-?\d+(?:\.\d+)?)\s*(?P<from>[a-zA-Z]+)\s+to\s+(?P<to>[a-zA-Z]+)",
+    re.IGNORECASE,
+)
+
+
+def _route_capability(problem: str) -> tuple[str, dict] | None:
+    """Map a sub-problem to a (capability, arguments) pair, or None if no tool fits.
+
+    Deterministic demo router:
+      * ``convert <value> <unit> to <unit>``           → ("tool.units", {value, from, to})
+      * a bare arithmetic expression (digits + ops)    → ("tool.calc",  {expression})
+    Returns None when the text matches no tool grammar (the caller then degrades).
+    PLUGGABLE: an LLM tool-router can replace this body; the contract is just the return type.
+    """
+    text = (problem or "").strip()
+    if not text:
+        return None
+    m = _UNITS_RE.search(text)
+    if m:
+        return ("tool.units", {
+            "value": float(m.group("value")),
+            "from": m.group("from"),
+            "to": m.group("to"),
+        })
+    # Arithmetic: only digits/operators/known function letters — no prose. A '^' (common
+    # human power notation) is normalised to Python's '**' for the calc evaluator.
+    if any(ch.isdigit() for ch in text) and _CALC_EXPR_RE.match(text):
+        return ("tool.calc", {"expression": text.replace("^", "**")})
+    return None
+
+
+async def solve_with_tools(
+    problem: str,
+    *,
+    user_id: str,
+    build_assertion=None,
+    max_delegations: int | None = None,
+) -> dict[str, Any]:
+    """Solve a sub-problem with a GOVERNED tool — locally if we serve the capability, else
+    by DELEGATING the tool call to a peer over the DID-signed /a2a/tool channel.
+
+    Args:
+      problem:        the sub-problem text (routed to a capability by _route_capability).
+      user_id:        the authenticated principal the tool runs on behalf of (audited;
+                      the LOCAL path runs under our own authz, the REMOTE path forwards a
+                      recipient-bound assertion the peer re-authorizes).
+      build_assertion: OPTIONAL ``(audience_did) -> dict`` override that mints the
+                      RECIPIENT-BOUND user assertion for a peer. When omitted (the default,
+                      and how the request path uses this), the assertion is minted EXACTLY as
+                      call_peer_agent does: the user's VALIDATED CLAIMS come from the
+                      ``_user_claims_ctx`` ContextVar (set once per request by set_user_claims —
+                      NOT a raw token) and ``peer_client._bind_user_assertion(claims,
+                      audience=peer_did)`` adds aud/iat/exp/jti. An explicit override is used
+                      only by demos/tests; either way it is called ONLY on the remote path and
+                      ONLY with the chosen peer's DID as the audience.
+      max_delegations: cap on cross-agent tool hops (defaults to settings.max_tool_delegations).
+
+    Returns a dict ``{status, result?, capability?, source, reason?}`` where status is
+    "completed" | "failed" | "no_capability" and source ∈ {"local","peer","none"}. NEVER
+    raises for an expected degradation (unknown capability, no peer, delegation cap, peer
+    failure) — those return a structured failure the caller can surface.
+    """
+    cap_route = _route_capability(problem)
+    if cap_route is None:
+        log.info("solve_with_tools_no_capability", user_id=user_id, agt_audit=True)
+        return {"status": "no_capability", "source": "none",
+                "reason": "no tool capability matches this sub-problem"}
+    capability, arguments = cap_route
+
+    # ── LOCAL FIRST: if we serve the capability, run it through our governed executor ──
+    from tools.local_tools import run_local_tool, server_for_capability
+    local_server = server_for_capability(capability)
+    if local_server is not None:
+        from tools.local_tools import local_server_configs
+        tool = capability.split(".", 1)[-1]
+        for cfg in local_server_configs():
+            if cfg.get("name") == local_server and (cfg.get("tools") or []):
+                tool = str(cfg["tools"][0])
+                break
+        try:
+            result = await run_local_tool(local_server, tool, arguments)
+        except Exception as exc:  # noqa: BLE001 — a local tool error degrades, never crashes
+            log.warning("solve_with_tools_local_failed", user_id=user_id, capability=capability,
+                        error=str(exc), agt_audit=True)
+            return {"status": "failed", "source": "local", "capability": capability,
+                    "reason": "local tool execution failed"}
+        log.info("solve_with_tools_local_executed", user_id=user_id, capability=capability,
+                 server=local_server, tool=tool, agt_audit=True)
+        return {"status": "completed", "source": "local", "capability": capability,
+                "result": result}
+
+    # ── REMOTE: discover a peer that advertises the capability and delegate the tool call ──
+    if not settings.tool_delegation_enabled:
+        log.info("solve_with_tools_delegation_disabled", user_id=user_id, capability=capability,
+                 agt_audit=True)
+        return {"status": "no_capability", "source": "none", "capability": capability,
+                "reason": "no local tool serves this capability and delegation is disabled"}
+
+    cap_limit = settings.max_tool_delegations if max_delegations is None else max_delegations
+    if cap_limit <= 0:
+        log.warning("solve_with_tools_delegation_cap_reached", user_id=user_id,
+                    capability=capability, agt_audit=True)
+        return {"status": "failed", "source": "none", "capability": capability,
+                "reason": "tool delegation cap reached"}
+
+    from mesh.discovery import find_peer_for_capability
+    peer = await find_peer_for_capability(capability)
+    if peer is None:
+        log.info("solve_with_tools_no_peer", user_id=user_id, capability=capability,
+                 agt_audit=True)
+        return {"status": "no_capability", "source": "none", "capability": capability,
+                "reason": f"no agent can serve capability {capability}"}
+
+    # Mint the RECIPIENT-BOUND user assertion for THIS peer (aud = peer.agent_did) using the
+    # SAME builder the query path uses — never a raw token on the wire. Default path: the
+    # user's VALIDATED claims come from the per-request _user_claims_ctx ContextVar (set by
+    # set_user_claims, not a token) and _bind_user_assertion adds aud/iat/exp/jti, exactly as
+    # call_peer_agent does. An explicit build_assertion override (demos/tests) wins if given.
+    from mesh.peer_client import _bind_user_assertion, call_peer_tool
+    if build_assertion is not None:
+        user_assertion = build_assertion(peer.agent_did)
+    else:
+        user_assertion = _bind_user_assertion(_user_claims_ctx.get(), audience=peer.agent_did)
+    log.info("solve_with_tools_delegating", user_id=user_id, capability=capability,
+             peer_did=peer.agent_did, division=peer.division_id, agt_audit=True)
+    try:
+        resp = await call_peer_tool(
+            peer.agent_url,
+            peer.agent_did,
+            capability,
+            arguments,
+            user_assertion=user_assertion,
+            source_division=settings.division_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — a delegation failure degrades, never crashes
+        log.warning("solve_with_tools_delegation_failed", user_id=user_id, capability=capability,
+                    peer_did=peer.agent_did, error_type=type(exc).__name__, agt_audit=True)
+        return {"status": "failed", "source": "peer", "capability": capability,
+                "peer_did": peer.agent_did, "reason": "peer tool delegation failed"}
+
+    log.info("solve_with_tools_delegated", user_id=user_id, capability=capability,
+             peer_did=peer.agent_did, status=resp.status, agt_audit=True)
+    return {"status": "completed" if resp.status == "completed" else "failed",
+            "source": "peer", "capability": capability, "peer_did": peer.agent_did,
+            "result": resp.result, "reason": None if resp.status == "completed"
+            else "peer reported tool failure"}

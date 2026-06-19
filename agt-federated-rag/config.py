@@ -251,6 +251,22 @@ class Settings(BaseSettings):
     # service credential with agent-side ReBAC mediation.
     mcp_servers: str = ""
 
+    # ── Cross-agent tool delegation (/a2a/tool) ──────────────────────────────
+    # When an agent faces a sub-problem needing a TOOL capability it lacks, it can
+    # discover a peer advertising that capability and securely delegate the TOOL CALL
+    # over the DID-signed /a2a/tool channel (the peer runs ITS governed tool and returns
+    # a DID-signed result). This mirrors the /a2a/query envelope exactly (signature →
+    # trust → recipient-bound assertion → policy → governed execution → signed reply).
+    #   * tool_delegation_enabled — master switch for the orchestrator's delegate branch.
+    #     When False, solve_with_tools never reaches across the mesh: a missing-local
+    #     capability degrades gracefully instead of delegating. The /a2a/tool RECEIVE
+    #     endpoint is governed independently (signature + policy) and is not gated by this.
+    #   * max_tool_delegations — hard cap on cross-agent tool hops per solve_with_tools
+    #     call (runaway / delegation-loop guard, ASI-07/ASI-08 spirit). Each delegated tool
+    #     call counts once; exceeding the cap degrades gracefully (no further delegation).
+    tool_delegation_enabled: bool = True
+    max_tool_delegations: int = 3
+
     # ── AGT Policy Engine (Agent OS) ─────────────────────────────────────────
     # Path to YAML policy directory (loaded at startup).
     policy_dir: str = "agent/policies"

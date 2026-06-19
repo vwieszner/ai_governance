@@ -62,9 +62,24 @@ def discovery_url() -> str | None:
 
 
 def advertised_capabilities() -> list[str]:
-    """Capabilities this agent advertises to the broker (AGENT_CAPABILITIES env, CSV)."""
+    """Capabilities this agent advertises to the broker (AGENT_CAPABILITIES env, CSV) PLUS
+    every LOCAL tool capability (from local_server_configs, e.g. "tool.calc"/"tool.units").
+
+    So a peer can discover us by a TOOL capability over the /a2a/tool channel without an
+    operator having to hand-list each tool in AGENT_CAPABILITIES — the in-process tool
+    registry is the source of truth for what tools we can serve. Order-stable + de-duplicated
+    (env-declared first, then any local tool capability not already present)."""
     raw = (os.environ.get(_CAPABILITIES_ENV) or "").strip()
-    return [c.strip() for c in raw.split(",") if c.strip()]
+    caps = [c.strip() for c in raw.split(",") if c.strip()]
+    try:
+        from tools.local_tools import local_server_configs
+        for cfg in local_server_configs():
+            cap = cfg.get("capability")
+            if cap and cap not in caps:
+                caps.append(cap)
+    except Exception as exc:  # noqa: BLE001 — advertising local tools must never block registration
+        log.debug("tool_capability_advertise_skipped", error=str(exc))
+    return caps
 
 
 # Lightweight keyword → capability map for deriving a query's capability when the
@@ -230,3 +245,75 @@ async def resolve_delegation_target(query: str, capability: str | None = None) -
     # Found peers but none trusted/negotiable → fall back to the configured peer.
     log.info("discovery_no_trusted_negotiable_peer_fallback", capability=cap, count=len(peers))
     return _configured_target(cap, candidates=peers)
+
+
+@dataclass
+class ToolPeer:
+    """A discovered peer that advertises (and negotiated) a TOOL capability.
+
+    Carries exactly what mesh.peer_client.call_peer_tool needs to delegate: the peer's
+    DATA-PATH agent_url + DID (both from the operator-curated peer_trust anchor, NOT the
+    open broker), plus the division for audit/observability."""
+    agent_url: str
+    agent_did: str
+    division_id: str
+    capability: str
+
+
+async def find_peer_for_capability(capability: str) -> ToolPeer | None:
+    """Discover a TRUSTED peer that advertises a given TOOL capability (e.g. "tool.calc").
+
+    Mirrors resolve_delegation_target's discover → negotiate flow but for the cross-agent
+    TOOL channel: it asks the broker for peers advertising ``capability``, keeps only those
+    whose DID is in this division's DATA-PATH trust anchor (settings.peer_trust), confirms
+    the capability via the lightweight negotiate ("can you help with <capability>?"), and
+    resolves the WINNER's agent_url + division from the trust anchor (never the broker — a
+    rogue broker entry can't steer where we actually send). Returns a ToolPeer, or None.
+
+    GRACEFUL DEGRADATION (same posture as the query path): no broker configured, broker
+    unreachable, broker returns nothing, or no trusted+negotiable peer → None, so the caller
+    (solve_with_tools) degrades cleanly ("no agent can serve capability X") instead of crashing.
+    NEVER raises.
+    """
+    if not capability or not capability.strip():
+        return None
+    url = discovery_url()
+    if not url:
+        log.debug("tool_discovery_disabled", capability=capability)
+        return None
+
+    await _ensure_registered(url)
+
+    try:
+        peers = await _discover_peers(url, capability=capability)
+    except Exception as exc:  # noqa: BLE001 — broker down → graceful None
+        log.warning("tool_discovery_lookup_failed", url=url, capability=capability, error=str(exc))
+        return None
+
+    for peer in peers or []:
+        if not _trusted(peer):
+            log.info("tool_discovery_skip_untrusted_peer", peer_did=peer.get("agent_did"))
+            continue
+        if not await _negotiate(peer, capability):
+            continue
+        # Take agent_url + division from the operator-curated trust anchor keyed on the
+        # (now trust-verified) DID — the broker only says WHICH trusted DID claims the
+        # capability, the anchor says WHERE it lives (defence-in-depth A1c/A4, as above).
+        did = str(peer.get("agent_did") or "")
+        anchor = settings.peer_trust.get(did) or {}
+        agent_url = str(anchor.get("agent_url") or "").rstrip("/")
+        if not agent_url:
+            log.info("tool_discovery_peer_has_no_anchor_url", peer_did=did, capability=capability)
+            continue
+        target = ToolPeer(
+            agent_url=agent_url,
+            agent_did=did,
+            division_id=str(anchor.get("division_id") or ""),
+            capability=capability,
+        )
+        log.info("tool_discovery_peer_selected", peer_did=did, division=target.division_id,
+                 capability=capability, agt_audit=True)
+        return target
+
+    log.info("tool_discovery_no_capable_peer", capability=capability)
+    return None

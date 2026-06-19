@@ -86,6 +86,9 @@ from agent.nodes import (
     set_user_claims,
     start_approval,
 )
+# Re-export the standalone cross-agent tool-delegation entry point so callers can reach it
+# via the graph module (it is NOT a compiled graph node — it does not alter the RAG flow).
+from agent.nodes import solve_with_tools as solve_with_tools
 from agent.state import AgentState, FlowDecision
 from config import settings
 from mesh.agent_identity import govern_action

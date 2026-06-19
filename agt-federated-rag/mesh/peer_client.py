@@ -51,6 +51,10 @@ log = structlog.get_logger(__name__)
 
 # Path on the peer cluster that receives DID-signed federation queries.
 _PEER_QUERY_PATH = "/a2a/query"
+# Path on the peer cluster that receives DID-signed delegated TOOL calls. The peer
+# runs ITS OWN governed tool (policy gate + authorize the delegated user) and returns
+# a DID-signed result. Same security envelope as _PEER_QUERY_PATH; different payload.
+_PEER_TOOL_PATH = "/a2a/tool"
 
 # FR-3.6: lifetime of the recipient-bound user assertion. The assertion travels
 # inside the DID-signed, replay-protected envelope, so this short window is a
@@ -103,6 +107,16 @@ class PeerResponse:
     trust_score: float
 
 
+@dataclass
+class PeerToolResponse:
+    """Normalised response from a delegated cross-agent TOOL call (/a2a/tool)."""
+    status: str            # "completed" | "failed"
+    result: Any            # the peer tool's signed result payload (or None on failure)
+    task_id: str
+    peer_did: str
+    trust_score: float
+
+
 async def get_peer_circuit_state(peer_url: str | None = None) -> CircuitState:
     """Return the circuit-breaker state for the configured (or given) peer."""
     url = peer_url or str(settings.peer_agent_url or "")
@@ -141,6 +155,112 @@ def _bind_user_assertion(claims: dict, *, audience: str) -> dict:
     return bound
 
 
+async def _deliver_signed_payload(
+    *,
+    peer_url: str,
+    peer_did: str,
+    payload: dict[str, Any],
+    govern_action_name: str,
+    govern_context: dict[str, Any],
+    endpoint_path: str,
+) -> dict[str, Any]:
+    """Shared cross-agent send+verify path for BOTH /a2a/query and /a2a/tool.
+
+    Replicates the security controls in mesh.peer_client's module docstring, in order,
+    for ANY signed peer payload so the two channels can never diverge in their envelope:
+
+      1. verify the peer DID + trust score against the AgentMesh registry (fail closed);
+      2. circuit breaker — fail fast if OPEN (ASI-08);
+      3. AGT governance gate for the outbound action (``govern_action_name``);
+      4. sign the outbound message with this agent's DID credentials;
+      5. real HTTP POST of the signed message to ``endpoint_path``, presenting this
+         division's client cert when mTLS is enabled (same transport.mtls context);
+      6. verify the peer's Ed25519 signature on the response (signer == peer_did) — fail
+         closed otherwise — and record success/failure in the TrustTracker + breaker.
+
+    Returns the signature-VERIFIED response dict. Raises AgentMeshError / the original
+    transport exception on any failure (every failure also trips the breaker + trust event),
+    exactly as call_peer_agent did inline before this extraction.
+    """
+    # ── Step 1: verify peer DID + trust score against the AgentMesh registry ──
+    verified, trust_score = await verify_peer_identity(peer_did)
+    if not verified:
+        log.error("peer_did_not_verified", peer_did=peer_did)
+        raise AgentMeshError(f"Peer DID '{peer_did}' could not be verified")
+    if trust_score < settings.agent_trust_threshold:
+        log.error(
+            "peer_trust_below_threshold",
+            peer_did=peer_did,
+            trust_score=trust_score,
+            threshold=settings.agent_trust_threshold,
+        )
+        raise AgentMeshError(
+            f"Peer trust score {trust_score:.2f} is below threshold "
+            f"{settings.agent_trust_threshold}"
+        )
+
+    # ── Step 2: circuit breaker — fail fast if open ──────────────────────────
+    cb = await _get_circuit_breaker(peer_url)
+    if cb.get_state() == CircuitState.OPEN:
+        log.warning("peer_circuit_open", peer_url=peer_url)
+        raise RuntimeError(f"Circuit breaker OPEN for peer {peer_url} — call rejected")
+
+    # ── Step 3: AGT governance gate for the outbound peer message ────────────
+    gov = await govern_action(govern_action_name, {**govern_context,
+                                                   "peer_did": peer_did,
+                                                   "peer_trust_score": trust_score})
+    if not gov.allowed:
+        log.warning("peer_send_governance_denied", action=govern_action_name,
+                    peer_did=peer_did, decision=gov.decision)
+        raise AgentMeshError(f"Governance denied {govern_action_name}: {gov.decision}")
+
+    # ── Step 4: sign the outbound message ────────────────────────────────────
+    signed_payload = await sign_outbound_message(payload)
+    endpoint = peer_url.rstrip("/") + endpoint_path
+    log.info("peer_call_sending", peer_url=endpoint, peer_did=peer_did, trust_score=trust_score)
+
+    # ── Step 5: real HTTP POST of the DID-signed message to the peer ─────────
+    # M7: present this division's client cert on the outbound call when mTLS is enabled.
+    from transport.mtls import peer_tls_context
+    _tls = peer_tls_context(settings)
+    try:
+        async with httpx.AsyncClient(
+            timeout=_PEER_HTTP_TIMEOUT,
+            verify=_tls if _tls is not None else True,
+        ) as client:
+            http_response = await client.post(endpoint, json=signed_payload)
+        http_response.raise_for_status()
+        response = http_response.json()
+    except httpx.HTTPStatusError as exc:
+        cb.record_failure()
+        log.error("peer_http_error", status_code=exc.response.status_code, error=str(exc))
+        await report_trust_event(peer_did, "iatp_error", {"status": exc.response.status_code})
+        raise AgentMeshError(f"Peer returned HTTP {exc.response.status_code}") from exc
+    except Exception as exc:  # noqa: BLE001 — any transport failure trips the breaker
+        cb.record_failure()
+        log.error("peer_call_failed", error_type=type(exc).__name__, error=repr(exc))
+        await report_trust_event(peer_did, "call_failure", {"error": type(exc).__name__})
+        raise
+
+    # ── Step 6: verify the peer's signature on the response (fail closed) ─────
+    if not isinstance(response, dict):
+        cb.record_failure()
+        await report_trust_event(peer_did, "unexpected_payload", {})
+        raise AgentMeshError("Peer response was not a JSON object")
+
+    resp_verified, resp_signer = await verify_signed_message(response)
+    if not resp_verified or resp_signer != peer_did:
+        cb.record_failure()
+        log.error("peer_response_signature_invalid", peer_did=peer_did, signer=resp_signer)
+        await report_trust_event(peer_did, "policy_violation", {"reason": "bad_response_signature"})
+        raise AgentMeshError("Peer response signature could not be verified")
+
+    cb.record_success()
+    await report_trust_event(peer_did, "call_success", {})
+    response["_trust_score"] = trust_score   # surface the gated trust score to the caller
+    return response
+
+
 async def call_peer_agent(
     query: str,
     user_id: str,
@@ -170,44 +290,9 @@ async def call_peer_agent(
     if not peer_did:
         raise ValueError("PEER_AGENT_DID not configured — cannot verify peer identity")
 
-    # ── Step 1: verify peer DID + trust score against the AgentMesh registry ──
-    verified, trust_score = await verify_peer_identity(peer_did)
-    if not verified:
-        log.error("peer_did_not_verified", peer_did=peer_did)
-        raise AgentMeshError(f"Peer DID '{peer_did}' could not be verified")
-    if trust_score < settings.agent_trust_threshold:
-        log.error(
-            "peer_trust_below_threshold",
-            peer_did=peer_did,
-            trust_score=trust_score,
-            threshold=settings.agent_trust_threshold,
-        )
-        raise AgentMeshError(
-            f"Peer trust score {trust_score:.2f} is below threshold "
-            f"{settings.agent_trust_threshold}"
-        )
-
-    # ── Step 2: circuit breaker — fail fast if open ──────────────────────────
-    cb = await _get_circuit_breaker(peer_url)
-    if cb.get_state() == CircuitState.OPEN:
-        log.warning("peer_circuit_open", peer_url=peer_url)
-        raise RuntimeError(f"Circuit breaker OPEN for peer {peer_url} — call rejected")
-
-    # ── Step 3: AGT governance gate for the outbound peer message ────────────
-    gov = await govern_action(
-        "peer.send_message",
-        {
-            "user_id": user_id,
-            "peer_did": peer_did,
-            "peer_trust_score": trust_score,
-            "transport": "iatp",
-        },
-    )
-    if not gov.allowed:
-        log.warning("peer_send_governance_denied", peer_did=peer_did, decision=gov.decision)
-        raise AgentMeshError(f"Governance denied peer.send_message: {gov.decision}")
-
-    # ── Step 4: build + sign the outbound message ────────────────────────────
+    # Build the outbound query payload. Authenticity/freshness/trust + the response
+    # signature check are handled uniformly by _deliver_signed_payload (which mirrors
+    # the security envelope for BOTH /a2a/query and /a2a/tool — see its docstring).
     payload: dict[str, Any] = {
         "query": query,
         # M2: user_id is now diagnostic only — the receiver derives the authoritative
@@ -231,66 +316,77 @@ async def call_peer_agent(
         # restarting its approval workflow (no duplicate owner notifications per poll).
         "check_only": check_only,
     }
-    signed_payload = await sign_outbound_message(payload)
 
-    endpoint = peer_url.rstrip("/") + _PEER_QUERY_PATH
-    log.info("peer_call_sending", peer_url=endpoint, peer_did=peer_did, trust_score=trust_score)
+    response = await _deliver_signed_payload(
+        peer_url=peer_url,
+        peer_did=peer_did,
+        payload=payload,
+        govern_action_name="peer.send_message",
+        govern_context={"user_id": user_id, "transport": "iatp"},
+        endpoint_path=_PEER_QUERY_PATH,
+    )
 
-    # ── Step 5: real HTTP POST of the DID-signed message to the peer ─────────
-    # AgentMesh provides the security envelope (DID + Ed25519 signature); HTTP is
-    # the wire. The peer authenticates the call by verifying that signature.
-    # M7: present this division's client cert on the outbound call when mTLS is enabled,
-    # so the peer's CERT_REQUIRED server accepts us; None → plain HTTP (the demo posture).
-    from transport.mtls import peer_tls_context
-    _tls = peer_tls_context(settings)
-    try:
-        async with httpx.AsyncClient(
-            timeout=_PEER_HTTP_TIMEOUT,
-            verify=_tls if _tls is not None else True,
-        ) as client:
-            http_response = await client.post(endpoint, json=signed_payload)
-        http_response.raise_for_status()
-        response = http_response.json()
-    except httpx.HTTPStatusError as exc:
-        # Non-2xx from the peer (401 unverified signature, 403 governance, 5xx).
-        cb.record_failure()
-        log.error("peer_http_error", status_code=exc.response.status_code, error=str(exc))
-        await report_trust_event(peer_did, "iatp_error", {"status": exc.response.status_code})
-        raise AgentMeshError(
-            f"Peer returned HTTP {exc.response.status_code}"
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 — any transport failure trips the breaker
-        cb.record_failure()
-        # str() on httpx.ReadTimeout/ConnectTimeout is empty — log the exception
-        # type so a timeout is distinguishable from a connection refusal etc.
-        log.error("peer_call_failed", error_type=type(exc).__name__, error=repr(exc))
-        await report_trust_event(peer_did, "call_failure", {"error": type(exc).__name__})
-        raise
-
-    # ── Step 6: verify the peer's signature on the response (fail closed) ─────
-    # A valid HTTP 200 is not enough — the response body must carry the peer's
-    # Ed25519 signature, verified against the configured peer public key. This
-    # closes the loop: both directions of the exchange are DID-authenticated.
-    if not isinstance(response, dict):
-        cb.record_failure()
-        await report_trust_event(peer_did, "unexpected_payload", {})
-        raise AgentMeshError("Peer response was not a JSON object")
-
-    resp_verified, resp_signer = await verify_signed_message(response)
-    if not resp_verified or resp_signer != peer_did:
-        cb.record_failure()
-        log.error("peer_response_signature_invalid", peer_did=peer_did, signer=resp_signer)
-        await report_trust_event(peer_did, "policy_violation", {"reason": "bad_response_signature"})
-        raise AgentMeshError("Peer response signature could not be verified")
-
-    cb.record_success()
-    await report_trust_event(peer_did, "call_success", {})
-
-    log.info("peer_call_success", peer_url=endpoint, status=response.get("status"))
+    log.info("peer_call_success", peer_did=peer_did, status=response.get("status"))
     return PeerResponse(
         status=str(response.get("status", "unknown")),
         answer=response.get("answer"),
         task_id=str(response.get("task_id", "")),
         peer_did=peer_did,
-        trust_score=trust_score,
+        trust_score=float(response.get("_trust_score", 0.0)),
+    )
+
+
+async def call_peer_tool(
+    peer_url: str,
+    peer_did: str,
+    capability: str,
+    arguments: dict,
+    *,
+    user_assertion: dict,
+    source_division: str,
+    context_id: str | None = None,
+) -> PeerToolResponse:
+    """Delegate a single governed TOOL CALL to a peer over the DID-signed /a2a/tool channel.
+
+    The peer runs ITS OWN governed tool (policy gate + authorizes the delegated user) and
+    returns a DID-signed result. This is the SEND side; it mirrors call_peer_agent's send
+    path exactly via the shared _deliver_signed_payload helper (peer DID + trust verify →
+    circuit breaker → governance gate → sign → POST → verify response signature, fail closed).
+
+    The delegated user's identity travels ONLY as ``user_assertion`` — the same
+    RECIPIENT-BOUND, time-limited CLAIMS assertion call_peer_agent forwards (built by the
+    orchestrator via _bind_user_assertion / mint_user_assertion with aud = this peer's DID).
+    NO raw bearer token is ever placed on the wire, so a compromised peer gets no credential
+    to replay, and the aud binding stops it re-presenting the assertion to a third division.
+    """
+    payload: dict[str, Any] = {
+        # The capability the peer must serve (e.g. "tool.calc"); the peer resolves it to its
+        # own local server via server_for_capability — we never name the peer's server/tool.
+        "capability": capability,
+        "arguments": arguments,
+        # FR-3.6: recipient-bound, time-limited user CLAIMS — never a raw token (see docstring).
+        "user_assertion": user_assertion,
+        "context_id": context_id or str(uuid.uuid4()),
+        "source_cluster": settings.cluster_id,
+        # M0 tenancy: the originating division, signed in the envelope for the peer's audit.
+        "source_division": source_division,
+    }
+
+    response = await _deliver_signed_payload(
+        peer_url=peer_url,
+        peer_did=peer_did,
+        payload=payload,
+        govern_action_name="peer.send_message",
+        govern_context={"transport": "iatp", "capability": capability},
+        endpoint_path=_PEER_TOOL_PATH,
+    )
+
+    status = str(response.get("status", "unknown"))
+    log.info("peer_tool_call_success", peer_did=peer_did, capability=capability, status=status)
+    return PeerToolResponse(
+        status=status,
+        result=response.get("result"),
+        task_id=str(response.get("task_id", "")),
+        peer_did=peer_did,
+        trust_score=float(response.get("_trust_score", 0.0)),
     )
