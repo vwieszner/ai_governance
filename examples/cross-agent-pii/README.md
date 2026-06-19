@@ -18,17 +18,21 @@ governed tools. When it needs a capability it does not own, it **delegates** the
 tool call to the department that does, over the DID-signed `/a2a/tool` channel. Delegation
 is **bidirectional**: each department both serves tools to peers and consumes peers' tools.
 
-The two departments wired on the `kind-agt` cluster:
+The three departments wired on the `kind-agt` cluster — each owns a **distinct** tool and
+delegates the ones it lacks, so the routing is a full **N-way mesh**:
 
 | Department | Role | Owns (data) | Serves (`AGT_LOCAL_TOOLS`) | Delegates out (`PEER_TOOL_MAP`) |
 |---|---|---|---|---|
-| **gamma** | Security / Legal | its own Qdrant + OpenFGA | `tool.pii`, `tool.compliance` | `tool.risk`→delta, `tool.classify`→delta |
-| **delta** | Risk / Data-Gov | its own Qdrant + OpenFGA | `tool.risk`, `tool.classify` | `tool.pii`→gamma, `tool.compliance`→gamma |
+| **gamma** | Security / Legal | its own Qdrant + OpenFGA | `tool.pii`, `tool.compliance` | `tool.risk`/`tool.classify`→delta, `tool.fincheck`→epsilon |
+| **delta** | Risk / Data-Gov | its own Qdrant + OpenFGA | `tool.risk`, `tool.classify` | `tool.pii`/`tool.compliance`→gamma, `tool.fincheck`→epsilon |
+| **epsilon** | Finance | its own Qdrant + OpenFGA | `tool.fincheck` | `tool.pii`/`tool.compliance`→gamma, `tool.risk`/`tool.classify`→delta |
 
-So **delta can use gamma's PII screen** *and* **gamma can use delta's risk classifier** —
-real two-way collaboration, each under the callee's governance, each keeping its own data.
+So **delta uses gamma's PII screen**, **gamma uses delta's risk classifier**, and **both use
+epsilon's financial check** — real N-way collaboration, each call under the callee's
+governance, each department keeping its own data. Adding a department extends the mesh
+automatically (see extension point 3).
 
-The four governed tools (all real, deterministic, dependency-light — in
+The governed tools (all real, deterministic, dependency-light — in
 `agt-federated-rag/tools/local_tools.py`):
 
 | Capability | What it does | Arguments |
@@ -37,6 +41,7 @@ The four governed tools (all real, deterministic, dependency-light — in
 | `tool.compliance` | EU AI Act / GDPR obligation lookup by topic | `{"topic": str}` |
 | `tool.risk` | EU AI Act risk-tier classifier (unacceptable/high/limited/minimal) + obligations | `{"description": str}` |
 | `tool.classify` | Data classification / sensitivity labelling + handling guidance | `{"text": str}` |
+| `tool.fincheck` | Finance / AML transaction screen: sanctions watchlist + disclosure threshold + risk tier (Finance department) | `{"amount": number, "currency": str, "counterparty": str}` |
 
 ### The three wiring knobs
 
@@ -63,23 +68,25 @@ Prereqs: a cluster context (`kind create cluster --name agt`), the agent image b
 loaded, and `./.env` with `NVIDIA_API_KEY`. From the repo root:
 
 ```bash
-# Bring up BOTH departments AND wire the whole cross-department tool mesh in one shot.
+# Bring up ALL THREE departments AND wire the whole cross-department tool mesh in one shot.
 # After the DIDs exist, --federate patches each department's ConfigMap with PEER_TRUST_MAP
 # + an auto-derived PEER_TOOL_MAP (every capability a department lacks -> the peer DID that
 # serves it) + AGT_LOCAL_TOOLS from the manifests, then restarts the agents.
-python scripts/bootstrap_k8s.py --divisions gamma,delta --federate --context kind-agt
+python scripts/bootstrap_k8s.py --divisions gamma,delta,epsilon --federate --context kind-agt
 ```
 
-Confirm the bidirectional mesh landed:
+Confirm the N-way mesh landed (each department serves its own tools, routes the rest):
 
 ```bash
-kubectl -n agt-div-gamma get configmap agent-config -o jsonpath='{.data.AGT_LOCAL_TOOLS}'  # tool.pii,tool.compliance
-kubectl -n agt-div-gamma get configmap agent-config -o jsonpath='{.data.PEER_TOOL_MAP}'    # {"tool.risk":"did:mesh:<delta>","tool.classify":"did:mesh:<delta>"}
-kubectl -n agt-div-delta get configmap agent-config -o jsonpath='{.data.AGT_LOCAL_TOOLS}'  # tool.risk,tool.classify
-kubectl -n agt-div-delta get configmap agent-config -o jsonpath='{.data.PEER_TOOL_MAP}'    # {"tool.pii":"did:mesh:<gamma>","tool.compliance":"did:mesh:<gamma>"}
+kubectl -n agt-div-gamma   get configmap agent-config -o jsonpath='{.data.AGT_LOCAL_TOOLS}'  # tool.pii,tool.compliance
+kubectl -n agt-div-gamma   get configmap agent-config -o jsonpath='{.data.PEER_TOOL_MAP}'    # {"tool.risk":"<delta>","tool.classify":"<delta>","tool.fincheck":"<epsilon>"}
+kubectl -n agt-div-delta   get configmap agent-config -o jsonpath='{.data.AGT_LOCAL_TOOLS}'  # tool.risk,tool.classify
+kubectl -n agt-div-delta   get configmap agent-config -o jsonpath='{.data.PEER_TOOL_MAP}'    # {"tool.pii":"<gamma>","tool.compliance":"<gamma>","tool.fincheck":"<epsilon>"}
+kubectl -n agt-div-epsilon get configmap agent-config -o jsonpath='{.data.AGT_LOCAL_TOOLS}'  # tool.fincheck
+kubectl -n agt-div-epsilon get configmap agent-config -o jsonpath='{.data.PEER_TOOL_MAP}'    # {"tool.pii":"<gamma>","tool.compliance":"<gamma>","tool.risk":"<delta>","tool.classify":"<delta>"}
 ```
 
-### Drive `POST /solve` — both directions
+### Drive `POST /solve` — any direction
 
 `/solve` is the **user trigger** for the governed tool path. It needs a Bearer JWT (same
 validation as `/query`); mint one from the **calling** department's Keycloak.
@@ -109,6 +116,13 @@ curl -s http://localhost:9200/solve -H "Authorization: Bearer $GAMMA_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"capability":"tool.risk","arguments":{"description":"Real-time CV screening for hiring decisions."}}' | jq
 #   -> {"status":"completed","source":"peer","capability":"tool.risk","peer_did":"did:mesh:<delta>","result":{"tier":"high",...}}
+
+# C) delta delegates a FINANCE/AML check to epsilon (the third department) ----------------
+curl -s http://localhost:9300/solve -H "Authorization: Bearer $DELTA_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"capability":"tool.fincheck","arguments":{"amount":50000,"currency":"USD","counterparty":"Acme Holdings"}}' | jq
+#   -> {"status":"completed","source":"peer","capability":"tool.fincheck","peer_did":"did:mesh:<epsilon>","result":{"disclosure_required":true,"risk":"medium",...}}
+# (epsilon serves tool.fincheck LOCALLY; the same call against epsilon's own agent returns source:"local".)
 ```
 
 `source:"peer"` + `peer_did` proves the cross-department delegation; a tool the department
@@ -225,28 +239,45 @@ per-chunk governance.
 
 A new department = a new manifest + overlay (copy an existing one). It gets its **own**
 Qdrant / OpenFGA / Keycloak / Temporal / Redis / DID and its **own** data — the isolation
-boundary is a dedicated Namespace + default-deny NetworkPolicy.
+boundary is a dedicated Namespace + default-deny NetworkPolicy. **Worked example: the Finance
+department `epsilon`** (added exactly this way — `infra/divisions/epsilon.yml` +
+`k8s/overlays/epsilon/`).
 
-1. **Manifest** — `infra/divisions/epsilon.yml` (copy `delta.yml`): set `division_id`,
-   `display_name`, a clean `port_base` (see `onboard_division._reserved_ports`), its
-   `docs_dir` (its own corpus), its `local_tools` (the tools it owns), and `trusted_peers`
-   (the departments it collaborates with, both ways).
+1. **Manifest** — `infra/divisions/epsilon.yml` (copied from `delta.yml`):
+   ```yaml
+   division_id: epsilon
+   display_name: Division Epsilon (Finance)
+   port_base: 9400                 # clean band above delta's 9300 (see onboard_division._reserved_ports)
+   trusted_peers: [gamma, delta]   # the departments it collaborates with, both ways
+   docs_dir: tests/docs/cluster-b
+   residency_mode: external
+   seed_viewer: q4_financial_results
+   local_tools: [tool.fincheck]    # the DISTINCT tool this department owns
+   ```
 
-2. **k8s overlay** — copy `k8s/overlays/delta/` to `k8s/overlays/epsilon/`: set
+2. **Make peers trust it both ways** — add `epsilon` to the existing departments'
+   `trusted_peers` so federation wires the routes in both directions:
+   `gamma.yml → [alpha, beta, delta, epsilon]`, `delta.yml → [gamma, epsilon]`.
+
+3. **k8s overlay** — copy `k8s/overlays/delta/` to `k8s/overlays/epsilon/`: set
    `namespace: agt-div-epsilon`, the Namespace patch name/label, the ConfigMap values
-   (`DIVISION_ID`, `CLUSTER_ID`, `TRUSTED_PEERS`, `AGENT_CLIENT_ID`, `TEMPORAL_TASK_QUEUE`,
-   `OIDC_*`, `AGT_LOCAL_TOOLS`), and the `images:` tag. Leave `PEER_TOOL_MAP` to federation.
+   (`DIVISION_ID`/`CLUSTER_ID` = epsilon, `TRUSTED_PEERS: gamma,delta`,
+   `AGENT_CLIENT_ID: agent-epsilon`, `AGENT_NAME`, `TEMPORAL_TASK_QUEUE: approval-epsilon`,
+   `OIDC_*`, `AGT_LOCAL_TOOLS: tool.fincheck`), the `images:` `newTag: epsilon`, and leave
+   `PEER_TOOL_MAP: ""` for federation to fill.
 
-3. **Bring it up + federate** — it ingests its own docs into its own Qdrant, mints its own
+4. **Bring it up + federate** — it ingests its own docs into its own Qdrant, mints its own
    DID, and joins the tool mesh:
    ```bash
-   python scripts/bootstrap_k8s.py --divisions epsilon --federate --context kind-agt
-   # or, to re-wire the whole mesh including the existing departments:
-   python scripts/bootstrap_k8s.py --divisions gamma,delta,epsilon --federate
+   # bring up just epsilon, then re-federate the whole mesh so existing departments learn its DID:
+   python scripts/bootstrap_k8s.py --divisions gamma,delta,epsilon --federate --context kind-agt
    ```
    Federation derives each department's `PEER_TOOL_MAP` from the manifests' `local_tools` +
-   the federated DIDs — so adding a department with new tools extends the mesh with **no
-   hand-editing** of any routing table.
+   the federated DIDs — so adding epsilon **automatically** gives gamma + delta a
+   `tool.fincheck → epsilon` route, and gives epsilon routes to gamma's pii/compliance and
+   delta's risk/classify, with **no hand-editing** of any routing table. (Verify offline first
+   with `federate_divisions.compute_peer_tool_map` across the three manifests — it yields the
+   full N-way table.)
 
 The `base/` is never edited; a department is added entirely by config (NFR-8). The Compose
 path is identical: `scripts/onboard_division.py infra/divisions/epsilon.yml` then
@@ -263,7 +294,7 @@ path is identical: `scripts/onboard_division.py infra/divisions/epsilon.yml` the
 | Capability → peer DID routing (broker-less) | `agt-federated-rag/mesh/discovery.py`, `config.py` (`peer_tool_map`) |
 | Retrieval-as-a-service connector | `agt-federated-rag/config.py` (`RaasEndpoint`, `RAAS_ENDPOINTS`), `agt-federated-rag/rag/retriever.py` (`build_retrievers`) |
 | k8s defaults | `k8s/base/configmap.yaml` (`AGT_LOCAL_TOOLS`, `PEER_TOOL_MAP`) |
-| Per-department assignment + routing (k8s) | `k8s/overlays/{gamma,delta,...}/kustomization.yaml` |
-| Department manifest (data + tools + peers) | `infra/divisions/{gamma,delta,...}.yml` (`docs_dir`, `local_tools`, `trusted_peers`) |
+| Per-department assignment + routing (k8s) | `k8s/overlays/{gamma,delta,epsilon,...}/kustomization.yaml` |
+| Department manifest (data + tools + peers) | `infra/divisions/{gamma,delta,epsilon,...}.yml` (`docs_dir`, `local_tools`, `trusted_peers`) |
 | Env generation + auto-routing (Compose parity) | `scripts/onboard_division.py` (`AGT_LOCAL_TOOLS`), `scripts/federate_divisions.py` (`compute_peer_tool_map` → `PEER_TOOL_MAP`) |
 | Deploy-time k8s mesh wiring | `scripts/bootstrap_k8s.py` (`--federate` patches each ConfigMap) |

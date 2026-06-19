@@ -21,7 +21,7 @@ import pytest
 
 from tools import local_tools
 from tools import mcp as mcp_tools
-from tools.local_tools import classify, compliance_lookup, pii_scan, risk_assess
+from tools.local_tools import classify, compliance_lookup, fin_check, pii_scan, risk_assess
 
 
 def _patch_enforce_ok(monkeypatch):
@@ -244,8 +244,62 @@ def test_classify_oversized_and_non_string_raise():
         classify({"text": None})
 
 
+# ── tool.fincheck: finance / AML transaction screen ───────────────────────────
+def test_fincheck_sanctioned_counterparty_is_flagged():
+    out = fin_check({"amount": 200, "currency": "USD", "counterparty": "Volkov Holdings"})
+    assert out["flagged"] is True
+    assert out["risk"] == "high"
+    assert any("sanctions" in r for r in out["reasons"])
+    # Case + whitespace are normalised before the watchlist comparison.
+    out2 = fin_check({"amount": 200, "currency": "USD", "counterparty": "VOLKOV  holdings"})
+    assert out2["flagged"] is True
+
+
+def test_fincheck_large_amount_requires_disclosure():
+    out = fin_check({"amount": 50000, "currency": "USD", "counterparty": "Acme Corp"})
+    assert out["disclosure_required"] is True
+    assert out["flagged"] is False
+    assert any("disclosure" in r for r in out["reasons"])
+    # Echoes the inputs it was given.
+    assert out["amount"] == 50000
+    assert out["currency"] == "USD"
+
+
+def test_fincheck_high_risk_currency_elevates_risk():
+    out = fin_check({"amount": 200, "currency": "KPW", "counterparty": "Acme Corp"})
+    assert out["risk"] == "high"
+    assert any("higher-risk jurisdiction" in r for r in out["reasons"])
+
+
+def test_fincheck_clean_small_usd_transaction_is_not_flagged():
+    out = fin_check({"amount": 500, "currency": "USD", "counterparty": "Acme Corp"})
+    assert out["flagged"] is False
+    assert out["disclosure_required"] is False
+    assert out["risk"] == "low"
+    assert out["reasons"] == []
+
+
+def test_fincheck_all_three_controls_fire_together():
+    out = fin_check({"amount": 50000, "currency": "KPW", "counterparty": "Redline Imports"})
+    assert out["flagged"] is True
+    assert out["disclosure_required"] is True
+    assert out["risk"] == "high"
+    assert len(out["reasons"]) == 3
+
+
+def test_fincheck_validates_types_and_bounds():
+    with pytest.raises(ValueError):
+        fin_check({"amount": "lots", "currency": "USD", "counterparty": "Acme"})
+    with pytest.raises(ValueError):
+        fin_check({"amount": True, "currency": "USD", "counterparty": "Acme"})  # bool not number
+    with pytest.raises(ValueError):
+        fin_check({"amount": 10, "currency": 5, "counterparty": "Acme"})
+    with pytest.raises(ValueError):
+        fin_check({"amount": 10, "currency": "USD", "counterparty": "A" * 300})
+
+
 # ── per-division tool assignment (AGT_LOCAL_TOOLS) ────────────────────────────
-_ALL_SERVERS = {"pii-scan", "compliance-lookup", "risk-score", "data-classify"}
+_ALL_SERVERS = {"pii-scan", "compliance-lookup", "risk-score", "data-classify", "fin-check"}
 
 
 def test_filter_unset_serves_all_tools(monkeypatch):
@@ -254,6 +308,7 @@ def test_filter_unset_serves_all_tools(monkeypatch):
     assert local_tools.server_for_capability("tool.compliance") == "compliance-lookup"
     assert local_tools.server_for_capability("tool.risk") == "risk-score"
     assert local_tools.server_for_capability("tool.classify") == "data-classify"
+    assert local_tools.server_for_capability("tool.fincheck") == "fin-check"
     names = {c["name"] for c in local_tools.local_server_configs()}
     assert names == _ALL_SERVERS
 
@@ -310,11 +365,13 @@ def test_capability_mapping(monkeypatch):
     assert local_tools.capability_for("compliance-lookup") == "tool.compliance"
     assert local_tools.capability_for("risk-score") == "tool.risk"
     assert local_tools.capability_for("data-classify") == "tool.classify"
+    assert local_tools.capability_for("fin-check") == "tool.fincheck"
     assert local_tools.capability_for("nope") is None
     assert local_tools.server_for_capability("tool.pii") == "pii-scan"
     assert local_tools.server_for_capability("tool.compliance") == "compliance-lookup"
     assert local_tools.server_for_capability("tool.risk") == "risk-score"
     assert local_tools.server_for_capability("tool.classify") == "data-classify"
+    assert local_tools.server_for_capability("tool.fincheck") == "fin-check"
     assert local_tools.server_for_capability("tool.nope") is None
 
 
@@ -354,6 +411,12 @@ def test_run_local_tool_executes_through_gates(monkeypatch):
     out = asyncio.run(local_tools.run_local_tool(
         "data-classify", "classify", {"text": "Card 4242424242424242 on file"}))
     assert out["label"] == "Restricted"
+
+    out = asyncio.run(local_tools.run_local_tool(
+        "fin-check", "screen",
+        {"amount": 50000, "currency": "USD", "counterparty": "Volkov Holdings"}))
+    assert out["flagged"] is True
+    assert out["disclosure_required"] is True
 
 
 def test_ensure_local_servers_registered_is_idempotent(monkeypatch):

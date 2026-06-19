@@ -17,8 +17,9 @@ class RaasEndpoint(BaseModel):
 
     The service MUST return stable ``chunk_id``s that key this division's OpenFGA
     tuples, and MUST NOT be relied on to filter per-user (that stays in check_auth).
-    Configured as JSON, e.g.
-    ``RAG_RAAS_ENDPOINTS='[{"name":"acme","url":"https://raas.internal","top_k":10}]'``.
+    Configured as JSON in the ``RAAS_ENDPOINTS`` env var (the Settings loader has no
+    env_prefix, so the field name IS the env var — not ``RAG_RAAS_ENDPOINTS``), e.g.
+    ``RAAS_ENDPOINTS='[{"name":"acme","url":"https://raas.internal","top_k":10}]'``.
     """
     name: str                       # label used in fusion / logs (keep unique)
     url: str                        # base URL; the adapter POSTs to <url>/retrieve

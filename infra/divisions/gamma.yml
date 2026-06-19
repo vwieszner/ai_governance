@@ -4,7 +4,7 @@
 division_id: gamma
 display_name: Division Gamma
 port_base: 9200          # agent 9200, openfga 9201, keycloak 9202, temporal 9203/9204, qdrant 9205, redis 9206. Clean band (avoids co-resident project's reserved ports; old 8301 collided with its N=3 BACKEND). See onboard_division._reserved_ports.
-trusted_peers: [alpha, beta, delta]   # delta is the k8s cross-department tool peer (two-way)
+trusted_peers: [alpha, beta, delta, epsilon]   # delta + epsilon are k8s cross-department tool peers (two-way mesh)
 docs_dir: tests/docs/cluster-a
 residency_mode: external
 seed_viewer: data_retention_policy
@@ -13,7 +13,8 @@ seed_approval: hr_compensation_data
 # OpenFGA, unchanged) AND owns DISTINCT governed tools: the PII/DLP screen (tool.pii) and the
 # EU AI Act/GDPR compliance lookup (tool.compliance). onboard_division writes these as
 # AGT_LOCAL_TOOLS so the agent registers + advertises only them. Departments collaborate BOTH
-# ways: gamma serves pii/compliance to delta, and delegates tool.risk/tool.classify to delta
-# (federate_divisions.compute_peer_tool_map derives gamma's PEER_TOOL_MAP -> delta's DID).
+# ways across the mesh: gamma serves pii/compliance to delta + epsilon, and delegates the tools
+# it lacks — tool.risk/tool.classify -> delta, tool.fincheck -> epsilon
+# (federate_divisions.compute_peer_tool_map derives gamma's PEER_TOOL_MAP from the peers' DIDs).
 # Omit this key to serve ALL tools (back-compat default); [] serves none.
 local_tools: [tool.pii, tool.compliance]

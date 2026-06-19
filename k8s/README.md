@@ -73,12 +73,12 @@ python scripts/bootstrap_k8s.py --divisions gamma,delta --federate --context kin
 **self-sufficient department**: its own data (per-division Qdrant + OpenFGA) AND its own distinct
 governed tools, declared via `AGT_LOCAL_TOOLS` (from its manifest `local_tools`). The federate step
 computes each division's `PEER_TOOL_MAP` (`{capability: provider_DID}`) for every capability it does
-**not** serve but a trusted peer does — building a **bidirectional** tool mesh with **no discovery
-broker**. On the cluster: gamma (Security/Legal) serves `tool.pii,tool.compliance` and delegates
-`tool.risk,tool.classify` to delta; delta (Risk/Data-Gov) serves `tool.risk,tool.classify` and
-delegates `tool.pii,tool.compliance` to gamma — so each department uses the other's tools under
-governance. The extensibility walkthrough — **add a tool**, **add a RaaS retrieval connector**, **add
-a department** — with the exact `POST /solve` curls for both directions is in
+**not** serve but a trusted peer does — building an **N-way** tool mesh with **no discovery broker**.
+On the cluster three departments collaborate: gamma (Security/Legal) serves `tool.pii,tool.compliance`,
+delta (Risk/Data-Gov) serves `tool.risk,tool.classify`, and epsilon (Finance) serves `tool.fincheck` —
+each delegates the capabilities it lacks to whichever peer owns them, both ways. The extensibility
+walkthrough — **add a tool**, **add a RaaS retrieval connector**, **add a department** (epsilon is the
+worked example) — with the exact `POST /solve` curls is in
 [`examples/cross-agent-pii/README.md`](../examples/cross-agent-pii/README.md).
 
 ---
@@ -119,7 +119,7 @@ k8s/
     networkpolicy.yaml      # default-deny + intra-namespace + agent-federation
     kustomization.yaml
   overlays/
-    alpha/  beta/  gamma/  delta/   # one overlay per division (mirrors infra/divisions/*.yml)
+    alpha/  beta/  gamma/  delta/  epsilon/   # one overlay per division (mirrors infra/divisions/*.yml)
   README.md
 ```
 

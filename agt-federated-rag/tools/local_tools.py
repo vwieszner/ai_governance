@@ -8,9 +8,9 @@ transport configured". This module provides that transport for a small set of SA
 dependency-light, pure-compute AI-governance tools so the agent can actually EXECUTE
 real governance work end-to-end through every gate — and so different divisions can
 advertise DIFFERENT capabilities (``tool.pii``, ``tool.compliance``, ``tool.risk``,
-``tool.classify``) for cross-agent tool delegation.
+``tool.classify``, ``tool.fincheck``) for cross-agent tool delegation.
 
-The four tools are genuine governance primitives, not toys:
+The five tools are genuine governance primitives, not toys:
   - ``tool.pii`` (server ``pii-scan``, tool ``scan``) — a PII / DLP screen: detect +
     classify + redact emails, phones, SSNs, Luhn-valid cards, IBANs, IPv4 in free text.
   - ``tool.compliance`` (server ``compliance-lookup``, tool ``lookup``) — a deterministic
@@ -22,6 +22,10 @@ The four tools are genuine governance primitives, not toys:
   - ``tool.classify`` (server ``data-classify``, tool ``classify``) — a data-SENSITIVITY
     classifier: assign Public|Internal|Confidential|Restricted from content signals
     (Classification markers, credential patterns, and PII via the shared DLP detectors).
+  - ``tool.fincheck`` (server ``fin-check``, tool ``screen``) — a finance / AML transaction
+    screen: check a transaction against a sanctions watchlist, the large-transaction
+    disclosure threshold, and currency/jurisdiction risk. On-theme with the seeded
+    q4_financial_results / AML governance.
 
 PER-DIVISION ASSIGNMENT (so divisions genuinely differ). ``AGT_LOCAL_TOOLS`` is a CSV of
 the capabilities a division serves — either full capability ids (``tool.pii``) or the
@@ -57,6 +61,7 @@ _MAX_PII_TEXT_LEN = 20_000
 _MAX_COMPLIANCE_TOPIC_LEN = 512
 _MAX_RISK_DESC_LEN = 20_000
 _MAX_CLASSIFY_TEXT_LEN = 20_000
+_MAX_COUNTERPARTY_LEN = 256
 
 
 # ── tool.pii: a real PII / DLP screen ─────────────────────────────────────────
@@ -491,6 +496,92 @@ def classify(arguments: dict) -> dict:
     return {"label": label, "signals": signals, "handling": handling}
 
 
+# ── tool.fincheck: deterministic finance / AML transaction screen ─────────────
+# A real finance-governance primitive: screen a transaction against three deterministic
+# controls and return whether it is flagged, whether disclosure is required, and a risk band
+# with the reasons that fired. On-theme with the seeded q4_financial_results / AML governance.
+#   1. SANCTIONS — counterparty (normalised, case-insensitive) matches a sample watchlist of
+#      fictitious sanctioned entities → flagged, high risk.
+#   2. DISCLOSURE THRESHOLD — amount > 10000 (in ANY currency) → disclosure_required (large-
+#      transaction reporting, e.g. CTR-style).
+#   3. CURRENCY/JURISDICTION RISK — a higher-risk currency code → elevated (at least medium)
+#      risk.
+# SECURITY: the tool only ever echoes the inputs it was given (amount + currency); ``reasons``
+# describe WHAT matched ("counterparty on sanctions watchlist"), never any secret. Deterministic;
+# never raises on normal input — ValueError only on bad TYPES or an oversized counterparty.
+_SANCTIONS_WATCHLIST = frozenset({
+    "volkov holdings", "redline imports", "acme shell ltd", "north star trading",
+    "grayport logistics",
+})
+# Disclosure threshold for large-transaction reporting (any currency).
+_DISCLOSURE_THRESHOLD = 10_000
+# Higher-risk currency codes (sanctioned / high-AML-risk jurisdictions — illustrative set).
+_HIGH_RISK_CURRENCIES = frozenset({"KPW", "IRR", "SYP", "CUP"})
+
+
+def fin_check(arguments: dict) -> dict:
+    """Screen a transaction ``{"amount": number, "currency": str, "counterparty": str}`` for
+    AML / finance-governance controls.
+
+    Returns ``{"flagged": bool, "disclosure_required": bool, "risk": "low"|"medium"|"high",
+    "reasons": [str,...], "amount": number, "currency": str}``. Deterministic checks: sanctions
+    watchlist (→ flagged + high), >10000 disclosure threshold, higher-risk currency (→ ≥medium).
+    Never raises on normal input — ValueError only on bad types or an oversized counterparty."""
+    amount = arguments.get("amount")
+    currency = arguments.get("currency")
+    counterparty = arguments.get("counterparty")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        raise ValueError("'amount' must be a number")
+    if not isinstance(currency, str) or not isinstance(counterparty, str):
+        raise ValueError("'currency' and 'counterparty' must be strings")
+    if len(counterparty) > _MAX_COUNTERPARTY_LEN:
+        raise ValueError(
+            f"counterparty too long ({len(counterparty)} > {_MAX_COUNTERPARTY_LEN}) — refusing"
+        )
+
+    reasons: list[str] = []
+    flagged = False
+    disclosure_required = False
+    # Risk escalates monotonically: start low, raise to medium/high as controls fire.
+    risk_rank = {"low": 0, "medium": 1, "high": 2}
+    risk = "low"
+
+    def _raise_risk(level: str) -> None:
+        nonlocal risk
+        if risk_rank[level] > risk_rank[risk]:
+            risk = level
+
+    # 1. Sanctions watchlist (normalise whitespace + case for the comparison).
+    normalised_cp = " ".join(counterparty.lower().split())
+    if normalised_cp in _SANCTIONS_WATCHLIST:
+        flagged = True
+        _raise_risk("high")
+        reasons.append("counterparty on sanctions watchlist")
+
+    # 2. Large-transaction disclosure threshold (any currency).
+    if amount > _DISCLOSURE_THRESHOLD:
+        disclosure_required = True
+        _raise_risk("medium")
+        reasons.append(
+            f"amount exceeds the {_DISCLOSURE_THRESHOLD} disclosure threshold — "
+            f"large-transaction reporting required"
+        )
+
+    # 3. Currency / jurisdiction risk.
+    if currency.upper() in _HIGH_RISK_CURRENCIES:
+        _raise_risk("high")
+        reasons.append(f"currency {currency.upper()} is a higher-risk jurisdiction")
+
+    return {
+        "flagged": flagged,
+        "disclosure_required": disclosure_required,
+        "risk": risk,
+        "reasons": reasons,
+        "amount": amount,
+        "currency": currency,
+    }
+
+
 # ── registry ──────────────────────────────────────────────────────────────────
 # server name -> {"capability": "tool.x", <tool_name>: callable}. Each server advertises
 # exactly one capability (so capability discovery is a clean server<->capability map);
@@ -500,6 +591,7 @@ TOOLS: dict[str, dict[str, Any]] = {
     "compliance-lookup": {"capability": "tool.compliance", "lookup": compliance_lookup},
     "risk-score": {"capability": "tool.risk", "assess": risk_assess},
     "data-classify": {"capability": "tool.classify", "classify": classify},
+    "fin-check": {"capability": "tool.fincheck", "screen": fin_check},
 }
 
 # capability -> server, and short-name -> capability, so AGT_LOCAL_TOOLS can list either

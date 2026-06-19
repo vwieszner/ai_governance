@@ -1,0 +1,18 @@
+# Division manifest (IMPLEMENTATION_PLAN.md M0). See alpha.yml for field docs.
+# Fifth division — the THIRD self-sufficient DEPARTMENT in the k8s tool mesh (after gamma +
+# delta), proving the cross-department tool collaboration scales past two with no base edits.
+division_id: epsilon
+display_name: Division Epsilon (Finance)
+port_base: 9400          # agent 9400, openfga 9401, keycloak 9402, temporal 9403/9404, qdrant 9405, redis 9406. Clean band (verified against onboard_division._reserved_ports; next free above delta's 9300).
+trusted_peers: [gamma, delta]   # the two departments epsilon collaborates with (two-way tool mesh)
+docs_dir: tests/docs/cluster-b
+residency_mode: external
+seed_viewer: q4_financial_results
+# SELF-SUFFICIENT DEPARTMENT (Finance). It keeps its OWN data (per-division Qdrant + OpenFGA;
+# its financial corpus is q4_financial_results) AND owns a DISTINCT governed tool: the financial
+# integrity / sanity check (tool.fincheck, server fin-check). onboard_division writes this as
+# AGT_LOCAL_TOOLS so the agent registers + advertises only it. Departments collaborate BOTH ways:
+# epsilon serves tool.fincheck to gamma + delta, and delegates the tools it lacks
+# (tool.pii/tool.compliance -> gamma, tool.risk/tool.classify -> delta) — compute_peer_tool_map
+# derives epsilon's PEER_TOOL_MAP from the federated DIDs. Omit local_tools to serve ALL; [] none.
+local_tools: [tool.fincheck]

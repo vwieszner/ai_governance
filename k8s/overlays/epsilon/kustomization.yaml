@@ -1,0 +1,78 @@
+# Division Epsilon overlay (Finance department). Mirrors infra/divisions/epsilon.yml.
+# The THIRD self-sufficient department in the k8s tool mesh: its own data (Qdrant + OpenFGA)
+# AND a distinct governed tool (tool.fincheck), collaborating two-way with gamma + delta (it
+# delegates the tools it lacks there). A new department = a new overlay; the base is never edited.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: agt-div-epsilon
+
+resources:
+  - ../../base
+
+labels:
+  - pairs:
+      agt.division: epsilon
+    includeSelectors: false
+
+patches:
+  - target:
+      kind: Namespace
+      name: agt-div
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: agt-div-epsilon
+      - op: replace
+        path: /metadata/labels/agt.division
+        value: epsilon
+  - target:
+      kind: ConfigMap
+      name: agent-config
+    patch: |-
+      - op: add
+        path: /data/DIVISION_ID
+        value: epsilon
+      - op: add
+        path: /data/CLUSTER_ID
+        value: epsilon
+      - op: add
+        path: /data/TRUSTED_PEERS
+        value: gamma,delta
+      - op: add
+        path: /data/OIDC_ISSUER
+        value: http://keycloak:8080/realms/rag
+      - op: add
+        path: /data/OIDC_JWKS_URI
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/certs
+      - op: add
+        path: /data/OIDC_TOKEN_ENDPOINT
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/token
+      - op: add
+        path: /data/AGENT_CLIENT_ID
+        value: agent-epsilon
+      - op: add
+        path: /data/AGENT_NAME
+        value: AGT RAG - Division Epsilon (Finance)
+      - op: add
+        path: /data/TEMPORAL_TASK_QUEUE
+        value: approval-epsilon
+      # SELF-SUFFICIENT DEPARTMENT (Finance). epsilon keeps its OWN data (Qdrant + OpenFGA in
+      # this namespace) AND owns a DISTINCT tool: the financial integrity / sanity check.
+      # tools.local_tools registers only this, and the agent auto-advertises it so gamma + delta
+      # can delegate tool.fincheck here.
+      - op: add
+        path: /data/AGT_LOCAL_TOOLS
+        value: tool.fincheck
+      # TWO-WAY collaboration: for the tools epsilon does NOT serve (pii/compliance/risk/classify),
+      # route each to the department that owns it. Left empty here and filled by federation:
+      # `bootstrap_k8s.py --federate` computes this from the manifests' local_tools + the live
+      # DIDs (tool.pii/tool.compliance -> gamma, tool.risk/tool.classify -> delta) and patches it
+      # in. (Set it explicitly here only if you are not running the federate step.)
+      - op: add
+        path: /data/PEER_TOOL_MAP
+        value: ""
+
+images:
+  - name: agt-federated-rag
+    newTag: epsilon
