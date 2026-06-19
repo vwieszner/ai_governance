@@ -1,5 +1,7 @@
 # Multi-department governance mesh — a template you extend with tools, connectors, and departments
 
+> **Proof & reproduction:** [`PROOF.md`](PROOF.md) — what the two governance layers prove, the 6 live cross-department scenarios (`prove_live.py`), how to stand the clusters up, and the benchmarks.
+
 This is the **template at the heart of the project**: a set of **self-sufficient
 departments** that each own their **data** *and* their **tools**, and that **collaborate
 both ways** under governance — DID-signed transport, recipient-bound user assertions,

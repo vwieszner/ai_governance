@@ -1,6 +1,6 @@
 {
   "scope": "local_governed_path",
-  "iterations": 300,
+  "iterations": 1000,
   "warmup": 50,
   "note": "Measures the in-process LOCAL governed path (policy + gateway + caller). The cross-agent DELEGATED path (sign + HTTP + verify) is benchmarked separately \u2014 see bench_delegated().",
   "cases": [
@@ -11,25 +11,25 @@
         "text": "Contact alice@example.com, card 4242424242424242, SSN 123-45-6789."
       },
       "raw": {
-        "count": 300,
-        "mean": 104.46666666666667,
-        "p50": 101.8,
-        "p95": 150.7,
-        "p99": 167.7,
-        "min": 74.8,
-        "max": 195.0
+        "count": 1000,
+        "mean": 66.411,
+        "p50": 62.1,
+        "p95": 88.7,
+        "p99": 103.8,
+        "min": 58.5,
+        "max": 178.7
       },
       "governed": {
-        "count": 300,
-        "mean": 254.82533333333336,
-        "p50": 250.0,
-        "p95": 299.4,
-        "p99": 436.0,
-        "min": 197.2,
-        "max": 508.9
+        "count": 1000,
+        "mean": 214.721,
+        "p50": 206.0,
+        "p95": 276.0,
+        "p99": 300.4,
+        "min": 185.1,
+        "max": 326.7
       },
-      "overhead_us": 150.3586666666667,
-      "overhead_pct": 143.92980216975113
+      "overhead_us": 148.31,
+      "overhead_pct": 223.3214377136318
     }
   ]
 }

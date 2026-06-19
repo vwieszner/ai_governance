@@ -170,6 +170,9 @@ python scripts\agtctl.py doctor --division alpha
 
 ## Documentation map
 
+- **`examples/cross-agent-pii/PROOF.md`** — **what we prove, how to reproduce it, and the
+  benchmarks**: the two governance layers (data-access RAG + cross-agent tool sharing), the 6 live
+  cross-department scenarios (`prove_live.py`), cluster bring-up, and tool-latency numbers.
 - **`PROJECT_STATUS.md`** — **start here for current state**: what is built / partial / not built,
   verified against code + tests. Supersedes any status claim elsewhere.
 - **`ARCHITECTURE.md`** — components, request **dataflow**, **callgraph**, the cross-division

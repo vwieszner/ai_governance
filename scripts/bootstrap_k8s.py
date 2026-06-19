@@ -122,16 +122,33 @@ def health(base: int) -> str:
         return f"<not ready: {exc}>"
 
 
-def bootstrap_division(ctx: str, image: str, div: str) -> None:
+def build_image(image: str, source_tag: str) -> None:
+    """Build the agent image ONCE from the current source into {image}:{source_tag}.
+
+    This is the fix for the per-division image-tag CLOBBER: the old code re-tagged each
+    division from {image}:alpha (a possibly-stale image), so `--divisions <id>` could deploy
+    OLD code even after you changed the source. Building fresh into a dedicated source tag,
+    then tagging each division from THAT, guarantees a division always runs current code."""
+    print(f"-> build agent image {image}:{source_tag} from current source")
+    run(["docker", "build", "-t", f"{image}:{source_tag}", str(ROOT / "agt-federated-rag")])
+
+
+def bootstrap_division(ctx: str, image: str, div: str, source_tag: str) -> None:
     ns = f"agt-div-{div}"
     base = port_base(div)
     p = od.derive_ports(base)
     print(f"\n=== Division '{div}' (namespace {ns}, ports {base}..{base + 6}) ===")
 
     print("-> load agent image into the cluster")
-    src = f"{image}:alpha"
+    # Tag this division from the chosen SOURCE tag (a fresh build by default — see
+    # build_image / --no-build), NEVER blindly from :alpha. Fail loudly if the source is
+    # missing so we don't silently deploy a stale/absent image.
+    src = f"{image}:{source_tag}"
     if subprocess.run(["docker", "image", "inspect", src], capture_output=True).returncode != 0:
-        src = f"{image}:latest"
+        raise RuntimeError(
+            f"source image {src} not found — run with --build (default) to build it, "
+            f"or --source-tag <tag> to point at an existing image."
+        )
     run(["docker", "tag", src, f"{image}:{div}"], check=False)
     cluster = ctx[5:] if ctx.startswith("kind-") else ctx
     run([str(ROOT / ".tools" / "kind.exe"), "load", "docker-image", f"{image}:{div}", "--name", cluster], check=False)
@@ -283,10 +300,19 @@ def main() -> None:
     ap.add_argument("--image", default="agt-federated-rag")
     ap.add_argument("--federate", action="store_true",
                     help="after bring-up, cross-wire DID trust + cross-grants between the divisions")
+    ap.add_argument("--source-tag", default="src",
+                    help="image tag to deploy each division FROM (default 'src', built fresh unless --no-build)")
+    ap.add_argument("--no-build", dest="build", action="store_false",
+                    help="skip building; tag divisions from the existing --source-tag image")
+    ap.set_defaults(build=True)
     args = ap.parse_args()
     divs = [d.strip() for d in args.divisions.split(",") if d.strip()]
+    # Build ONCE from current source (the fix for the per-division stale-image clobber), then
+    # every division is tagged from this fresh image. --no-build reuses --source-tag as-is.
+    if args.build:
+        build_image(args.image, args.source_tag)
     for div in divs:
-        bootstrap_division(args.context, args.image, div)
+        bootstrap_division(args.context, args.image, div, args.source_tag)
     if args.federate and len(divs) > 1:
         federate(args.context, divs)
     print(f"\nDone. Divisions on Kubernetes: {args.divisions}"
