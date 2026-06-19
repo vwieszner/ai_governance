@@ -8,8 +8,60 @@ per-division physical isolation.
 
 > **This complements — it does NOT replace — the Compose path.** Local dev and the
 > demo still run on Compose via `scripts/onboard_division.py`. Kubernetes is for a
-> real multi-node / multi-cloud deployment. Nothing here touches `infra/`, `scripts/`,
-> or the application code.
+> real multi-node / multi-cloud deployment.
+
+---
+
+## Quick start (turnkey — one command)
+
+`scripts/bootstrap_k8s.py` is the Kubernetes equivalent of the Compose `bootstrap`: for each
+division it loads the image, applies the overlay, creates the Secret, waits for the data plane,
+**provisions** (OpenFGA store/model + Keycloak realm/users/roles + **doc ingest** + DID — reusing
+the exact tested `onboard_division.provision()` over short-lived port-forwards), completes the
+Secret with the store/model ids, restarts agent+worker, and verifies `/health`.
+
+```bash
+# prereqs: a cluster context (e.g. `kind create cluster --name agt`), the agent image built
+#          (docker build -t agt-federated-rag:alpha agt-federated-rag/), and ./.env with NVIDIA_API_KEY
+python scripts/bootstrap_k8s.py --divisions gamma
+python scripts/bootstrap_k8s.py --divisions alpha,beta --context kind-agt
+```
+
+When it finishes, the division is fully provisioned and serving. Reach it with a port-forward:
+
+```bash
+kubectl -n agt-div-gamma port-forward svc/agent 9200:8000      # then GET http://localhost:9200/health
+kubectl -n agt-div-gamma port-forward svc/keycloak 9202:8080   # mint a user token to query (client_id rag-ui)
+```
+
+> Cross-platform, no hidden processes, no force-kills — it only runs `docker`/`kind`/`kubectl`/
+> `python`. (A heuristic AV may still flag *any* unsigned script that drives `kubectl` + port-forwards;
+> the source is ~130 readable lines.) The **manual** steps below are what this automates — read them
+> to understand or customize the flow.
+
+> **Embeddings = a SERVED API, not an in-pod model.** On Kubernetes the base ConfigMap
+> sets `EMBEDDING_PROVIDER=api` (with `EMBEDDING_MODEL` + `EMBEDDING_API_BASE`), so the
+> agent gets its **dense** vector from an OpenAI-compatible embeddings endpoint — no
+> 1.3GB model download into the pod. **BM25 sparse** retrieval stays local in-pod, so
+> hybrid search still works. The `EMBEDDING_API_KEY` lives in the Secret (same NVIDIA
+> key as the LLM). For **data-residency** mode, self-host the embedding endpoint
+> in-cluster (a NIM/TEI Service) and point `EMBEDDING_API_BASE` at it — exactly like
+> self-hosting the LLM — so no embedding text leaves the cluster.
+>
+> Two model-specific notes for `nv-embedqa-e5-v5`, both already wired in the base:
+> - **Relevance threshold:** its cosine scores run much lower than bge-large
+>   (relevant chunks ~0.30, not ~0.55), so the base sets `QDRANT_SCORE_THRESHOLD=0.25`.
+>   The bge-tuned default (~0.55) would filter every real hit. Raise it back if you
+>   switch to bge-large / local mode.
+> - **Long chunks:** the served embedder truncates over-length chunks via
+>   `EMBEDDING_TRUNCATE` (default `END`) — `nv-embedqa` returns HTTP 400 on inputs
+>   over its 512-token limit without it. The default works; no manifest change needed.
+
+**Federation across k8s divisions** (cross-DID trust) is not yet folded into `bootstrap_k8s.py`
+— each division comes up standalone + serving. To federate, run the cross-grant + peer-wiring step
+(`scripts/federate_divisions.py` against the divisions' OpenFGA, plus the peer config in each
+overlay's ConfigMap). Same-cluster, the peer URL is the cross-namespace Service DNS
+(`agent.agt-div-<peer>.svc.cluster.local:8000`), which the `allow-agent-federation` NetworkPolicy permits.
 
 ---
 
@@ -128,6 +180,7 @@ editing any file**, then it overrides the template:
 # is created; the rest from infra/generated/alpha/secrets.json.
 kubectl -n agt-div-alpha create secret generic agent-secrets \
   --from-literal=OPENAI_API_KEY="$NVIDIA_API_KEY" \
+  --from-literal=EMBEDDING_API_KEY="$NVIDIA_API_KEY" \
   --from-literal=POSTGRES_USER=openfga \
   --from-literal=POSTGRES_PASSWORD="$(jq -r .postgres_password infra/generated/alpha/secrets.json)" \
   --from-literal=OPENFGA_API_TOKEN="$(jq -r .openfga_api_token infra/generated/alpha/secrets.json)" \
@@ -177,6 +230,48 @@ With any cluster (even a throwaway `kind`/`minikube`):
 ```bash
 kubectl apply -k k8s/overlays/alpha --dry-run=server   # server-side validation, applies nothing
 ```
+
+---
+
+## If your host does TLS interception
+
+**Host-specific — skip this on a normal network, or when you self-host the embedder
+in-cluster.** If the host running the cluster has a TLS-intercepting AV/proxy (e.g.
+Norton's "Web/Mail Shield Root", a corporate MITM proxy, Zscaler), the **Linux pod
+can't make external HTTPS calls**: the proxy re-signs every TLS connection with its
+own root CA, which is in the *host's* trust store but **not** in the container's. This
+breaks the served embedder (and the LLM), and likewise breaks any in-pod model
+download — so it isn't fixed by switching `EMBEDDING_PROVIDER` to `local`. The fix is
+to inject the host's intercepting CA into the pod's trust store:
+
+```bash
+# 1) Export the host's full root store to a single PEM bundle (this includes the
+#    interceptor's root). On Windows, e.g. export "Trusted Root Certification
+#    Authorities" to host-ca-bundle.crt (Base-64 PEM). On Linux/mac, copy your
+#    system bundle (e.g. /etc/ssl/certs/ca-certificates.crt) and append the proxy CA.
+
+# 2) Create a ConfigMap from it. Use `create`, NOT `apply` — `apply` records a
+#    last-applied annotation capped at 256KB and a full root store overflows it.
+kubectl -n agt-div-gamma create configmap ca-bundle \
+  --from-file=cert.pem=host-ca-bundle.crt
+
+# 3) Find where the pod's Python/OpenSSL looks for the CA bundle:
+#    python -c "import ssl; print(ssl.get_default_verify_paths().cafile)"
+#    -> /usr/lib/ssl/cert.pem   (on the distro this image uses)
+
+# 4) Mount the ConfigMap key read-only OVER that file via a subPath, on the agent
+#    (and worker) Deployment — a subPath replaces the single file, not the directory:
+#      volumes:        - name: ca-bundle
+#                        configMap: { name: ca-bundle }
+#      volumeMounts:   - name: ca-bundle
+#                        mountPath: /usr/lib/ssl/cert.pem
+#                        subPath: cert.pem
+#                        readOnly: true
+```
+
+This is **host-specific and not baked into the base manifests** — a clean deploy on a
+normal network needs none of it. The cleanest avoidance is to **self-host the embedding
+(and LLM) endpoint in-cluster**, so no pod makes an external HTTPS call in the first place.
 
 ---
 

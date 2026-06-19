@@ -1,0 +1,61 @@
+# Division Delta overlay (mirrors infra/divisions/delta.yml). A 4th division as a new
+# overlay, no base edits — and the peer that gamma federates with in the k8s federation test.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: agt-div-delta
+
+resources:
+  - ../../base
+
+labels:
+  - pairs:
+      agt.division: delta
+    includeSelectors: false
+
+patches:
+  - target:
+      kind: Namespace
+      name: agt-div
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: agt-div-delta
+      - op: replace
+        path: /metadata/labels/agt.division
+        value: delta
+  - target:
+      kind: ConfigMap
+      name: agent-config
+    patch: |-
+      - op: add
+        path: /data/DIVISION_ID
+        value: delta
+      - op: add
+        path: /data/CLUSTER_ID
+        value: delta
+      - op: add
+        path: /data/TRUSTED_PEERS
+        value: gamma
+      - op: add
+        path: /data/OIDC_ISSUER
+        value: http://keycloak:8080/realms/rag
+      - op: add
+        path: /data/OIDC_JWKS_URI
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/certs
+      - op: add
+        path: /data/OIDC_TOKEN_ENDPOINT
+        value: http://keycloak:8080/realms/rag/protocol/openid-connect/token
+      - op: add
+        path: /data/AGENT_CLIENT_ID
+        value: agent-delta
+      - op: add
+        path: /data/AGENT_NAME
+        value: AGT RAG - Division Delta
+      - op: add
+        path: /data/TEMPORAL_TASK_QUEUE
+        value: approval-delta
+
+images:
+  - name: agt-federated-rag
+    newTag: delta

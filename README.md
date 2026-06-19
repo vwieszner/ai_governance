@@ -51,7 +51,7 @@ Qdrant, and Keycloak.
 | Secrets backend | env-file default, Vault/KMS adapter | `secrets_backend.py` |
 | Admin CLI | `agtctl` grant/revoke/list (users + groups), status, doctor | `scripts/agtctl.py` |
 | One-command bring-up | `bootstrap.ps1` / `bootstrap.sh`; pinned images + frozen deps | `scripts/` |
-| Kubernetes deployment | kustomize base + per-division overlays; per-namespace NetworkPolicy isolation; verified Running on kind (alongside Compose) | `k8s/` |
+| Kubernetes deployment | kustomize base + per-division overlays; per-namespace NetworkPolicy isolation; **one-command turnkey bring-up** `python scripts/bootstrap_k8s.py --divisions <id>` (apply → provision → ingest → DID → serve); verified Running on kind (alongside Compose) | `k8s/`, `scripts/bootstrap_k8s.py` |
 
 ## Architecture at a glance
 

@@ -1,0 +1,19 @@
+division_id: delta
+display_name: Division Delta
+port_base: 9300          # agent 9300, openfga 9301, keycloak 9302, temporal 9303/9304, qdrant 9305, redis 9306 — free band (alpha=9000/beta=9100/gamma=9200 elsewhere).
+trusted_peers: [gamma]
+docs_dir: tests/docs/cluster-b
+residency_mode: external
+seed_viewer: technical_architecture
+seed_approval: q4_financial_results
+# Federation: pre-authorize gamma's seeded user to reach delta's data (proves the
+# cross-division path on Kubernetes — the analogue of alpha's alice reaching beta).
+cross_grants:
+  - user_email: alice@example.com
+    home_division: gamma
+    relation: viewer
+    doc: technical_architecture
+  - user_email: alice@example.com
+    home_division: gamma
+    relation: pending_approval
+    doc: q4_financial_results
