@@ -1,4 +1,4 @@
-import { Fragment, useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { UserPane } from './components/UserPane'
 import { BffPane } from './components/BffPane'
 import { MonitorPanel } from './components/MonitorPanel'
@@ -12,6 +12,9 @@ export default function App() {
   const [monitorOpen, setMonitorOpen] = useState(false)
   // Production auth (BFF): one division per browser session, no token in the browser.
   const bff = bffEnabled()
+  // One division per browser, chosen by ?cluster=<id> (e.g. ?cluster=gamma). No split pane.
+  const clusterId = new URLSearchParams(window.location.search).get('cluster')
+  const selected = clusterId ? DIVISIONS.find((d) => d.id === clusterId) : undefined
   // TODO(inbox): when the /inbox retrieval endpoint lands, wire per-division offline
   // delivery off Division.apiBase here. Left for the inbox-backend work.
 
@@ -58,13 +61,24 @@ export default function App() {
           // BFF mode: ONE division per browser session (the production multi-user model —
           // open another division in a separate browser). No token ever in the browser.
           <BffPane division={PRIMARY_DIVISION} onEvent={addEvent} />
+        ) : selected ? (
+          // ONE division per browser, chosen by ?cluster=<id>. Open another division in
+          // another browser/window to present the federated, multi-department setup.
+          <UserPane division={selected} onEvent={addEvent} />
         ) : (
-          DIVISIONS.map((division, i) => (
-            <Fragment key={division.id}>
-              {i > 0 && <div className="pane-divider" />}
-              <UserPane division={division} onEvent={addEvent} />
-            </Fragment>
-          ))
+          // No ?cluster= → a picker: each configured division opens in this browser.
+          <div className="division-picker">
+            <h2>Pick a division to log in as</h2>
+            <p>Open a different division in each browser/window to present the federation.</p>
+            <div className="division-grid">
+              {DIVISIONS.map((d) => (
+                <a key={d.id} className="division-card" href={`?cluster=${d.id}`}>
+                  <span className="division-card-label">{d.label}</span>
+                  <span className="division-card-id">?cluster={d.id}</span>
+                </a>
+              ))}
+            </div>
+          </div>
         )}
       </main>
 

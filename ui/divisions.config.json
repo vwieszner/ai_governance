@@ -1,0 +1,7 @@
+[
+  { "id": "alpha",   "label": "Division Alpha",            "defaultUser": "alice", "agentPort": 9000, "keycloakPort": 9002, "realm": "rag" },
+  { "id": "beta",    "label": "Division Beta",             "defaultUser": "bob",   "agentPort": 9100, "keycloakPort": 9102, "realm": "rag" },
+  { "id": "gamma",   "label": "Division Gamma (Security/Legal)", "defaultUser": "alice", "agentPort": 9200, "keycloakPort": 9202, "realm": "rag" },
+  { "id": "delta",   "label": "Division Delta (Risk/Data-Gov)",  "defaultUser": "alice", "agentPort": 9300, "keycloakPort": 9302, "realm": "rag" },
+  { "id": "epsilon", "label": "Division Epsilon (Finance)",      "defaultUser": "alice", "agentPort": 9400, "keycloakPort": 9402, "realm": "rag" }
+]

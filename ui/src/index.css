@@ -624,3 +624,14 @@ button { font-family: inherit; font-size: inherit; }
 .btn-deny    { background: var(--red); }
 .btn-approve:hover:not(:disabled), .btn-deny:hover:not(:disabled) { filter: brightness(1.12); }
 .btn-approve:disabled, .btn-deny:disabled { opacity: 0.5; cursor: default; }
+
+/* Division picker (shown when no ?cluster=<id> is given) */
+.division-picker { max-width: 720px; margin: 48px auto; padding: 0 16px; text-align: center; }
+.division-picker h2 { margin-bottom: 4px; }
+.division-picker p { color: #666; margin-top: 0; }
+.division-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-top: 24px; }
+.division-card { display: flex; flex-direction: column; gap: 6px; padding: 18px; border: 1px solid #d9deea;
+  border-radius: 12px; text-decoration: none; color: #1a1a2e; background: #fff; transition: box-shadow .15s, border-color .15s; }
+.division-card:hover { border-color: #3b5bdb; box-shadow: 0 2px 10px #3b5bdb22; }
+.division-card-label { font-weight: 700; }
+.division-card-id { font-family: monospace; font-size: 12px; color: #888; }
