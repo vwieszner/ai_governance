@@ -1,14 +1,15 @@
 """Live, deterministic cross-agent GOVERNED TOOL DELEGATION demo.
 
-Narrative: Division A's agent is handed a problem that needs math (``tool.calc``). A does NOT
-serve that capability locally, so it discovers that Division B advertises ``tool.calc``,
-DELEGATES the tool call to B over the DID-signed ``/a2a/tool`` channel, B authorizes the
-DELEGATED USER and runs ITS OWN governed calc tool, returns a DID-SIGNED result, and A
-verifies the signature and composes the answer. Every governance step is printed.
+Narrative: Division A must SCREEN some free text for PII before it uses it (a real DLP
+obligation), but A does NOT serve the ``tool.pii`` capability locally. It discovers that
+the COMPLIANCE division (Division B) advertises ``tool.pii``, DELEGATES the screening over
+the DID-signed ``/a2a/tool`` channel, B authorizes the DELEGATED USER and runs ITS OWN
+governed PII scan, returns a DID-SIGNED redacted/findings result, and A verifies the
+signature and proceeds with the redacted text. Every governance step is printed.
 
 This exercises the REAL code path — the policy engine (default-deny ``_enforce``), the MCP
-gateway, the recipient-bound user-assertion binding, and the actual calc tool all run for
-real. The peer (Division B) is simulated in-process by the SAME FastAPI app behind httpx
+gateway, the recipient-bound user-assertion binding, and the actual PII-scan tool all run
+for real. The peer (Division B) is simulated in-process by the SAME FastAPI app behind httpx
 ASGITransport (no network), with ``peer_trust`` monkeypatched to point back at it; the
 Ed25519 sign/verify, the AgentMesh registry trust lookup, and the JWKS issuer validation are
 the only simulated seams (they need live infra) — stubbed exactly as tests/test_a2a_tool.py
@@ -99,20 +100,26 @@ async def run_demo() -> int:
 
     print("=" * 78)
     print("  AGT cross-agent governed tool delegation — live demo")
-    print("  Division A needs math, lacks tool.calc, delegates to Division B (who serves it)")
+    print("  Division A must PII-screen some text, lacks tool.pii, delegates to the")
+    print("  Compliance division (Division B), which serves it.")
     print("=" * 78)
 
-    problem = "What is 2 + 3 * 4?"
-    capability = "tool.calc"
-    arguments = {"expression": "2+3*4"}
+    # A real DLP scenario: A holds some free text it intends to use, and policy requires it be
+    # screened for PII first. The text deliberately contains an email + a (Luhn-valid) card so
+    # the screen returns a non-trivial result.
+    raw_text = ("New support ticket from Alice: please reach me at alice@example.com, "
+                "my card on file is 4242424242424242.")
+    capability = "tool.pii"
+    arguments = {"text": raw_text}
 
-    # ── Step 1: Division A receives a problem needing tool.calc, which it LACKS locally ──
-    _step(1, "Division A receives a problem that needs a math tool")
-    _line(f"problem: {problem!r}  ->  capability needed: {capability}")
+    # ── Step 1: Division A receives text needing tool.pii, which it LACKS locally ──
+    _step(1, "Division A must screen some text for PII before using it")
+    _line(f"text to screen: {raw_text!r}")
+    _line(f"capability needed: {capability}  (a DLP / PII screen — required before use)")
     # In-process simulation: a SINGLE app instance plays Division B (the tool server). In a real
-    # two-division deploy, Division A would be a SEPARATE stack that never registered local-calc,
-    # so it must delegate. We model that here: A has no local calc, B (this app) serves it.
-    _line("Division A does NOT serve tool.calc locally -> it must find a peer that does.")
+    # two-division deploy, Division A would be a SEPARATE stack launched with AGT_LOCAL_TOOLS that
+    # excludes tool.pii, so it must delegate. We model that here: A has no local PII scan, B does.
+    _line("Division A does NOT serve tool.pii locally -> it must find a peer that does.")
     _line("(in-process demo: this one app instance acts as the PEER, Division B, over ASGI)")
 
     # ── Identity/crypto seams (simulated — need live infra) + REAL policy/tool/assertion ──
@@ -185,10 +192,10 @@ async def run_demo() -> int:
         p.set(main, "_get_redis", fake_get_redis)
         p.set(main.agent_nodes, "_enforce", watching_enforce)
 
-        # ── Step 2: A discovers Division B advertises tool.calc ──
+        # ── Step 2: A discovers the Compliance division advertises tool.pii ──
         _step(2, "Division A discovers a peer that advertises the capability")
         _line(f"Division B (DID {_DID_B}) advertises {capability} and is in A's trust anchor.")
-        _line("negotiate: 'B, can you help with tool.calc?' -> yes (trusted + capable)")
+        _line("negotiate: 'B, can you PII-screen this for me?' -> yes (trusted + capable)")
 
         # ── Step 3: A mints a RECIPIENT-BOUND user assertion for B (aud = B's DID) ──
         _step(3, "Division A mints a recipient-bound user assertion (NO raw token on the wire)")
@@ -215,14 +222,16 @@ async def run_demo() -> int:
                                           "alg": "EdDSA"}}
         signed_request = await sign_as_a(request_body)
         _line(f"signed by {signed_request['_agentmesh']['sender_did']}, POST -> B /a2a/tool "
-              f"(capability={capability}, args={arguments})")
+              f"(capability={capability})")
+        _line("note: the RAW text (with PII) is sent to the trusted compliance peer to be "
+              "screened — that is the tool's whole job; B returns only masked findings.")
 
         transport = ASGITransport(app=main.app)
         async with AsyncClient(transport=transport, base_url="http://division-b") as client:
             resp = await client.post("/a2a/tool", json=signed_request)
 
         # ── Step 5: B's governed receipt (signature -> trust -> assertion -> authz -> tool) ──
-        _step(5, "Division B governs the delegated call (real policy + real tool)")
+        _step(5, "Division B governs the delegated call (real policy + real PII tool)")
         if resp.status_code != 200:
             _line(f"FAILED: B returned HTTP {resp.status_code}: {resp.text}")
             return 1
@@ -237,8 +246,8 @@ async def run_demo() -> int:
             assert captured_authz["user_id"] == _USER, "delegated user must come from assertion"
         _line(f"B ran its OWN governed tool: {data.get('capability')} -> {data.get('tool')}")
 
-        # ── Step 6: A verifies B's signed result and composes the answer ──
-        _step(6, "Division A verifies B's signed result and composes the answer")
+        # ── Step 6: A verifies B's signed result and proceeds with the redacted text ──
+        _step(6, "Division A verifies B's signed result and proceeds with the REDACTED text")
         ok, signer = await main.agent_identity.verify_signed_message(data)
         _line(f"B's response signature verified: {ok} (signer={signer})")
         if not ok or signer != _DID_B:
@@ -248,21 +257,36 @@ async def run_demo() -> int:
             _line(f"FAILED: B reported status={data.get('status')!r}")
             return 1
         result = data.get("result", {})
-        answer = result.get("result")
-        _line(f"signed result payload: {result}")
-        print(f"\n  ANSWER (composed by Division A from B's governed tool): {problem} = {answer}")
+        has_pii = result.get("has_pii")
+        findings = result.get("findings", [])
+        redacted = result.get("redacted")
+        counts = result.get("counts", {})
+        _line(f"has_pii = {has_pii}   counts = {counts}")
+        _line(f"findings (MASKED, last-4 only): {findings}")
+        _line(f"redacted text: {redacted!r}")
+        # The redacted text is what A is now safe to use / log / forward.
+        print(f"\n  Division A proceeds with the GOVERNED, redacted text: {redacted!r}")
 
-        # Final integrity check for the demo's own exit code.
-        if answer != 14:
-            _line(f"UNEXPECTED: calc returned {answer}, expected 14")
+        # Final integrity checks for the demo's own exit code: PII was found, the findings are
+        # masked (no raw PII leaked across the wire), and the redacted text dropped the PII.
+        types = {f.get("type") for f in findings}
+        if not has_pii or not {"EMAIL", "CARD"} <= types:
+            _line(f"UNEXPECTED: expected EMAIL+CARD findings, got {sorted(types)}")
+            rc = 1
+        if any(secret in json.dumps(result)
+               for secret in ("alice@example.com", "4242424242424242")):
+            _line("SECURITY FAILURE: a RAW PII value leaked into the signed result payload.")
+            rc = 1
+        if redacted and ("[EMAIL_REDACTED]" not in redacted or "[CARD_REDACTED]" not in redacted):
+            _line("UNEXPECTED: redacted text is missing a redaction marker.")
             rc = 1
 
     print("\n" + "=" * 78)
     if rc == 0:
         print("  DEMO OK — governed cross-agent delegation succeeded end to end.")
         print("  discover -> negotiate -> mint recipient-bound assertion -> delegate(signed)")
-        print("  -> B verifies+trusts+authorizes delegated user -> B runs governed calc")
-        print("  -> signed result -> A verifies -> A composes answer (= 14).")
+        print("  -> B verifies+trusts+authorizes delegated user -> B runs governed PII scan")
+        print("  -> signed (masked) findings + redacted text -> A verifies -> A proceeds safely.")
     else:
         print("  DEMO FAILED — see the step output above.")
     print("=" * 78)

@@ -600,6 +600,34 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     did = await agent_identity.get_did()
     log.info("agentmesh_identity_ready", did=did)
 
+    # ── Cross-agent tool delegation: governed registration at boot ────────────
+    # Now that the mesh identity exists, make THIS division usable as a tool PROVIDER:
+    #   1. register its ENABLED local tool servers (per AGT_LOCAL_TOOLS) into the governed
+    #      MCP executor, so /solve and /a2a/tool can run them through every gate from the
+    #      first request — not lazily on first call;
+    #   2. if a discovery broker is configured (DISCOVERY_URL), advertise our capabilities so a
+    #      peer can DISCOVER us even though a pure provider never itself asks for a tool.
+    # Each step is best-effort: a failure is logged and never blocks startup (a provider that
+    # can't reach the broker still serves locally + via configured peer_tool_map routing).
+    from mesh.discovery import advertised_capabilities
+    try:
+        from tools.local_tools import ensure_local_servers_registered
+        ensure_local_servers_registered()
+        log.info("local_tool_servers_registered", capabilities=advertised_capabilities())
+    except Exception as exc:  # noqa: BLE001 — tool registration must never block startup
+        log.warning("local_tool_registration_failed", error=str(exc))
+
+    discovery_url = os.environ.get("DISCOVERY_URL", "").strip()
+    if discovery_url:
+        try:
+            from discovery.client import register_self
+            caps = advertised_capabilities()
+            await register_self(discovery_url, caps)
+            log.info("discovery_self_registered_startup", url=discovery_url, capabilities=caps)
+        except Exception as exc:  # noqa: BLE001 — broker registration must never block startup
+            log.warning("discovery_self_registration_failed_startup",
+                        url=discovery_url, error=str(exc))
+
     # Connect to Temporal
     tc = await TemporalClient.connect(
         settings.temporal_address,
@@ -916,6 +944,128 @@ async def query(
         yield {"event": "done", "data": "{}"}
 
     return EventSourceResponse(event_stream())
+
+
+# ── POST /solve ───────────────────────────────────────────────────────────────
+
+@app.post("/solve")
+async def solve(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Governed cross-agent TOOL endpoint — the user trigger for solve_with_tools.
+
+    GOVERNED FLOW: this is the front door to the governed tool path. A request names a TOOL
+    capability (directly, or as free text we route). We solve it LOCALLY through our governed
+    MCP executor when THIS division serves the capability; otherwise we DISCOVER a trusted peer
+    that does (broker, or the configured peer_tool_map) and DELEGATE the call over the
+    DID-signed /a2a/tool channel — the peer runs ITS governed tool and returns a signed result.
+    The user's identity travels onward only as a recipient-bound, time-limited ASSERTION minted
+    from the validated JWT claims (set_user_claims below), NEVER a raw bearer token on the wire.
+
+    Auth — mirrors POST /query EXACTLY:
+      * kill-switch engaged → 503 (administrative disable, before any work);
+      * JWT validated via _get_bearer_token; principal(claims) → user_id (401 if unbuildable);
+      * per-subject rate limit (_check_rate_limit) before any tool/LLM work.
+
+    Request body (either form):
+      * DIRECT:  {"capability": "tool.pii", "arguments": {"text": "..."}}
+      * ROUTED:  {"problem": "screen this text for PII: ..."}   (routed via _route_capability)
+
+    Response (JSON, the solve_with_tools result):
+      {"status": "completed"|"failed"|"no_capability",
+       "source": "local"|"peer"|"none",
+       "capability": "tool.pii",            # the resolved capability (absent if unroutable)
+       "result": {...},                      # present when status == "completed"
+       "reason": "...",                      # present on failure / degradation
+       "peer_did": "did:mesh:..."}           # present when delegated to a peer
+    """
+    # Kill-switch: refuse the governed-tool path before any work (same posture as /query).
+    if await _runtime_kill_switch_engaged():
+        log.warning("kill_switch_refused_solve", agt_audit=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Agent administratively disabled (kill-switch engaged)",
+        )
+
+    # Validate JWT and extract user identity (identical to /query).
+    try:
+        _token, claims = await _get_bearer_token(authorization)
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        log.warning("agt_policy_denial_solve", error=str(exc))
+        raise HTTPException(status_code=403, detail="Request denied by governance policy")
+
+    try:
+        user_id = principal(claims)
+    except ValueError as exc:
+        log.warning("solve_principal_unbuildable", error=str(exc))
+        raise HTTPException(
+            status_code=401,
+            detail="Token lacks a verified email required for authorization",
+        )
+
+    # Per-subject rate limit before the (potentially delegated) tool work.
+    await _check_rate_limit(user_id)
+
+    # Parse + validate the request body.
+    import json
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    capability = body.get("capability")
+    arguments = body.get("arguments")
+    problem = body.get("problem")
+
+    if capability is not None:
+        # DIRECT form: an explicit capability + arguments object.
+        if not isinstance(capability, str) or not capability.strip():
+            raise HTTPException(status_code=400, detail="'capability' must be a non-empty string")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise HTTPException(status_code=400, detail="'arguments' must be a JSON object")
+        # Reject non-finite numbers (inf/nan can't be re-serialized in the signed peer payload).
+        if _has_non_finite_number(arguments):
+            raise HTTPException(status_code=422, detail="'arguments' contain a non-finite number")
+        if len(json.dumps(arguments).encode("utf-8")) > _MAX_TOOL_ARGS_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'arguments' exceed the maximum size of {_MAX_TOOL_ARGS_BYTES} bytes",
+            )
+    else:
+        # ROUTED form: free-text problem the deterministic router maps to a capability.
+        if not isinstance(problem, str) or not problem.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either 'capability' (+ 'arguments') or a non-empty 'problem'",
+            )
+        if len(problem) > settings.max_query_length:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'problem' exceeds the maximum length of {settings.max_query_length} characters",
+            )
+
+    # Set the per-request user CLAIMS ContextVar so a DELEGATED tool call mints its
+    # recipient-bound assertion from the VALIDATED claims (not a raw token), exactly like the
+    # /query path. minimal_assertion_claims strips the claims to the non-replayable subset.
+    agent_nodes.set_user_claims(minimal_assertion_claims(claims))
+
+    log.info("solve_request", user_id=user_id,
+             capability=capability or "(routed)", agt_audit=True)
+
+    result = await agent_nodes.solve_with_tools(
+        problem,
+        user_id=user_id,
+        capability=capability,
+        arguments=arguments,
+    )
+    return JSONResponse(result)
 
 
 # ── GET /tasks/{task_id}/result ───────────────────────────────────────────────
@@ -1440,7 +1590,7 @@ async def a2a_tool(request: Request) -> JSONResponse:
     peer_issuer = settings.peer_trust.get(signer_did, {}).get("issuer", "")
 
     # ── Step 6: extract + validate the delegated TOOL request from the SIGNED payload ──
-    # The caller names a CAPABILITY (e.g. "tool.calc") — resolved to OUR local server here,
+    # The caller names a CAPABILITY (e.g. "tool.pii") — resolved to OUR local server here,
     # never the peer's server name — OR an explicit server+tool pair. Arguments must be a
     # dict and bounded in size (DoS guard). All type/size failures are 400 (malformed request).
     from tools.local_tools import (

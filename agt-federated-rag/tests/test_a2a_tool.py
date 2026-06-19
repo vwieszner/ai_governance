@@ -37,7 +37,7 @@ _USER_ID = "alice@example.com|deadbeefdeadbeef"
 @pytest.fixture(autouse=True)
 def _clean_mcp_cache():
     """Reset the governed MCP executor's gateway cache around each test so the happy-path
-    (which runs the real local calc tool via run_local_tool) is order-independent — other
+    (which runs the real local pii-scan tool via run_local_tool) is order-independent — other
     suites monkeypatch settings.mcp_servers and pytest's revert can leave a stale gateway."""
     from tools import mcp as mcp_tools
     mcp_tools.reset_cache()
@@ -65,12 +65,13 @@ def _req(body: dict):
     return _Req()
 
 
-def _tool_body(capability="tool.calc", arguments=None, with_assertion=True):
+def _tool_body(capability="tool.pii", arguments=None, with_assertion=True):
     """A well-formed /a2a/tool request body (the signed envelope fields are simulated by
     monkeypatching verify_signed_message, so we only need the application fields here)."""
     body: dict = {
         "capability": capability,
-        "arguments": {"expression": "2+3*4"} if arguments is None else arguments,
+        # tool.pii input is {"text": ...}; the default text carries one e-mail (one finding).
+        "arguments": {"text": "contact alice@example.com"} if arguments is None else arguments,
         "source_division": "division-b",
         # An opaque _agentmesh block; the real signature is simulated by the monkeypatch.
         "_agentmesh": {"sender_did": _PEER_DID, "signature": "sig", "alg": "EdDSA"},
@@ -164,7 +165,7 @@ def test_non_finite_number_returns_422(monkeypatch):
     monkeypatch.setattr(main.settings, "agent_kill_switch_engaged", False)
     monkeypatch.setattr(main.settings, "division_id", "alpha")
     _patch_redis(monkeypatch)
-    body = _tool_body(arguments={"expression": "1", "x": float("inf")})
+    body = _tool_body(arguments={"text": "hi", "x": float("inf")})
     with pytest.raises(main.HTTPException) as ei:
         _run(body)
     assert ei.value.status_code == 422
@@ -277,17 +278,20 @@ def test_authorized_call_runs_tool_and_signs_result(monkeypatch):
     policy_ctx: dict = {}
     _allow_policy(monkeypatch, policy_ctx)
 
-    resp = _run(_tool_body())   # tool.calc, expression "2+3*4"
+    resp = _run(_tool_body())   # tool.pii, text "contact alice@example.com"
     body = json.loads(bytes(resp.body).decode())
     assert body["status"] == "completed"
-    assert body["capability"] == "tool.calc"
-    assert body["result"]["result"] == 14          # the real local calc tool ran
+    assert body["capability"] == "tool.pii"
+    # The real local pii-scan tool ran: it found the e-mail and masked it (no raw PII).
+    assert body["result"]["has_pii"] is True
+    assert body["result"]["findings"][0]["type"] == "EMAIL"
+    assert "[EMAIL_REDACTED]" in body["result"]["redacted"]
     assert "_agentmesh" in body                     # DID-SIGNED result
 
     # The DELEGATED user is what the policy engine saw — the peer did NOT bypass authz.
     assert policy_ctx["action"] == "mcp.call"
     assert policy_ctx["user_id"] == _USER_ID
-    assert policy_ctx["server"] == "local-calc"
+    assert policy_ctx["server"] == "pii-scan"
     assert policy_ctx["source_division"] == "division-b"
     assert captured_resp["status"] == "completed"
 
@@ -297,7 +301,7 @@ def test_oversized_arguments_rejected(monkeypatch):
     monkeypatch.setattr(main.settings, "division_id", "alpha")
     _patch_redis(monkeypatch)
     _pass_signature_and_trust(monkeypatch)
-    big = {"expression": "1+" * 5000}     # well over _MAX_TOOL_ARGS_BYTES
+    big = {"text": "a" * 9000}            # well over _MAX_TOOL_ARGS_BYTES
     with pytest.raises(main.HTTPException) as ei:
         _run(_tool_body(arguments=big))
     assert ei.value.status_code == 400
@@ -341,10 +345,10 @@ def _setup_authorized(monkeypatch):
 
 
 @pytest.mark.parametrize("bad_result", [
-    {"result": float("inf"), "expression": "1e1000"},      # inf → allow_nan=False rejects
-    {"result": float("-inf"), "expression": "-1e1000"},
-    {"result": float("nan"), "expression": "1e1000-1e1000"},  # nan
-    {"result": 2 ** 50000, "expression": "pow(2, 50000)"},  # oversized int → str-digit limit
+    {"score": float("inf")},                               # inf → allow_nan=False rejects
+    {"score": float("-inf")},
+    {"score": float("nan")},                               # nan
+    {"big": 2 ** 50000},                                   # oversized int → str-digit limit
     {"nested": [1, {"deep": float("inf")}]},               # non-finite buried in structure
 ])
 def test_unserializable_tool_result_returns_signed_failure_not_500(monkeypatch, bad_result):
@@ -370,18 +374,21 @@ def test_unserializable_tool_result_returns_signed_failure_not_500(monkeypatch, 
     assert captured.get("result") is None
 
 
-def test_real_calc_oversized_int_result_returns_signed_failure(monkeypatch):
-    """End-to-end via the REAL calc tool (no monkeypatched result): pow(2, 50000) — whatever
-    the sandbox does, IF a giant int reaches the endpoint it must degrade to a signed failure,
-    never a 500. (If the sandbox rejects it first, that's ALSO a signed failure — either way,
-    the contract holds and no 500 escapes.)"""
+def test_real_compliance_lookup_runs_and_signs_result(monkeypatch):
+    """End-to-end via the REAL compliance-lookup tool (no monkeypatched result): a delegated
+    tool.compliance call runs OUR governed KB lookup and returns a SIGNED status='completed'
+    with the obligation matches — the second real tool the channel can serve."""
     captured = _setup_authorized(monkeypatch)
-    resp = _run(_tool_body(arguments={"expression": "pow(2, 50000)"}))
+    resp = _run(_tool_body(capability="tool.compliance",
+                           arguments={"topic": "high-risk AI systems"}))
     assert resp.status_code == 200
     body = json.loads(bytes(resp.body).decode())
-    assert body["status"] == "failed"
+    assert body["status"] == "completed"
+    assert body["capability"] == "tool.compliance"
+    # The KB matched the high-risk topic to at least one EU AI Act article.
+    assert any(m["framework"] == "EU AI Act" for m in body["result"]["matches"])
     assert "_agentmesh" in body
-    assert captured["status"] == "failed"
+    assert captured["status"] == "completed"
 
 
 def test_response_build_error_degrades_to_signed_failure(monkeypatch):
@@ -404,7 +411,7 @@ def test_response_build_error_degrades_to_signed_failure(monkeypatch):
         return {**obj, "_agentmesh": {"sender_did": _SELF_DID, "signature": "s", "alg": "EdDSA"}}
     monkeypatch.setattr(main.agent_identity, "sign_outbound_message", flaky_sign)
 
-    resp = _run(_tool_body())          # tool.calc 2+3*4 — a perfectly serializable result
+    resp = _run(_tool_body())          # tool.pii — a perfectly serializable result
     assert resp.status_code == 200
     body = json.loads(bytes(resp.body).decode())
     assert body["status"] == "failed"
@@ -413,11 +420,11 @@ def test_response_build_error_degrades_to_signed_failure(monkeypatch):
 
 def test_valid_result_still_succeeds_after_fix(monkeypatch):
     """Regression guard: the result-validation must NOT reject a normal, serializable result —
-    the happy path (calc 2+3*4 → 14) still returns a signed status='completed'."""
+    the happy path (tool.pii on a one-email text) still returns a signed status='completed'."""
     captured = _setup_authorized(monkeypatch)
-    resp = _run(_tool_body())          # tool.calc, "2+3*4"
+    resp = _run(_tool_body())          # tool.pii, "contact alice@example.com"
     assert resp.status_code == 200
     body = json.loads(bytes(resp.body).decode())
     assert body["status"] == "completed"
-    assert body["result"]["result"] == 14
+    assert body["result"]["has_pii"] is True
     assert captured["status"] == "completed"

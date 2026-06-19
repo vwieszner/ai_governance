@@ -1,23 +1,23 @@
 {
   "scope": "delegated_cross_agent_path",
-  "iterations": 1000,
+  "iterations": 300,
   "warmup": 50,
   "transport": "httpx ASGITransport (in-process, no network)",
-  "note": "Full governed /a2a/tool round-trip: sign -> POST -> verify+trust+assertion+policy+run_local_tool -> signed response -> verify. REAL policy engine, MCP gateway, assertion recipient-binding, and calc tool; SIMULATED Ed25519 sign/verify + AgentMesh registry trust + JWKS issuer validation (live-infra seams, stubbed exactly as tests/test_a2a_tool.py does).",
-  "capability": "tool.calc",
+  "note": "Full governed /a2a/tool round-trip: sign -> POST -> verify+trust+assertion+policy+run_local_tool -> signed response -> verify. REAL policy engine, MCP gateway, assertion recipient-binding, and PII-scan tool; SIMULATED Ed25519 sign/verify + AgentMesh registry trust + JWKS issuer validation (live-infra seams, stubbed exactly as tests/test_a2a_tool.py does).",
+  "capability": "tool.pii",
   "delegated": {
-    "count": 1000,
-    "mean": 2530.4621,
-    "p50": 2348.0,
-    "p95": 3991.8,
-    "p99": 4625.2,
-    "min": 1223.1,
-    "max": 6306.5
+    "count": 300,
+    "mean": 1852.9563333333333,
+    "p50": 1845.7,
+    "p95": 2303.1,
+    "p99": 2378.9,
+    "min": 1245.3,
+    "max": 2915.3
   },
   "comparison_to_local": {
-    "local_governed_p50_us": 155.0,
-    "delegated_p50_us": 2348.0,
-    "secure_hop_overhead_us": 2193.0,
-    "delegated_over_local_x": 15.148387096774194
+    "local_governed_p50_us": 250.0,
+    "delegated_p50_us": 1845.7,
+    "secure_hop_overhead_us": 1595.7,
+    "delegated_over_local_x": 7.3828000000000005
   }
 }

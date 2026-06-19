@@ -1,7 +1,7 @@
 """Governance-overhead benchmark for the LOCAL governed tool path.
 
 Measures how much the AGT governance gates add to a tool call by comparing, per tool:
-  (a) RAW   — the bare tool function (e.g. ``local_tools.calc({...})``): the latency floor.
+  (a) RAW   — the bare tool function (e.g. ``local_tools.pii_scan({...})``): the latency floor.
   (b) GOVERNED — ``local_tools.run_local_tool(server, tool, {...})``, which runs the policy
       engine (``_enforce``, default-deny), the McpAuthPolicy gateway (per-server allowlist +
       auth method + TLS), and the §4.2 no-credential boundary, then dispatches to the same
@@ -131,23 +131,17 @@ def _time_sync(fn: Callable[[], Any], iters: int) -> list[float]:
 
 
 # Each case: a label, the RAW sync call, and the GOVERNED async call. The arguments are
-# fixed deterministic inputs so timing reflects the path, not input-dependent work.
+# fixed deterministic inputs so timing reflects the path, not input-dependent work. The
+# benchmarked tool is the REAL PII / DLP screen (tool.pii) — a representative governance
+# workload (regex classification + Luhn validation + redaction), not a toy.
+_PII_TEXT = "Contact alice@example.com, card 4242424242424242, SSN 123-45-6789."
 _CASES = [
     {
-        "tool": "calc",
-        "server": "local-calc",
-        "args": {"expression": "2+3*4"},
-        "raw": lambda: local_tools.calc({"expression": "2+3*4"}),
-        "governed": lambda: local_tools.run_local_tool("local-calc", "calc",
-                                                       {"expression": "2+3*4"}),
-    },
-    {
-        "tool": "units",
-        "server": "local-units",
-        "args": {"value": 1, "from": "km", "to": "m"},
-        "raw": lambda: local_tools.units({"value": 1, "from": "km", "to": "m"}),
-        "governed": lambda: local_tools.run_local_tool("local-units", "units",
-                                                       {"value": 1, "from": "km", "to": "m"}),
+        "tool": "pii",
+        "server": "pii-scan",
+        "args": {"text": _PII_TEXT},
+        "raw": lambda: local_tools.pii_scan({"text": _PII_TEXT}),
+        "governed": lambda: local_tools.run_local_tool("pii-scan", "scan", {"text": _PII_TEXT}),
     },
 ]
 
@@ -240,7 +234,7 @@ class _patched:
     REAL governed tool while simulating ONLY the crypto/identity/registry gates that need live
     infra (Ed25519 verify, AgentMesh registry trust, JWKS issuer validation) — exactly the
     seams tests/test_a2a_tool.py stubs. The signing/verify here is simulated, but the policy
-    default-deny gate, the assertion RECIPIENT-binding shape, the MCP gateway, and the calc
+    default-deny gate, the assertion RECIPIENT-binding shape, the MCP gateway, and the PII-scan
     tool all run for real, so the measured cost reflects the genuine governed delegation path
     minus only the (separately-characterised) asymmetric-crypto + socket time."""
 
@@ -266,15 +260,15 @@ async def bench_delegated(iters: int = _DEFAULT_ITERS) -> dict[str, Any]:
       sign_outbound_message (SEND side)
         → HTTP POST /a2a/tool (ASGITransport — no socket, no network)
         → receiver: verify signature + registry trust + recipient-bound assertion + policy
-          default-deny (_enforce) + run_local_tool (MCP gateway + calc tool)
+          default-deny (_enforce) + run_local_tool (MCP gateway + PII-scan tool)
         → DID-signed response
         → verify response signature (caller side).
 
     REAL vs simulated: the policy engine, the MCP gateway, the assertion recipient/expiry
-    binding shape, and the calc tool all run for real. The Ed25519 sign/verify, the AgentMesh
-    registry trust lookup, and the JWKS issuer validation are simulated (they need live infra),
-    exactly as tests/test_a2a_tool.py does — so this is the governed delegation path minus only
-    the asymmetric-crypto + socket cost, which the report calls out explicitly.
+    binding shape, and the PII-scan tool all run for real. The Ed25519 sign/verify, the
+    AgentMesh registry trust lookup, and the JWKS issuer validation are simulated (they need
+    live infra), exactly as tests/test_a2a_tool.py does — so this is the governed delegation
+    path minus only the asymmetric-crypto + socket cost, which the report calls out explicitly.
 
     Returns the structured results (same stat shape as the local benchmark) and includes a
     comparison against the LOCAL governed p50 from results_local.json (the cost of the secure
@@ -293,8 +287,8 @@ async def bench_delegated(iters: int = _DEFAULT_ITERS) -> dict[str, Any]:
     # what the endpoint validates and runs.
     def _make_body() -> dict[str, Any]:
         return {
-            "capability": "tool.calc",
-            "arguments": {"expression": "2+3*4"},
+            "capability": "tool.pii",
+            "arguments": {"text": "Contact alice@example.com, card 4242424242424242."},
             "source_division": "division-b",
             "user_assertion": {
                 "sub": "x", "email": "alice@example.com", "email_verified": True,
@@ -385,7 +379,7 @@ async def bench_delegated(iters: int = _DEFAULT_ITERS) -> dict[str, Any]:
         try:
             local = json.loads(_RESULTS_PATH.read_text(encoding="utf-8"))
             for case in local.get("cases", []):
-                if case.get("server") == "local-calc":
+                if case.get("server") == "pii-scan":
                     local_governed_p50 = case["governed"]["p50"]
                     break
         except Exception:
@@ -407,10 +401,10 @@ async def bench_delegated(iters: int = _DEFAULT_ITERS) -> dict[str, Any]:
         "transport": "httpx ASGITransport (in-process, no network)",
         "note": "Full governed /a2a/tool round-trip: sign -> POST -> verify+trust+assertion+"
                 "policy+run_local_tool -> signed response -> verify. REAL policy engine, MCP "
-                "gateway, assertion recipient-binding, and calc tool; SIMULATED Ed25519 "
+                "gateway, assertion recipient-binding, and PII-scan tool; SIMULATED Ed25519 "
                 "sign/verify + AgentMesh registry trust + JWKS issuer validation (live-infra "
                 "seams, stubbed exactly as tests/test_a2a_tool.py does).",
-        "capability": "tool.calc",
+        "capability": "tool.pii",
         "delegated": delegated,
         "comparison_to_local": comparison,
     }

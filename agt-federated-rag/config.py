@@ -267,6 +267,21 @@ class Settings(BaseSettings):
     tool_delegation_enabled: bool = True
     max_tool_delegations: int = 3
 
+    # peer_tool_map — CONFIGURED (broker-less) capability → peer-DID ROUTING TABLE. A JSON
+    # object mapping EACH tool capability to the DID of the trusted peer that serves it; a
+    # division serves some capabilities LOCALLY (AGT_LOCAL_TOOLS) and routes the OTHERS to
+    # peers — and DIFFERENT capabilities can route to DIFFERENT peers, e.g.
+    #   PEER_TOOL_MAP={"tool.compliance":"did:mesh:division-b","tool.risk":"did:mesh:division-c"}
+    # This lets a template Kubernetes deployment do cross-agent tool delegation with NO extra
+    # discovery-broker service: when no broker is configured (or it is unreachable / returns
+    # nothing), find_peer_for_capability looks the SPECIFIC capability up here to learn WHICH
+    # trusted peer serves it. SECURITY — this map only names the peer DID; the peer's agent_url
+    # and division ALWAYS come from the operator-curated `peer_trust` anchor keyed on that DID,
+    # so an entry can only route to an already-trusted partner (a DID not in peer_trust resolves
+    # to nothing — never a fabricated peer). Empty (default) → configured routing is off and
+    # delegation relies on the discovery broker alone.
+    peer_tool_map: str = ""
+
     # ── AGT Policy Engine (Agent OS) ─────────────────────────────────────────
     # Path to YAML policy directory (loaded at startup).
     policy_dir: str = "agent/policies"
@@ -391,6 +406,22 @@ class Settings(BaseSettings):
                 "division_id": "",
             }}
         return {}
+
+    @property
+    def peer_tool_map_dict(self) -> dict:
+        """Parsed PEER_TOOL_MAP: ``{tool_capability: peer_did}`` for broker-less, CONFIGURED
+        capability routing. A malformed value parses to ``{}`` (configured routing off) so a
+        bad env var degrades gracefully rather than crashing — the broker path still applies.
+        The peer_did here is only a SELECTOR; the peer's url/division come from `peer_trust`."""
+        import json
+        raw = self.peer_tool_map.strip()
+        if not raw:
+            return {}
+        try:
+            m = json.loads(raw)
+            return m if isinstance(m, dict) else {}
+        except Exception:
+            return {}
 
     @property
     def trusted_issuers_list(self) -> list[str]:

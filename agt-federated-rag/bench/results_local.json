@@ -1,64 +1,35 @@
 {
   "scope": "local_governed_path",
-  "iterations": 1000,
+  "iterations": 300,
   "warmup": 50,
   "note": "Measures the in-process LOCAL governed path (policy + gateway + caller). The cross-agent DELEGATED path (sign + HTTP + verify) is benchmarked separately \u2014 see bench_delegated().",
   "cases": [
     {
-      "tool": "calc",
-      "server": "local-calc",
+      "tool": "pii",
+      "server": "pii-scan",
       "args": {
-        "expression": "2+3*4"
+        "text": "Contact alice@example.com, card 4242424242424242, SSN 123-45-6789."
       },
       "raw": {
-        "count": 1000,
-        "mean": 25.4975,
-        "p50": 23.5,
-        "p95": 44.2,
-        "p99": 62.6,
-        "min": 21.3,
-        "max": 70.3
+        "count": 300,
+        "mean": 104.46666666666667,
+        "p50": 101.8,
+        "p95": 150.7,
+        "p99": 167.7,
+        "min": 74.8,
+        "max": 195.0
       },
       "governed": {
-        "count": 1000,
-        "mean": 153.9447,
-        "p50": 155.0,
-        "p95": 161.8,
-        "p99": 193.8,
-        "min": 143.6,
-        "max": 280.7
+        "count": 300,
+        "mean": 254.82533333333336,
+        "p50": 250.0,
+        "p95": 299.4,
+        "p99": 436.0,
+        "min": 197.2,
+        "max": 508.9
       },
-      "overhead_us": 128.4472,
-      "overhead_pct": 503.7638984214139
-    },
-    {
-      "tool": "units",
-      "server": "local-units",
-      "args": {
-        "value": 1,
-        "from": "km",
-        "to": "m"
-      },
-      "raw": {
-        "count": 1000,
-        "mean": 1.9809,
-        "p50": 2.0,
-        "p95": 2.0,
-        "p99": 2.1,
-        "min": 1.9,
-        "max": 2.7
-      },
-      "governed": {
-        "count": 1000,
-        "mean": 119.8025,
-        "p50": 120.9,
-        "p95": 133.7,
-        "p99": 162.0,
-        "min": 109.8,
-        "max": 207.2
-      },
-      "overhead_us": 117.82159999999999,
-      "overhead_pct": 5947.882275733252
+      "overhead_us": 150.3586666666667,
+      "overhead_pct": 143.92980216975113
     }
   ]
 }

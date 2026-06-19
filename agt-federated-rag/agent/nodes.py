@@ -1184,54 +1184,98 @@ async def format_response(state: AgentState) -> dict[str, Any]:
 # Simple, deterministic capability ROUTER for the demo. PLUGGABLE: replace _route_capability
 # with an LLM tool-router (return the capability string) without touching solve_with_tools.
 # Kept transparent (no model call) so the demo is reproducible and the routing is auditable.
-_CALC_EXPR_RE = re.compile(r"^\s*[-+0-9.\s()*/%^a-z,]+\s*$", re.IGNORECASE)
-_UNITS_RE = re.compile(
-    r"convert\s+(?P<value>-?\d+(?:\.\d+)?)\s*(?P<from>[a-zA-Z]+)\s+to\s+(?P<to>[a-zA-Z]+)",
-    re.IGNORECASE,
+#
+# The four real governance tools (tools/local_tools.py) — note the argument KEY differs per
+# tool, so the router builds the right shape:
+#   * tool.pii        — PII / DLP screen          ({"text": <free text>}   → findings + redacted)
+#   * tool.classify   — data-sensitivity label    ({"text": <free text>}   → label + handling)
+#   * tool.risk       — EU AI Act risk-tier assess({"description": <text>} → tier + obligations)
+#   * tool.compliance — EU AI Act / GDPR lookup   ({"topic": <text>}       → article matches)
+# Keyword-triggered (case-insensitive substring). ORDER IS THE TIE-BREAK and is deliberate:
+# the more SPECIFIC intents are checked before the broad obligation lookup. PII screening and
+# sensitivity labelling are unambiguous verbs; risk TIERING uses multi-word phrases ("risk
+# tier", "assess the risk") so the compliance keyword "high-risk" does NOT pull an article
+# lookup into the risk tool; compliance is the broad fallback for regulation/obligation text.
+_PII_KEYWORDS: tuple[str, ...] = (
+    "pii", "personal data", "personally identifiable", "redact", "redaction", "screen for",
+    "scan for", "dlp", "anonymi",                 # anonymise / anonymize
+)
+_CLASSIFY_KEYWORDS: tuple[str, ...] = (
+    "classify", "classification", "sensitivity", "sensitivity label", "data label",
+    "label this", "label the", "confidentiality level", "restricted or public",
+    "how sensitive", "sensitive is",        # "how sensitive is this …"
+)
+_RISK_KEYWORDS: tuple[str, ...] = (
+    "risk tier", "risk-tier", "risk level", "risk category", "risk classification",
+    "assess the risk", "risk assessment", "assess this", "assess the", "what tier",
+    "which tier", "tier this", "is this prohibited", "unacceptable risk",
+    "is this high-risk", "is this high risk", "ai system", "ai use case",  # risk-tiering intent
+)
+_COMPLIANCE_KEYWORDS: tuple[str, ...] = (
+    "regulation", "regulatory", "compliance", "compliant", "obligation", "article",
+    "which law", "what law", "legal requirement", "eu ai act", "ai act", "gdpr",
+    "high-risk", "high risk", "transparency", "human oversight", "data subject",
 )
 
 
 def _route_capability(problem: str) -> tuple[str, dict] | None:
     """Map a sub-problem to a (capability, arguments) pair, or None if no tool fits.
 
-    Deterministic demo router:
-      * ``convert <value> <unit> to <unit>``           → ("tool.units", {value, from, to})
-      * a bare arithmetic expression (digits + ops)    → ("tool.calc",  {expression})
+    Deterministic demo router (keyword-matched, no model call), checked most-specific first:
+      * screen / scan / redact / PII / DLP               → ("tool.pii", {"text": <problem>})
+      * classify / sensitivity / label                   → ("tool.classify", {"text": <problem>})
+      * risk tier / assess the risk / which tier         → ("tool.risk", {"description": <problem>})
+      * regulation / compliance / obligation / article /
+        EU AI Act / GDPR                                 → ("tool.compliance", {"topic": <problem>})
     Returns None when the text matches no tool grammar (the caller then degrades).
     PLUGGABLE: an LLM tool-router can replace this body; the contract is just the return type.
     """
     text = (problem or "").strip()
     if not text:
         return None
-    m = _UNITS_RE.search(text)
-    if m:
-        return ("tool.units", {
-            "value": float(m.group("value")),
-            "from": m.group("from"),
-            "to": m.group("to"),
-        })
-    # Arithmetic: only digits/operators/known function letters — no prose. A '^' (common
-    # human power notation) is normalised to Python's '**' for the calc evaluator.
-    if any(ch.isdigit() for ch in text) and _CALC_EXPR_RE.match(text):
-        return ("tool.calc", {"expression": text.replace("^", "**")})
+    low = text.lower()
+    # PII screen — an explicit "screen/scan/redact … PII" request; the whole text IS the input.
+    if any(kw in low for kw in _PII_KEYWORDS):
+        return ("tool.pii", {"text": text})
+    # Data-sensitivity classification — also takes the whole text as input.
+    if any(kw in low for kw in _CLASSIFY_KEYWORDS):
+        return ("tool.classify", {"text": text})
+    # EU AI Act risk TIERING of an AI system / use case — input key is "description".
+    if any(kw in low for kw in _RISK_KEYWORDS):
+        return ("tool.risk", {"description": text})
+    # Compliance / obligation lookup (broad fallback) — input key is "topic".
+    if any(kw in low for kw in _COMPLIANCE_KEYWORDS):
+        return ("tool.compliance", {"topic": text})
     return None
 
 
 async def solve_with_tools(
-    problem: str,
+    problem: str | None = None,
     *,
     user_id: str,
+    capability: str | None = None,
+    arguments: dict | None = None,
     build_assertion=None,
     max_delegations: int | None = None,
 ) -> dict[str, Any]:
     """Solve a sub-problem with a GOVERNED tool — locally if we serve the capability, else
     by DELEGATING the tool call to a peer over the DID-signed /a2a/tool channel.
 
+    Two ways to name the work (the /solve endpoint accepts either form from the user):
+      * DIRECT — pass ``capability`` + ``arguments`` explicitly (the caller already knows the
+        tool, e.g. ``tool.pii`` with ``{"text": ...}``); routing is skipped.
+      * ROUTED — pass ``problem`` (free text); _route_capability maps it to (capability,
+        arguments). This is the pluggable router seam.
+
     Args:
-      problem:        the sub-problem text (routed to a capability by _route_capability).
+      problem:        the sub-problem text, routed to a capability by _route_capability. Ignored
+                      when ``capability`` is given explicitly.
       user_id:        the authenticated principal the tool runs on behalf of (audited;
                       the LOCAL path runs under our own authz, the REMOTE path forwards a
                       recipient-bound assertion the peer re-authorizes).
+      capability:     OPTIONAL explicit capability (e.g. "tool.pii"); when set, ``arguments`` is
+                      passed straight to the tool and the router is bypassed.
+      arguments:      OPTIONAL explicit tool arguments (used with ``capability``).
       build_assertion: OPTIONAL ``(audience_did) -> dict`` override that mints the
                       RECIPIENT-BOUND user assertion for a peer. When omitted (the default,
                       and how the request path uses this), the assertion is minted EXACTLY as
@@ -1248,12 +1292,16 @@ async def solve_with_tools(
     raises for an expected degradation (unknown capability, no peer, delegation cap, peer
     failure) — those return a structured failure the caller can surface.
     """
-    cap_route = _route_capability(problem)
-    if cap_route is None:
-        log.info("solve_with_tools_no_capability", user_id=user_id, agt_audit=True)
-        return {"status": "no_capability", "source": "none",
-                "reason": "no tool capability matches this sub-problem"}
-    capability, arguments = cap_route
+    # DIRECT capability wins over the router; otherwise route the free-text problem.
+    if capability:
+        arguments = arguments or {}
+    else:
+        cap_route = _route_capability(problem or "")
+        if cap_route is None:
+            log.info("solve_with_tools_no_capability", user_id=user_id, agt_audit=True)
+            return {"status": "no_capability", "source": "none",
+                    "reason": "no tool capability matches this sub-problem"}
+        capability, arguments = cap_route
 
     # ── LOCAL FIRST: if we serve the capability, run it through our governed executor ──
     from tools.local_tools import run_local_tool, server_for_capability

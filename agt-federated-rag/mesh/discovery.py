@@ -63,7 +63,7 @@ def discovery_url() -> str | None:
 
 def advertised_capabilities() -> list[str]:
     """Capabilities this agent advertises to the broker (AGENT_CAPABILITIES env, CSV) PLUS
-    every LOCAL tool capability (from local_server_configs, e.g. "tool.calc"/"tool.units").
+    every LOCAL tool capability (from local_server_configs, e.g. "tool.pii"/"tool.compliance").
 
     So a peer can discover us by a TOOL capability over the /a2a/tool channel without an
     operator having to hand-list each tool in AGENT_CAPABILITIES — the in-process tool
@@ -260,35 +260,92 @@ class ToolPeer:
     capability: str
 
 
+def _tool_peer_from_anchor(did: str, capability: str) -> ToolPeer | None:
+    """Build a ToolPeer for ``did`` from the operator-curated DATA-PATH trust anchor, or None
+    if ``did`` is not a trusted peer / has no anchor URL.
+
+    SECURITY (single source of truth for WHERE we send): the peer's agent_url + division come
+    ONLY from ``settings.peer_trust[did]`` — never from a broker entry or the peer_tool_map.
+    A DID that is not in peer_trust resolves to None, so neither a rogue broker row nor a
+    misconfigured peer_tool_map entry can ever fabricate a peer we'd talk to."""
+    anchor = settings.peer_trust.get(did) or {}
+    if not anchor:
+        return None
+    agent_url = str(anchor.get("agent_url") or "").rstrip("/")
+    if not agent_url:
+        return None
+    return ToolPeer(
+        agent_url=agent_url,
+        agent_did=did,
+        division_id=str(anchor.get("division_id") or ""),
+        capability=capability,
+    )
+
+
+def _configured_tool_peer(capability: str) -> ToolPeer | None:
+    """Broker-less CONFIGURED fallback: resolve ``capability`` via ``settings.peer_tool_map``
+    (capability → peer_did) and the ``peer_trust`` anchor, so a template deployment can
+    delegate tools with NO discovery-broker service.
+
+    The map only names WHICH trusted peer serves the capability; _tool_peer_from_anchor takes
+    the url/division from peer_trust (never fabricated). An unmapped capability, or a mapped
+    DID that is NOT a trust anchor, yields None (graceful degradation — fail-closed)."""
+    did = str(settings.peer_tool_map_dict.get(capability) or "").strip()
+    if not did:
+        return None
+    peer = _tool_peer_from_anchor(did, capability)
+    if peer is None:
+        # The map points at a DID we don't trust (or that has no anchor URL) — refuse to
+        # fabricate a peer. This is the security boundary: peer_tool_map can only SELECT
+        # among already-trusted peers, it can never add one.
+        log.info("tool_routing_configured_peer_not_trusted", peer_did=did, capability=capability)
+        return None
+    log.info("tool_routing_configured_peer_selected", peer_did=peer.agent_did,
+             division=peer.division_id, capability=capability, agt_audit=True)
+    return peer
+
+
 async def find_peer_for_capability(capability: str) -> ToolPeer | None:
-    """Discover a TRUSTED peer that advertises a given TOOL capability (e.g. "tool.calc").
+    """Discover a TRUSTED peer that advertises a given TOOL capability (e.g. "tool.pii").
 
-    Mirrors resolve_delegation_target's discover → negotiate flow but for the cross-agent
-    TOOL channel: it asks the broker for peers advertising ``capability``, keeps only those
-    whose DID is in this division's DATA-PATH trust anchor (settings.peer_trust), confirms
-    the capability via the lightweight negotiate ("can you help with <capability>?"), and
-    resolves the WINNER's agent_url + division from the trust anchor (never the broker — a
-    rogue broker entry can't steer where we actually send). Returns a ToolPeer, or None.
+    Two routing sources, broker FIRST (dynamic) then a static CONFIGURED fallback:
 
-    GRACEFUL DEGRADATION (same posture as the query path): no broker configured, broker
-    unreachable, broker returns nothing, or no trusted+negotiable peer → None, so the caller
+      1. DISCOVERY BROKER (primary, dynamic): ask the broker for peers advertising
+         ``capability``, keep only those whose DID is in this division's DATA-PATH trust anchor
+         (settings.peer_trust), confirm via the lightweight negotiate ("can you help with
+         <capability>?"), and resolve the WINNER's agent_url + division from the trust anchor
+         (never the broker — a rogue broker entry can't steer where we actually send).
+
+      2. CONFIGURED peer_tool_map (fallback, static): when no broker is configured, the broker
+         is unreachable, or it returns no trusted+negotiable peer, look the capability up in
+         settings.peer_tool_map (capability → peer_did) and build the ToolPeer from the trust
+         anchor for that DID. This lets a template Kubernetes deployment do cross-agent tool
+         delegation with NO extra broker service. SECURITY: the map only says WHICH trusted
+         peer serves the capability; the agent_url/DID/division ALWAYS come from peer_trust, so
+         a peer_tool_map DID that is not a trust anchor resolves to None (never fabricated).
+         This reuses the existing agent→agent NetworkPolicy (same trusted peer URL).
+
+    GRACEFUL DEGRADATION: no broker AND no configured route, broker down with no configured
+    route, broker returns nothing trusted and no configured route → None, so the caller
     (solve_with_tools) degrades cleanly ("no agent can serve capability X") instead of crashing.
     NEVER raises.
     """
     if not capability or not capability.strip():
         return None
+
     url = discovery_url()
     if not url:
-        log.debug("tool_discovery_disabled", capability=capability)
-        return None
+        # No broker — try the broker-less CONFIGURED route before giving up.
+        log.debug("tool_discovery_disabled_try_configured", capability=capability)
+        return _configured_tool_peer(capability)
 
     await _ensure_registered(url)
 
     try:
         peers = await _discover_peers(url, capability=capability)
-    except Exception as exc:  # noqa: BLE001 — broker down → graceful None
+    except Exception as exc:  # noqa: BLE001 — broker down → fall back to the configured route
         log.warning("tool_discovery_lookup_failed", url=url, capability=capability, error=str(exc))
-        return None
+        return _configured_tool_peer(capability)
 
     for peer in peers or []:
         if not _trusted(peer):
@@ -300,20 +357,14 @@ async def find_peer_for_capability(capability: str) -> ToolPeer | None:
         # (now trust-verified) DID — the broker only says WHICH trusted DID claims the
         # capability, the anchor says WHERE it lives (defence-in-depth A1c/A4, as above).
         did = str(peer.get("agent_did") or "")
-        anchor = settings.peer_trust.get(did) or {}
-        agent_url = str(anchor.get("agent_url") or "").rstrip("/")
-        if not agent_url:
+        target = _tool_peer_from_anchor(did, capability)
+        if target is None:
             log.info("tool_discovery_peer_has_no_anchor_url", peer_did=did, capability=capability)
             continue
-        target = ToolPeer(
-            agent_url=agent_url,
-            agent_did=did,
-            division_id=str(anchor.get("division_id") or ""),
-            capability=capability,
-        )
         log.info("tool_discovery_peer_selected", peer_did=did, division=target.division_id,
                  capability=capability, agt_audit=True)
         return target
 
-    log.info("tool_discovery_no_capable_peer", capability=capability)
-    return None
+    # Broker yielded no trusted+negotiable peer — try the broker-less CONFIGURED route.
+    log.info("tool_discovery_no_capable_peer_try_configured", capability=capability)
+    return _configured_tool_peer(capability)
