@@ -2,7 +2,7 @@
 division_id: beta
 display_name: Division Beta
 port_base: 9100          # agent 9100, openfga 9101, keycloak 9102, temporal 9103/9104, qdrant 9105, redis 9106. Clean band (avoids co-resident project's reserved ports; old 8201 collided with its N=2 BACKEND). See onboard_division._reserved_ports.
-trusted_peers: [alpha]
+trusted_peers: [alpha, gamma, delta, epsilon]   # full 5-way mesh: every division federates with every other (one Kubernetes backend)
 docs_dir: tests/docs/cluster-b
 residency_mode: external
 seed_viewer: technical_architecture

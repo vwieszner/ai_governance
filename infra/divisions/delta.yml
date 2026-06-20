@@ -1,7 +1,7 @@
 division_id: delta
 display_name: Division Delta
 port_base: 9300          # agent 9300, openfga 9301, keycloak 9302, temporal 9303/9304, qdrant 9305, redis 9306 — free band (alpha=9000/beta=9100/gamma=9200 elsewhere).
-trusted_peers: [gamma, epsilon]   # gamma + epsilon are the k8s cross-department tool peers (two-way mesh)
+trusted_peers: [alpha, beta, gamma, epsilon]   # full 5-way mesh: every division federates with every other (one Kubernetes backend)
 docs_dir: tests/docs/cluster-b
 residency_mode: external
 seed_viewer: technical_architecture

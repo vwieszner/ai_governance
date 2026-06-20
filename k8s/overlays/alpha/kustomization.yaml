@@ -66,6 +66,13 @@ patches:
       - op: add
         path: /data/TEMPORAL_TASK_QUEUE
         value: approval-alpha
+      # Data division (no governance tools of its own): "none" => serves NO local tools, so it
+      # DELEGATES every tool capability to the specialist department that owns it (gamma=pii/
+      # compliance, delta=risk/classify, epsilon=fincheck) over the signed /a2a/tool channel.
+      # (Empty/unset would mean "serve ALL" — "none" is the serve-nothing sentinel.)
+      - op: add
+        path: /data/AGT_LOCAL_TOOLS
+        value: none
 
 # Per-division image tag (build/push agt-federated-rag:alpha, or use a digest).
 images:

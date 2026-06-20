@@ -4,7 +4,7 @@
 division_id: epsilon
 display_name: Division Epsilon (Finance)
 port_base: 9400          # agent 9400, openfga 9401, keycloak 9402, temporal 9403/9404, qdrant 9405, redis 9406. Clean band (verified against onboard_division._reserved_ports; next free above delta's 9300).
-trusted_peers: [gamma, delta]   # the two departments epsilon collaborates with (two-way tool mesh)
+trusted_peers: [alpha, beta, gamma, delta]   # full 5-way mesh: every division federates with every other (one Kubernetes backend)
 docs_dir: tests/docs/cluster-b
 residency_mode: external
 seed_viewer: q4_financial_results

@@ -4,7 +4,7 @@
 division_id: gamma
 display_name: Division Gamma
 port_base: 9200          # agent 9200, openfga 9201, keycloak 9202, temporal 9203/9204, qdrant 9205, redis 9206. Clean band (avoids co-resident project's reserved ports; old 8301 collided with its N=3 BACKEND). See onboard_division._reserved_ports.
-trusted_peers: [alpha, beta, delta, epsilon]   # delta + epsilon are k8s cross-department tool peers (two-way mesh)
+trusted_peers: [alpha, beta, delta, epsilon]   # full 5-way mesh: every division federates with every other (one Kubernetes backend)
 docs_dir: tests/docs/cluster-a
 residency_mode: external
 seed_viewer: data_retention_policy

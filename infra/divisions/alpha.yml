@@ -5,7 +5,7 @@
 division_id: alpha
 display_name: Division Alpha
 port_base: 9000          # agent 9000, openfga 9001, keycloak 9002, temporal 9003/9004, qdrant 9005, redis 9006. Clean band 8881-9328 — avoids the co-resident project's reserved ports (its BACKEND=8000+N*100+1 = 8101/8201/8401 collided with our openfga=port_base+1). See onboard_division._reserved_ports.
-trusted_peers: [beta]    # peer divisions this one federates with (used by M2/M3)
+trusted_peers: [beta, gamma, delta, epsilon]   # full 5-way mesh: every division federates with every other (one Kubernetes backend)
 docs_dir: tests/docs/cluster-a
 residency_mode: external
 # Authz seed: the doc alice may view directly, and the doc that needs the
