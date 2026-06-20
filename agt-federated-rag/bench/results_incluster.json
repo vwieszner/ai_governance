@@ -1,0 +1,37 @@
+{
+  "context": "kind-agt",
+  "division": "gamma",
+  "method": "Load driven from INSIDE the cluster (k8s Job hitting the agent ClusterIP at http://agent:8000) — NO kubectl port-forward in the path. Deterministic governed tool path (POST /solve tool.pii: regex + Luhn + redaction + policy), no LLM. Token obtained from the in-cluster Keycloak with the Host header set to the agent's expected OIDC issuer. The per-subject 60/min anti-abuse rate limit was LEFT IN PLACE; each sweep level was paced 62s into a fresh window and kept to 50 requests so it is clean of 429s WITHOUT weakening the control.",
+  "cluster_shape": {
+    "nodes": 1,
+    "note": "Single-node kind cluster: all 3 agent replicas AND all infra (Qdrant/Postgres/Keycloak/OpenFGA/Redis for every division) share this one host's CPUs. This — not the architecture — is the throughput wall."
+  },
+  "headline": {
+    "port_forward_ceiling_rps": 18,
+    "in_cluster_peak_rps": 29.7,
+    "finding": "Removing the kubectl port-forward lifted the ceiling from ~18 rps to ~30 rps; the port-forward was a real dev-rig bottleneck, not the system."
+  },
+  "replica_scaling_at_concurrency_8": {
+    "1_replica": { "throughput_rps": 13.4, "p50_ms": 572, "p95_ms": 785, "errors": 0, "rate_limited": 0 },
+    "3_replicas": { "throughput_rps": 29.7, "p50_ms": 265, "p95_ms": 372, "errors": 0, "rate_limited": 0 },
+    "scaling_factor": 2.2,
+    "finding": "3 replicas deliver ~2.2x the throughput and ~half the p50 latency of 1 replica, on a SINGLE node — the agent is partly I/O-bound on OpenFGA/Qdrant/Redis, so replicas overlap that wait. On a multi-node cluster this scales closer to linear."
+  },
+  "in_cluster_sweep_3_replicas": {
+    "total_per_level": 50, "pace_s": 62,
+    "levels": [
+      { "concurrency": 1,   "throughput_rps": 16.4, "p50_ms": 58.6,   "p95_ms": 87.0,   "errors": 0, "rate_limited": 0 },
+      { "concurrency": 8,   "throughput_rps": 29.7, "p50_ms": 264.7,  "p95_ms": 372.2,  "errors": 0, "rate_limited": 0 },
+      { "concurrency": 16,  "throughput_rps": 23.3, "p50_ms": 530.8,  "p95_ms": 1024.0, "errors": 0, "rate_limited": 0 },
+      { "concurrency": 32,  "throughput_rps": 24.6, "p50_ms": 1027.6, "p95_ms": 1335.2, "errors": 0, "rate_limited": 0 },
+      { "concurrency": 64,  "throughput_rps": 27.4, "p50_ms": 1038.7, "p95_ms": 1708.0, "errors": 0, "rate_limited": 0 },
+      { "concurrency": 128, "throughput_rps": 9.7,  "p50_ms": 3105.8, "p95_ms": 4006.8, "errors": 0, "rate_limited": 0 }
+    ],
+    "note": "Per-level samples are small (50, to stay under the rate limit) so individual rps points are noisy; the signal is the ~30 rps plateau (the one-node CPU ceiling) and 0 errors / 0 429s throughout."
+  },
+  "what_would_make_this_fully_production_representative": [
+    "Multi-node cluster (or real nodes) so replicas don't share one host's CPUs — then replica scaling approaches linear.",
+    "Raising (or per-tenant scaling) the 60/min anti-abuse rate limit to measure SUSTAINED throughput beyond burst windows — requires an explicit decision since it weakens a security control on a shared cluster.",
+    "A paid / self-hosted LLM endpoint to take the e2e /query path out of the NVIDIA free-tier cold-start + rate limit (the governed /solve path benchmarked here is already LLM-free)."
+  ]
+}
