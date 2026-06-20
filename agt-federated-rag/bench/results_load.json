@@ -1,0 +1,207 @@
+{
+  "context": "kind-agt",
+  "modes": {
+    "sweep": {
+      "mode": "sweep",
+      "division": "gamma",
+      "path": "local /solve tool.pii (deterministic)",
+      "total_per_level": 40,
+      "warmup": 0,
+      "pace_s": 62.0,
+      "levels": [
+        {
+          "concurrency": 1,
+          "stats": {
+            "count": 40,
+            "errors": 0,
+            "rate_limited": 0,
+            "duration_s": 2.5848,
+            "throughput_rps": 15.47,
+            "p50": 62.87,
+            "p95": 78.58,
+            "p99": 111.05,
+            "mean": 64.56,
+            "min": 49.39,
+            "max": 111.05
+          }
+        },
+        {
+          "concurrency": 4,
+          "stats": {
+            "count": 40,
+            "errors": 0,
+            "rate_limited": 0,
+            "duration_s": 2.0876,
+            "throughput_rps": 19.16,
+            "p50": 204.94,
+            "p95": 220.48,
+            "p99": 239.54,
+            "mean": 200.69,
+            "min": 84.85,
+            "max": 239.54
+          }
+        },
+        {
+          "concurrency": 8,
+          "stats": {
+            "count": 40,
+            "errors": 0,
+            "rate_limited": 0,
+            "duration_s": 2.1901,
+            "throughput_rps": 18.26,
+            "p50": 422.72,
+            "p95": 457.14,
+            "p99": 478.95,
+            "mean": 402.28,
+            "min": 121.84,
+            "max": 478.95
+          }
+        },
+        {
+          "concurrency": 16,
+          "stats": {
+            "count": 40,
+            "errors": 0,
+            "rate_limited": 0,
+            "duration_s": 2.2125,
+            "throughput_rps": 18.08,
+            "p50": 844.0,
+            "p95": 863.53,
+            "p99": 925.6,
+            "mean": 724.8,
+            "min": 145.43,
+            "max": 925.6
+          }
+        },
+        {
+          "concurrency": 32,
+          "stats": {
+            "count": 40,
+            "errors": 0,
+            "rate_limited": 0,
+            "duration_s": 2.3488,
+            "throughput_rps": 17.03,
+            "p50": 1258.72,
+            "p95": 2224.74,
+            "p99": 2337.01,
+            "mean": 1219.65,
+            "min": 269.67,
+            "max": 2337.01
+          }
+        },
+        {
+          "concurrency": 64,
+          "stats": {
+            "count": 40,
+            "errors": 0,
+            "rate_limited": 0,
+            "duration_s": 2.5054,
+            "throughput_rps": 15.97,
+            "p50": 1454.71,
+            "p95": 2361.59,
+            "p99": 2496.54,
+            "mean": 1450.41,
+            "min": 209.98,
+            "max": 2496.54
+          }
+        }
+      ]
+    },
+    "xdiv": {
+      "mode": "xdiv",
+      "division": "delta",
+      "concurrency": 16,
+      "total": 40,
+      "warmup": 0,
+      "delegated": {
+        "path": "delta /solve tool.pii -> DELEGATES to gamma (/a2a/tool)",
+        "stats": {
+          "count": 40,
+          "errors": 0,
+          "rate_limited": 0,
+          "duration_s": 6.5691,
+          "throughput_rps": 6.09,
+          "p50": 2220.59,
+          "p95": 3762.45,
+          "p99": 3951.21,
+          "mean": 2456.46,
+          "min": 1159.52,
+          "max": 3951.21
+        }
+      },
+      "local": {
+        "path": "gamma /solve tool.pii (LOCAL owner, baseline)",
+        "stats": {
+          "count": 40,
+          "errors": 0,
+          "rate_limited": 0,
+          "duration_s": 2.1721,
+          "throughput_rps": 18.42,
+          "p50": 823.16,
+          "p95": 852.26,
+          "p99": 966.97,
+          "mean": 710.19,
+          "min": 124.26,
+          "max": 966.97
+        }
+      },
+      "comparison": {
+        "delegated_p50_ms": 2220.59,
+        "local_p50_ms": 823.16,
+        "secure_hop_overhead_p50_ms": 1397.43,
+        "delegated_over_local_x": 2.7,
+        "delegated_throughput_rps": 6.09,
+        "local_throughput_rps": 18.42
+      }
+    },
+    "e2e": {
+      "mode": "e2e",
+      "division": "gamma",
+      "path": "/query full RAG (retrieve -> LLM -> govern)",
+      "concurrency": 1,
+      "total": 5,
+      "warmup": 0,
+      "caveat": "LLM (NVIDIA NIM free tier) dominates this latency and rate-limits it; this is the END-USER path, NOT the system's throughput ceiling.",
+      "stats": {
+        "count": 5,
+        "errors": 0,
+        "rate_limited": 0,
+        "duration_s": 94.5465,
+        "throughput_rps": 0.05,
+        "p50": 9065.03,
+        "p95": 55765.78,
+        "p99": 55765.78,
+        "mean": 18909.19,
+        "min": 5205.02,
+        "max": 55765.78
+      }
+    },
+    "throughput": {
+      "mode": "throughput",
+      "division": "gamma",
+      "path": "local /solve tool.pii (deterministic)",
+      "concurrency": 16,
+      "total": 50,
+      "warmup": 0,
+      "stats": {
+        "count": 50,
+        "errors": 0,
+        "rate_limited": 0,
+        "duration_s": 2.9322,
+        "throughput_rps": 17.05,
+        "p50": 876.11,
+        "p95": 959.53,
+        "p99": 1028.31,
+        "mean": 797.09,
+        "min": 158.07,
+        "max": 1028.31
+      }
+    }
+  },
+  "caveats": [
+    "single-node kind cluster \u2014 all divisions + their infra (Qdrant/Postgres/Keycloak/OpenFGA/Redis) share one host's CPU; this is a dev cluster, not production hardware.",
+    "kubectl port-forward adds a localhost proxy hop in front of every request \u2014 real in-cluster service-to-service latency is lower than these numbers.",
+    "e2e (/query) latency is dominated by the NVIDIA NIM free-tier LLM, which also rate-limits; treat it as the end-USER path, not the system's deterministic ceiling.",
+    "the governed tool path (/solve tool.pii) is DETERMINISTIC (regex + Luhn + redaction + policy engine) \u2014 no LLM \u2014 so throughput/sweep/xdiv reflect the SYSTEM, not a model."
+  ]
+}
