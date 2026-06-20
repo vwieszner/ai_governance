@@ -231,8 +231,17 @@ _temporal_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def _get_retrievers() -> list[Any]:
-    """Build + cache the configured retriever fan-out (qdrant / neo4j seam / any
-    RaaS). One-time ``setup()`` per retriever (collection/index/egress check).
+    """Build + cache the ACTIVE retriever fan-out by PRESENCE: a backend is included only
+    if its one-time ``setup()`` probe succeeds — i.e. it is actually ATTACHED (Qdrant
+    collection reachable; Neo4j deployed + its vector index present; a RaaS egress allowed).
+
+    If a backend is NOT attached (e.g. no Neo4j is deployed), its setup() probe fails and it
+    is EXCLUDED here — so it never runs per query: no bolt:// connection attempts, no retry
+    storm, no errors, no latency cost. Attach the backend (deploy it + populate it) and it
+    joins the fan-out on the next process start. This is the "not attached → doesn't run;
+    attached → runs" contract. (retrieve_local additionally degrades a per-request runtime
+    hiccup of an attached backend — defence in depth.) Cached for the process lifetime; a
+    newly-attached backend is picked up on restart (attaching a backend is a deploy anyway).
     See rag/retriever.py for the governance contract."""
     global _retrievers
     if _retrievers is not None:
@@ -241,9 +250,22 @@ async def _get_retrievers() -> list[Any]:
         if _retrievers is None:
             from rag.retriever import build_retrievers
 
+            async def _probe(r: Any) -> Any:
+                try:
+                    await asyncio.wait_for(r.setup(), timeout=settings.retriever_timeout_seconds + 1.0)
+                    return r
+                except Exception as exc:  # noqa: BLE001 — not attached → exclude, don't run it
+                    log.warning("retriever_not_attached_excluded",
+                                retriever=getattr(r, "name", "?"), error=str(exc))
+                    return None
+
             insts = build_retrievers()
-            await asyncio.gather(*[r.setup() for r in insts])
-            _retrievers = insts
+            probed = await asyncio.gather(*[_probe(r) for r in insts])
+            active = [r for r in probed if r is not None]
+            if not active:
+                log.error("no_retrievers_attached")  # nothing reachable → retrieval is empty
+            log.info("retrievers_active", names=[r.name for r in active])
+            _retrievers = active
     return _retrievers
 
 
@@ -348,7 +370,29 @@ async def retrieve_local(state: AgentState) -> dict[str, Any]:
     # list here would build a MatchAny(any=[]) filter that matches zero points,
     # silently returning no results (the cause of the empty-answer bug).
     retrievers = await _get_retrievers()
-    results_per_retriever = await asyncio.gather(*[r.retrieve(query) for r in retrievers])
+
+    async def _retrieve_isolated(r: Any) -> list[dict[str, Any]]:
+        """Fan-out with GRACEFUL DEGRADATION: a retriever whose backend is slow or
+        unreachable returns [] instead of blocking or failing the whole query. This is
+        what makes retrieval fall back to Qdrant-only when an OPTIONAL backend (the Neo4j
+        graph seam, an external RaaS) is down — the documented behaviour. Two guards:
+          - asyncio.wait_for(retriever_timeout_seconds): a dead backend (e.g. Neo4j's
+            bolt:// connect retry-storm against a host with no Neo4j) can't consume the
+            request's latency budget;
+          - except: an isolated failure degrades this one backend, never crashes retrieval
+            (asyncio.gather without return_exceptions used to let one failed retriever kill
+            the query). Degrading here is safe — check_auth re-sources every served chunk's
+            TEXT from the trusted store, so a missing/failed backend can't leak or poison.
+        Add a working Neo4j (deploy it + a graph ingest) and this same path lights up."""
+        try:
+            return await asyncio.wait_for(
+                r.retrieve(query), timeout=settings.retriever_timeout_seconds
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade this backend, never crash retrieval
+            log.warning("retriever_degraded", retriever=getattr(r, "name", "?"), error=str(exc))
+            return []
+
+    results_per_retriever = await asyncio.gather(*[_retrieve_isolated(r) for r in retrievers])
 
     by_name = {r.name: res for r, res in zip(retrievers, results_per_retriever)}
     fused = rrf_fuse_many(results_per_retriever, final_limit=settings.qdrant_final_k)

@@ -86,22 +86,32 @@ class GraphRAGRetriever:
                     "Install: pip install neo4j neo4j-graphrag fastembed"
                 ) from exc
 
+            # Short connection/retry bounds so that when NO Neo4j is deployed (the default —
+            # the graph seam is optional), the bolt:// connect FAILS FAST instead of retry-
+            # storming for ~30s and blocking the executor thread. The retrieve_local fan-out
+            # already wall-clock-bounds + degrades this retriever; these driver-level bounds
+            # make the underlying thread give up quickly too (defence in depth).
             self._driver = neo4j.GraphDatabase.driver(
                 settings.neo4j_uri,
                 auth=(settings.neo4j_user, settings.neo4j_password),
+                connection_timeout=2.0,            # TCP connect gives up fast
+                connection_acquisition_timeout=2.0,
+                max_transaction_retry_time=2.0,    # don't retry-storm a dead host
             )
 
-            # Proactively verify the vector index exists before constructing the
-            # VectorRetriever — its __init__ probes the index and raises if it's
-            # absent (which would otherwise crash the whole query).
+            # Presence check: a usable graph backend means Neo4j is reachable AND has the
+            # vector index. If either is false (no Neo4j deployed, or deployed-but-empty),
+            # RAISE so the retriever fan-out (_get_retrievers) EXCLUDES this backend — it
+            # won't run per query at all ("not attached -> doesn't run"). _vector_index_exists
+            # also returns False when the connection itself fails (bounded by the driver's
+            # 2s connection_timeout, so this probe is fast). Attach a Neo4j + create the
+            # chunk_embedding index and this passes -> the backend joins the fan-out.
             if not self._vector_index_exists(neo4j, "chunk_embedding"):
-                log.warning(
-                    "neo4j.index_unavailable",
-                    index="chunk_embedding",
-                    detail="Neo4j vector index not found — degrading to Qdrant-only retrieval",
-                )
                 self._graph_unavailable = True
-                return
+                raise RuntimeError(
+                    "Neo4j graph backend not attached/usable (unreachable or missing the "
+                    "'chunk_embedding' vector index) — excluding it from the retriever fan-out"
+                )
 
             # Wrap fastembed in the neo4j-graphrag BaseEmbedder interface.
             embed_model = TextEmbedding(model_name=settings.qdrant_dense_model)

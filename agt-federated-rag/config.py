@@ -125,6 +125,12 @@ class Settings(BaseSettings):
     # an external (out-of-boundary) endpoint.
     raas_endpoints: list[RaasEndpoint] = Field(default_factory=list)
     raas_timeout_seconds: float = 10.0
+    # Per-retriever wall-clock bound in the retrieve_local fan-out. A retriever whose
+    # backend is slow/unreachable (e.g. the Neo4j graph seam when no Neo4j is deployed)
+    # degrades to [] after this, so retrieval falls back to the other backends (Qdrant)
+    # WITHOUT eating the request's latency budget or failing the query. Keep it well under
+    # the SRE latency budget so a dead optional backend never breaches it.
+    retriever_timeout_seconds: float = 3.0
 
     # ── Embeddings (pluggable DENSE backend) ──────────────────────────────────
     # The DENSE embedding can run LOCAL (FastEmbed ONNX, default) or be served by an
