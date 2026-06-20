@@ -52,6 +52,7 @@ Qdrant, and Keycloak.
 | Admin CLI | `agtctl` grant/revoke/list (users + groups), status, doctor | `scripts/agtctl.py` |
 | One-command bring-up | `bootstrap.ps1` / `bootstrap.sh`; pinned images + frozen deps | `scripts/` |
 | Kubernetes deployment | kustomize base + per-division overlays; per-namespace NetworkPolicy isolation; **one-command turnkey bring-up** `python scripts/bootstrap_k8s.py --divisions <id>` (apply → provision → ingest → DID → serve); verified Running on kind (alongside Compose) | `k8s/`, `scripts/bootstrap_k8s.py` |
+| **Multi-cluster federation** | **one cluster per division** (the multi-cloud-shaped topology) federated over routable URLs + DIDs; `python scripts/multicluster.py up --divisions gamma,delta` stands up + federates + proves cross-cluster tool delegation; deploy-anywhere guide for kind/EKS/GKE/AKS/on-prem | `scripts/multicluster.py`, `k8s/MULTICLUSTER.md` |
 
 ## Architecture at a glance
 

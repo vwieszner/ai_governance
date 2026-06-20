@@ -9,6 +9,13 @@ per-division physical isolation.
 > **This complements — it does NOT replace — the Compose path.** Local dev and the
 > demo still run on Compose via `scripts/onboard_division.py`. Kubernetes is for a
 > real multi-node / multi-cloud deployment.
+>
+> **Multi-cluster (one cluster per division) — the production-shaped topology:** see
+> **[`MULTICLUSTER.md`](MULTICLUSTER.md)** for deploying a division to ANY cluster
+> (kind/EKS/GKE/AKS/on-prem), exposing the agent with a routable endpoint, and federating
+> agents across clusters over routable URLs + DIDs. Local quickstart: `python
+> scripts/multicluster.py up --divisions gamma,delta` (one kind cluster per division,
+> federated + proven across clusters).
 
 ---
 

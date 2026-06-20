@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -40,8 +41,9 @@ import onboard_division as od  # noqa: E402
 VENV_PY = str(od.VENV_PY)
 
 
-def run(cmd: list[str], check: bool = True, capture: bool = False, stdin: str | None = None) -> str:
-    r = subprocess.run(cmd, cwd=str(ROOT), text=True, input=stdin,
+def run(cmd: list[str], check: bool = True, capture: bool = False, stdin: str | None = None,
+        env: dict | None = None) -> str:
+    r = subprocess.run(cmd, cwd=str(ROOT), text=True, input=stdin, env=env,
                        capture_output=True if capture else False)
     if capture and r.returncode != 0 and check:
         sys.stderr.write(r.stdout + r.stderr)
@@ -50,8 +52,32 @@ def run(cmd: list[str], check: bool = True, capture: bool = False, stdin: str | 
     return (r.stdout or "") if capture else ""
 
 
+# Transient kubectl-over-proxy failures on this host (Norton MITM): the connection is
+# occasionally aborted mid-handshake. CLAUDE.md flags this — retry rather than fail the run.
+_TRANSIENT = ("wsarecv", "connection was aborted", "tls handshake", "unexpected eof",
+              "i/o timeout", "connection reset", "couldn't get current server")
+
+
 def kubectl(ctx: str, *args: str, check: bool = True, capture: bool = False, stdin: str | None = None) -> str:
-    return run(["kubectl", "--context", ctx, *args], check=check, capture=capture, stdin=stdin)
+    """kubectl with retry on transient TLS/connection aborts (Norton proxy flakiness).
+
+    Always captures internally so a transient failure can be detected and retried; returns
+    stdout when capture=True (else ""), preserving the previous contract for callers."""
+    last = ""
+    for attempt in range(5):
+        r = subprocess.run(["kubectl", "--context", ctx, *args], cwd=str(ROOT), text=True,
+                           input=stdin, capture_output=True)
+        if r.returncode == 0:
+            return r.stdout or ""
+        last = (r.stdout or "") + (r.stderr or "")
+        if attempt < 4 and any(t in last.lower() for t in _TRANSIENT):
+            time.sleep(2)
+            continue
+        break
+    if check:
+        sys.stderr.write(last)
+        raise RuntimeError(f"command failed: kubectl {' '.join(args)}")
+    return last if capture else ""
 
 
 def port_base(div: str) -> int:
@@ -62,12 +88,32 @@ def port_base(div: str) -> int:
     raise RuntimeError(f"no port_base in {div}.yml")
 
 
-def make_secret_yaml(ctx: str, ns: str, div: str, store: str | None, model: str | None) -> str:
-    s = json.loads((ROOT / "infra" / "generated" / div / "secrets.json").read_text())
-    nv = ""
+def nvidia_key() -> str:
     for line in (ROOT / ".env").read_text().splitlines():
         if line.startswith("NVIDIA_API_KEY="):
-            nv = line.split("=", 1)[1].strip()
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def ingest_embedding_env(ctx: str, ns: str) -> dict[str, str]:
+    """The embedding config the HOST-side ingest must use, taken from the DEPLOYED configmap
+    (so it matches the cluster) + the NVIDIA key. Without this the ingest falls back to the
+    local FastEmbed model, which tries to reach HuggingFace and fails on this network (and is
+    blocked by Norton anyway) — the documented 'set EMBEDDING_PROVIDER=api on the host' gotcha.
+    Env vars override the regenerated .env.<div>, so this forces the served API embedder."""
+    cfg = json.loads(kubectl(ctx, "-n", ns, "get", "configmap", "agent-config", "-o", "json",
+                             capture=True) or "{}").get("data", {})
+    emb = {k: v for k, v in cfg.items()
+           if k.startswith("EMBEDDING_") or k in ("QDRANT_SCORE_THRESHOLD",)}
+    key = nvidia_key()
+    if key:
+        emb["EMBEDDING_API_KEY"] = key
+    return emb
+
+
+def make_secret_yaml(ctx: str, ns: str, div: str, store: str | None, model: str | None) -> str:
+    s = json.loads((ROOT / "infra" / "generated" / div / "secrets.json").read_text())
+    nv = nvidia_key()
     lits = {
         "OPENAI_API_KEY": nv, "EMBEDDING_API_KEY": nv, "POSTGRES_USER": "openfga",
         "POSTGRES_PASSWORD": s["postgres_password"], "OPENFGA_API_TOKEN": s["openfga_api_token"],
@@ -168,8 +214,11 @@ def bootstrap_division(ctx: str, image: str, div: str, source_tag: str) -> None:
             ("qdrant", p["qdrant"], 6333), ("temporal", p["temporal_ui"], 8233),
             ("redis", p["redis"], 6379)]
     store = model = None
+    # Force the host-side doc ingest to use the SERVED API embedder (matching the cluster's
+    # configmap), not the local FastEmbed model — see ingest_embedding_env.
+    prov_env = {**os.environ, **ingest_embedding_env(ctx, ns)}
     with port_forwards(ctx, ns, maps):
-        out = run([VENV_PY, "scripts/k8s_provision.py", div], capture=True)
+        out = run([VENV_PY, "scripts/k8s_provision.py", div], capture=True, env=prov_env)
         print(out.strip())
         for line in out.splitlines():
             if line.startswith("STORE_ID="):
@@ -291,6 +340,129 @@ def federate(ctx: str, divisions: list[str]) -> None:
     for d in divisions:
         kubectl(ctx, "-n", f"agt-div-{d}", "rollout", "status", "deploy/agent", "--timeout=120s", check=False)
     print("Federation complete: each division trusts its peers' DIDs and holds the cross-grants.")
+
+
+def relay_host_port(div: str) -> int:
+    """Stable host port used as the cross-cluster relay for a division's agent (port_base +
+    30000 — unique per division, well clear of the derived service ports). On the local kind
+    setup the HOST is the L4 router between otherwise-isolated clusters (the analogue of a
+    cloud LoadBalancer): each division's agent is port-forwarded to this host port, and peers
+    reach it at http://host.docker.internal:<this> (host.docker.internal resolves from kind
+    pods). See multicluster.py's `relay` supervisor."""
+    return port_base(div) + 30000
+
+
+def relay_url(div: str) -> str:
+    return f"http://host.docker.internal:{relay_host_port(div)}"
+
+
+def federate_multicluster(div_ctx: dict[str, str]) -> None:
+    """Federate divisions that live in SEPARATE clusters (one cluster per division).
+
+    Identical TRUST MODEL to federate() — reuses fd.DivisionFacts / compute_peer_tool_map /
+    _apply_cross_grants unchanged — but each division is reached at a ROUTABLE cross-cluster
+    URL instead of the in-cluster Service DNS, and each division's ConfigMap/cross-grants are
+    applied in its OWN kube-context. This is the multi-cluster (multi-cloud-shaped) expression
+    of the same federation.
+
+    Routable URL on local kind: http://host.docker.internal:<relay-port>. On this host the
+    clusters' pod/Service networks don't traverse the Docker bridge (kindnet iptables routing
+    is inert cross-cluster), but every pod CAN reach the host, and the host can reach every
+    cluster (kubectl port-forward) — so the host acts as the L4 router between clusters (run
+    `multicluster.py relay`). In a real multi-cloud deploy this URL is the agent's
+    LoadBalancer/Ingress hostname instead — same wiring (see k8s/MULTICLUSTER.md).
+
+    `div_ctx` maps division id -> kube context (e.g. {"gamma": "kind-agt-gamma", ...}).
+    """
+    import asyncio
+    import json as _json
+
+    import federate_divisions as fd
+
+    divisions = list(div_ctx)
+    print(f"\n=== Federating ACROSS clusters: {', '.join(divisions)} ===")
+    facts = {d: fd.DivisionFacts(od.load_manifest(ROOT / "infra" / "divisions" / f"{d}.yml"))
+             for d in divisions}
+    for d in divisions:
+        if not facts[d].onboarded:
+            raise RuntimeError(f"division '{d}' not onboarded (bootstrap it first)")
+
+    # 1) Resolve each division's routable (cross-cluster) URL via the host relay.
+    print("-> resolve routable peer URLs (host relay)")
+    ext_url: dict[str, str] = {d: relay_url(d) for d in divisions}
+    for d in divisions:
+        print(f"   {d}: {ext_url[d]}  (ctx {div_ctx[d]})")
+
+    # 2) Mount each division's stable DID identity as a Secret (in its own cluster).
+    print("-> mount stable DID identities")
+    for d in divisions:
+        ctx, ns = div_ctx[d], f"agt-div-{d}"
+        idfile = ROOT / "agt-federated-rag" / f"agent_identity_{d}.json"
+        y = kubectl(ctx, "-n", ns, "create", "secret", "generic", "agent-identity",
+                    f"--from-file=agent_identity.json={idfile}", "--dry-run=client", "-o", "yaml",
+                    capture=True)
+        kubectl(ctx, "apply", "-f", "-", stdin=y)
+
+    # 3) Wire each division's peer trust map (ROUTABLE urls) + tool routing + identity mount.
+    print("-> wire peer trust map + tool routing into each division")
+    for d in divisions:
+        ctx, ns = div_ctx[d], f"agt-div-{d}"
+        peers = [p for p in divisions if p != d]
+        trust: dict[str, dict] = {}
+        for p in peers:
+            pdid, pjwk = facts[p].did_jwk()
+            while isinstance(pjwk, str):
+                pjwk = _json.loads(pjwk)
+            trust[pdid] = {"issuer": facts[p].issuer, "public_jwk": pjwk,
+                           "agent_url": ext_url[p], "division_id": p}
+        primary = peers[0]
+        pdid, pjwk_s = facts[primary].did_jwk()
+        cm_patch = {"data": {
+            "PEER_AGENT_URL": ext_url[primary],
+            "PEER_AGENT_DID": pdid,
+            "PEER_AGENT_PUBLIC_JWK": pjwk_s,
+            "PEER_AGENT_ISSUER": facts[primary].issuer,
+            "TRUSTED_ISSUERS": ",".join(facts[p].issuer for p in peers),
+            "PEER_TRUST_MAP": _json.dumps(trust, separators=(",", ":")),
+            "OIDC_ISSUER": facts[d].issuer,                       # unique per division
+            "AGENT_IDENTITY_PATH": "/identity/agent_identity.json",
+        }}
+        if facts[d].m.local_tools is not None:
+            cm_patch["data"]["AGT_LOCAL_TOOLS"] = ",".join(facts[d].m.local_tools)
+        tool_map = fd.compute_peer_tool_map(facts[d], facts)
+        if tool_map:
+            cm_patch["data"]["PEER_TOOL_MAP"] = _json.dumps(tool_map, separators=(",", ":"))
+            print(f"   {d}: tool routing {', '.join(f'{c}->{t[:14]}…' for c, t in tool_map.items())}")
+        kubectl(ctx, "-n", ns, "patch", "configmap", "agent-config", "--type=merge",
+                "-p", _json.dumps(cm_patch))
+        vol_patch = {"spec": {"template": {"spec": {
+            "volumes": [{"name": "agent-identity", "secret": {"secretName": "agent-identity"}}],
+            "containers": [{"name": "$NAME", "volumeMounts":
+                            [{"name": "agent-identity", "mountPath": "/identity", "readOnly": True}]}],
+        }}}}
+        for dep, cname in (("agent", "agent"), ("worker", "worker")):
+            patch = _json.loads(_json.dumps(vol_patch).replace("$NAME", cname))
+            kubectl(ctx, "-n", ns, "patch", "deployment", dep, "--type=strategic", "-p", _json.dumps(patch))
+
+    # 4) Apply each division's cross-grants to its OWN OpenFGA (in its own cluster).
+    print("-> apply cross-grants")
+    for d in divisions:
+        if not facts[d].m.cross_grants:
+            continue
+        ctx, ns = div_ctx[d], f"agt-div-{d}"
+        p = facts[d].ports
+        with port_forwards(ctx, ns, [("openfga", p["openfga"], 8080), ("qdrant", p["qdrant"], 6333)]):
+            asyncio.run(fd._apply_cross_grants(facts[d], facts, dry_run=False))
+
+    # 5) Restart agents/workers so they load identity + peer config.
+    print("-> restart agents to pick up peers")
+    for d in divisions:
+        ctx, ns = div_ctx[d], f"agt-div-{d}"
+        kubectl(ctx, "-n", ns, "rollout", "restart", "deploy/agent", "deploy/worker")
+    for d in divisions:
+        kubectl(div_ctx[d], "-n", f"agt-div-{d}", "rollout", "status", "deploy/agent",
+                "--timeout=120s", check=False)
+    print("Cross-cluster federation complete: each division trusts its peers' DIDs over routable URLs.")
 
 
 def main() -> None:
