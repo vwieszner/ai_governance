@@ -5,104 +5,104 @@
       "mode": "sweep",
       "division": "gamma",
       "path": "local /solve tool.pii (deterministic)",
-      "total_per_level": 40,
+      "total_per_level": 30,
       "warmup": 0,
-      "pace_s": 62.0,
+      "pace_s": 35.0,
       "levels": [
         {
           "concurrency": 1,
           "stats": {
-            "count": 40,
+            "count": 30,
             "errors": 0,
             "rate_limited": 0,
-            "duration_s": 2.5848,
-            "throughput_rps": 15.47,
-            "p50": 62.87,
-            "p95": 78.58,
-            "p99": 111.05,
-            "mean": 64.56,
-            "min": 49.39,
-            "max": 111.05
+            "duration_s": 1.9975,
+            "throughput_rps": 15.02,
+            "p50": 63.97,
+            "p95": 74.95,
+            "p99": 146.0,
+            "mean": 66.52,
+            "min": 50.41,
+            "max": 146.0
           }
         },
         {
           "concurrency": 4,
           "stats": {
-            "count": 40,
+            "count": 30,
             "errors": 0,
             "rate_limited": 0,
-            "duration_s": 2.0876,
-            "throughput_rps": 19.16,
-            "p50": 204.94,
-            "p95": 220.48,
-            "p99": 239.54,
-            "mean": 200.69,
-            "min": 84.85,
-            "max": 239.54
+            "duration_s": 1.6495,
+            "throughput_rps": 18.19,
+            "p50": 215.48,
+            "p95": 233.21,
+            "p99": 238.94,
+            "mean": 208.29,
+            "min": 77.77,
+            "max": 238.94
           }
         },
         {
           "concurrency": 8,
           "stats": {
-            "count": 40,
+            "count": 30,
             "errors": 0,
             "rate_limited": 0,
-            "duration_s": 2.1901,
-            "throughput_rps": 18.26,
-            "p50": 422.72,
-            "p95": 457.14,
-            "p99": 478.95,
-            "mean": 402.28,
-            "min": 121.84,
-            "max": 478.95
+            "duration_s": 1.5623,
+            "throughput_rps": 19.2,
+            "p50": 400.26,
+            "p95": 415.96,
+            "p99": 433.22,
+            "mean": 367.86,
+            "min": 96.19,
+            "max": 433.22
           }
         },
         {
           "concurrency": 16,
           "stats": {
-            "count": 40,
+            "count": 30,
             "errors": 0,
             "rate_limited": 0,
-            "duration_s": 2.2125,
-            "throughput_rps": 18.08,
-            "p50": 844.0,
-            "p95": 863.53,
-            "p99": 925.6,
-            "mean": 724.8,
-            "min": 145.43,
-            "max": 925.6
+            "duration_s": 1.5882,
+            "throughput_rps": 18.89,
+            "p50": 789.86,
+            "p95": 823.34,
+            "p99": 875.27,
+            "mean": 649.23,
+            "min": 143.31,
+            "max": 875.27
           }
         },
         {
           "concurrency": 32,
           "stats": {
-            "count": 40,
+            "count": 30,
             "errors": 0,
             "rate_limited": 0,
-            "duration_s": 2.3488,
-            "throughput_rps": 17.03,
-            "p50": 1258.72,
-            "p95": 2224.74,
-            "p99": 2337.01,
-            "mean": 1219.65,
-            "min": 269.67,
-            "max": 2337.01
+            "duration_s": 2.0338,
+            "throughput_rps": 14.75,
+            "p50": 1181.86,
+            "p95": 1894.74,
+            "p99": 2010.38,
+            "mean": 1162.15,
+            "min": 225.89,
+            "max": 2010.38
           }
         },
         {
           "concurrency": 64,
           "stats": {
-            "count": 40,
+            "count": 30,
             "errors": 0,
             "rate_limited": 0,
-            "duration_s": 2.5054,
-            "throughput_rps": 15.97,
-            "p50": 1454.71,
-            "p95": 2361.59,
-            "p99": 2496.54,
-            "mean": 1450.41,
-            "min": 209.98,
-            "max": 2496.54
+            "duration_s": 1.6459,
+            "throughput_rps": 18.23,
+            "p50": 878.33,
+            "p95": 1502.31,
+            "p99": 1632.79,
+            "mean": 897.53,
+            "min": 184.34,
+            "max": 1632.79
           }
         }
       ]
@@ -110,48 +110,48 @@
     "xdiv": {
       "mode": "xdiv",
       "division": "delta",
-      "concurrency": 16,
-      "total": 40,
+      "concurrency": 8,
+      "total": 24,
       "warmup": 0,
       "delegated": {
         "path": "delta /solve tool.pii -> DELEGATES to gamma (/a2a/tool)",
         "stats": {
-          "count": 40,
+          "count": 24,
           "errors": 0,
           "rate_limited": 0,
-          "duration_s": 6.5691,
-          "throughput_rps": 6.09,
-          "p50": 2220.59,
-          "p95": 3762.45,
-          "p99": 3951.21,
-          "mean": 2456.46,
-          "min": 1159.52,
-          "max": 3951.21
+          "duration_s": 3.3665,
+          "throughput_rps": 7.13,
+          "p50": 881.88,
+          "p95": 1639.15,
+          "p99": 1736.15,
+          "mean": 1063.72,
+          "min": 746.93,
+          "max": 1736.15
         }
       },
       "local": {
         "path": "gamma /solve tool.pii (LOCAL owner, baseline)",
         "stats": {
-          "count": 40,
+          "count": 24,
           "errors": 0,
           "rate_limited": 0,
-          "duration_s": 2.1721,
-          "throughput_rps": 18.42,
-          "p50": 823.16,
-          "p95": 852.26,
-          "p99": 966.97,
-          "mean": 710.19,
-          "min": 124.26,
-          "max": 966.97
+          "duration_s": 1.2682,
+          "throughput_rps": 18.93,
+          "p50": 394.82,
+          "p95": 429.22,
+          "p99": 477.3,
+          "mean": 364.95,
+          "min": 113.87,
+          "max": 477.3
         }
       },
       "comparison": {
-        "delegated_p50_ms": 2220.59,
-        "local_p50_ms": 823.16,
-        "secure_hop_overhead_p50_ms": 1397.43,
-        "delegated_over_local_x": 2.7,
-        "delegated_throughput_rps": 6.09,
-        "local_throughput_rps": 18.42
+        "delegated_p50_ms": 881.88,
+        "local_p50_ms": 394.82,
+        "secure_hop_overhead_p50_ms": 487.06,
+        "delegated_over_local_x": 2.23,
+        "delegated_throughput_rps": 7.13,
+        "local_throughput_rps": 18.93
       }
     },
     "e2e": {
@@ -166,14 +166,14 @@
         "count": 5,
         "errors": 0,
         "rate_limited": 0,
-        "duration_s": 94.5465,
-        "throughput_rps": 0.05,
-        "p50": 9065.03,
-        "p95": 55765.78,
-        "p99": 55765.78,
-        "mean": 18909.19,
-        "min": 5205.02,
-        "max": 55765.78
+        "duration_s": 25.603,
+        "throughput_rps": 0.2,
+        "p50": 2509.0,
+        "p95": 9094.46,
+        "p99": 9094.46,
+        "mean": 5120.48,
+        "min": 1928.01,
+        "max": 9094.46
       }
     },
     "throughput": {
