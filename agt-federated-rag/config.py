@@ -354,6 +354,11 @@ class Settings(BaseSettings):
     slack_bot_token: str | None = None
     slack_approval_channel: str = "#approvals"
     approval_ui_base_url: str = "http://localhost:8000"
+    # Generic outbound webhook for parked approvals (ops/SIEM/automation). Fires IN ADDITION
+    # to slack/email. The payload is DATA-MINIMIZED on purpose — request id, approver, the
+    # signed deep-link, timestamp — and deliberately carries NO query text or chunk ids, so an
+    # external endpoint never receives the sensitive content the approval is gating.
+    notify_webhook_url: str = ""
 
     # ── Server ────────────────────────────────────────────────────────────────
     host: str = "0.0.0.0"

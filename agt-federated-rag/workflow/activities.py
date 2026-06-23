@@ -172,12 +172,41 @@ async def notify_approver(inp: NotifyApproverInput) -> None:
             request_id=inp.approval_request_id,
             agt_audit=True,
         )
-    else:
+    elif not settings.notify_webhook_url:
         log.warning(
             "no_notification_channel",
             approver_id=inp.approver_id,
             request_id=inp.approval_request_id,
         )
+
+    # A generic webhook fires IN ADDITION (ops/SIEM/automation), never instead — best-effort,
+    # data-minimized (no query/chunk content leaves the boundary).
+    if settings.notify_webhook_url:
+        await _webhook_notify(inp)
+
+
+async def _webhook_notify(inp: NotifyApproverInput) -> None:
+    """POST a DATA-MINIMIZED approval event to settings.notify_webhook_url. Best-effort: a
+    failing/slow webhook must never block or fail the approval workflow. Deliberately carries
+    NO query text and NO chunk ids — only the request id, approver, signed deep-link, and ts —
+    so an external endpoint can't receive the sensitive content the approval is gating."""
+    payload = {
+        "event": "approval.requested",
+        "approval_request_id": inp.approval_request_id,
+        "approver_id": inp.approver_id,
+        "approve_url": _approval_url(inp.approval_request_id, "approve"),
+        "deny_url": _approval_url(inp.approval_request_id, "deny"),
+        "ts": int(time.time()),
+    }
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(settings.notify_webhook_url, json=payload)
+            r.raise_for_status()
+        log.info("webhook_notify_approver", request_id=inp.approval_request_id, agt_audit=True)
+    except Exception as exc:  # noqa: BLE001 — never let a webhook failure break the approval
+        log.warning("webhook_notify_failed", request_id=inp.approval_request_id, error=str(exc))
 
 
 async def _slack_notify(inp: NotifyApproverInput) -> None:
