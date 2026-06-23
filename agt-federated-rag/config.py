@@ -189,6 +189,15 @@ class Settings(BaseSettings):
     require_citations: bool = True
     citation_enforcement: str = "log"          # "log" | "strict"
 
+    # ── Specialized sub-agents (governed multi-agent reasoning) ────────────────
+    # When enabled, generate_answer composes the answer with a team of specialist sub-agents
+    # (planner -> researcher -> synthesizer -> critic) instead of one LLM call. They operate
+    # ONLY on the already-authorized context (no new retrieval -> no access widening), each
+    # passes the default-deny policy + is audited, and the answer still flows through output
+    # DLP. Off by default (one LLM call); enabling adds LLM calls but improves complex answers.
+    specialist_agents_enabled: bool = False
+    max_specialist_aspects: int = 3            # cap the planner's decomposition (bounds cost)
+
     # ── Neo4j ─────────────────────────────────────────────────────────────────
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"

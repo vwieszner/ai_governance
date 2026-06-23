@@ -735,16 +735,27 @@ async def generate_answer(state: AgentState) -> dict[str, Any]:
         if settings.require_citations else ""
     )
     llm = await _get_llm()
-    prompt = (
-        f"{hardened_system_preamble(boundary)}\n\n"
-        f"{spotlighted}\n\n"
-        f"{citation_instruction}"
-        f"Question (from the user): {state['query']}\n\n"
-        "Answer:"
-    )
-
-    response = await llm.ainvoke(prompt)
-    answer = response.content if hasattr(response, "content") else str(response)
+    if settings.specialist_agents_enabled:
+        # Governed multi-agent composition over the AUTHORIZED, spotlighted context: planner ->
+        # researcher -> synthesizer -> critic, each passing _enforce + audited. No sub-agent
+        # retrieves new data, so the team can't widen access beyond what's already authorized.
+        from agent.specialists import compose_answer
+        composed = await compose_answer(
+            query=state["query"],
+            context=f"{hardened_system_preamble(boundary)}\n\n{spotlighted}",
+            llm=llm, enforce=_enforce, user_id=state["user_id"],
+        )
+        answer = composed["answer"]
+    else:
+        prompt = (
+            f"{hardened_system_preamble(boundary)}\n\n"
+            f"{spotlighted}\n\n"
+            f"{citation_instruction}"
+            f"Question (from the user): {state['query']}\n\n"
+            "Answer:"
+        )
+        response = await llm.ainvoke(prompt)
+        answer = response.content if hasattr(response, "content") else str(response)
 
     # Grounding gate (deterministic, auditable): which sources did the answer cite, and did it
     # cite any that are NOT in the authorized context (a fabricated citation)? Audited always;
