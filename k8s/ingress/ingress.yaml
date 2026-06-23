@@ -1,0 +1,57 @@
+# Edge for a division's agent — the k8s equivalent of the Compose nginx edge, and the production
+# replacement for the local multi-cluster host-relay. Two server blocks on two hostnames so the
+# PEER plane gets mutual TLS while the USER plane gets TLS + JWT (split by Ingress because nginx
+# mTLS annotations are per-Ingress):
+#
+#   * PEER plane  (peer.<div>.<domain>)  -> /a2a/*, /tasks/*/callback  with CLIENT-CERT mTLS.
+#     This hostname is what goes in the federation trust map (agent_url). The agent STILL verifies
+#     the Ed25519/DID signature at the app layer — mTLS is the transport gate on top.
+#   * USER plane  (agent.<div>.<domain>) -> everything else (/query, /solve, /inbox, /admin/*)
+#     with server TLS; the agent enforces the user JWT.
+#
+# REPLACE <div> and <domain>, and set the namespace (agt-div-<div>). Requires ingress-nginx +
+# cert-manager (see README). On AWS/GCP/Azure use the cloud LB + the same split, or a Gateway API.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-peer
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Mutual TLS: the peer must present a client cert signed by the CA in this secret.
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    nginx.ingress.kubernetes.io/auth-tls-secret: "agt-div-DIV/peer-ca"
+    nginx.ingress.kubernetes.io/auth-tls-verify-depth: "2"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["peer.DIV.DOMAIN"]
+      secretName: agent-peer-tls          # server cert (cert-manager Certificate below)
+  rules:
+    - host: peer.DIV.DOMAIN
+      http:
+        paths:
+          - path: /a2a
+            pathType: Prefix
+            backend: { service: { name: agent, port: { number: 8000 } } }
+          - path: /tasks
+            pathType: Prefix
+            backend: { service: { name: agent, port: { number: 8000 } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-user
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["agent.DIV.DOMAIN"]
+      secretName: agent-user-tls
+  rules:
+    - host: agent.DIV.DOMAIN
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: agent, port: { number: 8000 } } }

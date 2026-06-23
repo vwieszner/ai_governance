@@ -1,0 +1,9 @@
+# Per-division edge. Copy into / reference from a division overlay, set the namespace, and
+# replace the DIV/DOMAIN placeholders (kustomize `replacements` or sed at deploy time). Requires
+# ingress-nginx + cert-manager installed in the cluster (see README).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - certificate.yaml
+  - ingress.yaml

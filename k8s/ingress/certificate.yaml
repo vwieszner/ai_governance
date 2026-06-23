@@ -1,0 +1,26 @@
+# cert-manager Certificates for the agent edge (server TLS on both planes). Issued by a
+# ClusterIssuer the operator provides — a public ACME/Let's Encrypt issuer for internet-facing
+# hosts, or an internal CA issuer for the peer plane. REPLACE DIV/DOMAIN + the issuerRef name.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: agent-peer-tls
+spec:
+  secretName: agent-peer-tls
+  dnsNames:
+    - peer.DIV.DOMAIN
+  issuerRef:
+    name: agt-issuer          # ClusterIssuer (operator-provided: ACME or internal CA)
+    kind: ClusterIssuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: agent-user-tls
+spec:
+  secretName: agent-user-tls
+  dnsNames:
+    - agent.DIV.DOMAIN
+  issuerRef:
+    name: agt-issuer
+    kind: ClusterIssuer
