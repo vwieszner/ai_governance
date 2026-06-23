@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    # Carries the federation part-of label so the agents' allow-agent-federation NetworkPolicy
+    # admits Prometheus to scrape :8000/metrics on an enforcing CNI (inert on kindnet).
+    app.kubernetes.io/part-of: agt-federated-rag

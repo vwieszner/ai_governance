@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: monitoring
+
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - prometheus.yaml
+
+# The scrape config (k8s SD) + the alert rules become the prometheus-config ConfigMap mounted at
+# /etc/prometheus. The alert rules are REUSED verbatim from the Compose observability assets —
+# one source of truth for the governance alerts across both deployment targets.
+configMapGenerator:
+  - name: prometheus-config
+    files:
+      - prometheus.yml=prometheus.k8s.yml
+      - alert.rules.yml=alert.rules.yml
+
+generatorOptions:
+  disableNameSuffixHash: true
