@@ -181,6 +181,14 @@ class Settings(BaseSettings):
     reranker_api_key: str = ""                 # empty → embedding_api_key / openai_api_key
     rerank_candidate_k: int = 20               # fused candidates fed to the reranker before top_k
 
+    # ── Answer grounding / citations ──────────────────────────────────────────
+    # require_citations: instruct the LLM to cite its sources as [Source: <name>] per claim.
+    # citation_enforcement: "log" audits any citation to a source NOT in the authorized context
+    # (a fabricated/hallucinated citation); "strict" also appends a transparency caveat to the
+    # answer. Deterministic + auditable (no LLM judge) — a real groundedness judge is separate.
+    require_citations: bool = True
+    citation_enforcement: str = "log"          # "log" | "strict"
+
     # ── Neo4j ─────────────────────────────────────────────────────────────────
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"

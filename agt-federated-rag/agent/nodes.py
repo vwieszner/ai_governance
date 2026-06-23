@@ -651,6 +651,20 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     return result
 
 
+# ── Citation / grounding gate (deterministic, auditable) ──────────────────────
+
+_CITATION_RE = re.compile(r"\[Source:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+
+
+def verify_citations(answer: str, allowed_sources: set[str]) -> tuple[set[str], set[str]]:
+    """Extract the sources the answer CITES (``[Source: X]``) and split them into those present
+    in the authorized context vs. UNVERIFIED (cited but not in the allowed set — a fabricated
+    citation). Deterministic; the basis of the grounding audit in generate_answer."""
+    cited = {m.strip() for m in _CITATION_RE.findall(answer or "")}
+    unverified = {c for c in cited if c not in allowed_sources and c.lower() != "unknown"}
+    return cited, unverified
+
+
 # ── Node: generate_answer ─────────────────────────────────────────────────────
 
 async def generate_answer(state: AgentState) -> dict[str, Any]:
@@ -712,10 +726,19 @@ async def generate_answer(state: AgentState) -> dict[str, Any]:
                     user_id=state["user_id"], agt_audit=True)
     spotlighted, boundary = spotlight(context)
 
+    # Ask the model to ground every claim in a cited source (so the answer is auditable, not
+    # just plausible). The exact [Source: <name>] form matches the context blocks above and is
+    # what verify_citations checks after generation.
+    citation_instruction = (
+        "Ground every claim in the sources above and cite them inline as [Source: <name>]. "
+        "Use only the provided sources; if they don't answer the question, say so.\n\n"
+        if settings.require_citations else ""
+    )
     llm = await _get_llm()
     prompt = (
         f"{hardened_system_preamble(boundary)}\n\n"
         f"{spotlighted}\n\n"
+        f"{citation_instruction}"
         f"Question (from the user): {state['query']}\n\n"
         "Answer:"
     )
@@ -723,7 +746,23 @@ async def generate_answer(state: AgentState) -> dict[str, Any]:
     response = await llm.ainvoke(prompt)
     answer = response.content if hasattr(response, "content") else str(response)
 
-    return {"answer": answer, "status_message": "completed"}
+    # Grounding gate (deterministic, auditable): which sources did the answer cite, and did it
+    # cite any that are NOT in the authorized context (a fabricated citation)? Audited always;
+    # in "strict" mode a transparency caveat is appended so the user sees the answer isn't fully
+    # grounded. This is log-by-default (like injection detection) to avoid false positives.
+    allowed_sources = {
+        (c.get("metadata", {}) or {}).get("source", "unknown") for c in context_chunks
+    }
+    cited, unverified = verify_citations(answer, allowed_sources)
+    if unverified:
+        log.warning("answer_citation_unverified", unverified=sorted(unverified),
+                    cited=sorted(cited), user_id=state["user_id"], agt_audit=True)
+        if settings.citation_enforcement == "strict":
+            answer += ("\n\n[Note: this answer cited sources not in your authorized context "
+                       f"({', '.join(sorted(unverified))}) — treat those claims with caution.]")
+
+    return {"answer": answer, "status_message": "completed",
+            "citations": sorted(cited), "unverified_citations": sorted(unverified)}
 
 
 # ── Node: start_approval ──────────────────────────────────────────────────────
