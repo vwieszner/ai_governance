@@ -1,0 +1,128 @@
+name: Supply chain
+
+# Supply-chain assurance for the agent image (THREAT_MODEL §3 open item; flagged P0 by the
+# security + devops reviews). On every push/PR to the image or its deps — and weekly, so newly
+# disclosed CVEs surface without a code change — it:
+#   1. builds the agent image
+#   2. generates an SBOM (syft) and uploads it as an artifact
+#   3. scans the image for OS + Python-dependency CVEs (Trivy) -> SARIF + fails on CRITICAL/HIGH
+#   4. scans the repo for committed secrets (gitleaks)
+#   5. (push to main, when registry creds are configured) pushes by digest + cosign-signs it
+#
+# Steps 1-4 need no secrets and run everywhere. Step 5 is gated on a registry being configured
+# so a fork/PR without creds still gets full scanning, just no publish.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agt-federated-rag/**"
+      - ".github/workflows/supply-chain.yml"
+  pull_request:
+    paths:
+      - "agt-federated-rag/**"
+      - ".github/workflows/supply-chain.yml"
+  schedule:
+    - cron: "0 6 * * 1"   # weekly Monday 06:00 UTC — catch newly disclosed CVEs
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write   # upload Trivy SARIF to the Security tab
+  id-token: write          # cosign keyless (OIDC) signing
+  packages: write          # push to GHCR when publishing
+
+jobs:
+  image:
+    name: Build · SBOM · scan · sign
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: agt-federated-rag
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 1. Build the agent image locally (load into the runner's docker) ──────
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: agt-federated-rag
+          load: true
+          tags: ${{ env.IMAGE }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── 2. SBOM (syft) — uploaded as a build artifact for provenance ──────────
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:ci
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: sbom.spdx.json
+
+      # ── 3. Vulnerability scan (Trivy): OS packages + Python deps ──────────────
+      - name: Trivy scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:ci
+          format: sarif
+          output: trivy.sarif
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+      - name: Trivy gate (fail on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:ci
+          format: table
+          exit-code: "1"           # BLOCKING: a fixable CRITICAL/HIGH fails the build
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      # ── 4. Secret scan (gitleaks) — no committed credentials ──────────────────
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 5. Publish by digest + cosign-sign (only on push to main, creds present) ──
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push by digest
+        id: push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: agt-federated-rag
+          push: true
+          tags: ghcr.io/${{ github.repository }}/${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Install cosign
+        if: steps.push.outcome == 'success'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Cosign sign (keyless / OIDC)
+        if: steps.push.outcome == 'success'
+        run: cosign sign --yes "ghcr.io/${{ github.repository }}/${{ env.IMAGE }}@${{ steps.push.outputs.digest }}"
