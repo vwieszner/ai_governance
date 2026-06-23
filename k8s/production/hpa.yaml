@@ -1,0 +1,44 @@
+# Horizontal autoscaling for the STATELESS tiers (agent + worker). These hold no local state —
+# the agent is a FastAPI service and the worker a Temporal poller — so they scale horizontally
+# safely (the shared replay-nonce store + rate limiter are Redis-backed, see the defect fixes).
+# Requires metrics-server in the cluster. The stateful stores are NOT autoscaled (see README).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agent
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: agent
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # avoid flapping under bursty governed-tool load
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

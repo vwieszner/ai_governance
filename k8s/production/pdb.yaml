@@ -1,0 +1,23 @@
+# PodDisruptionBudgets keep a division serving through voluntary disruptions (node drains,
+# rolling upgrades). maxUnavailable:1 is meaningful only for tiers running >1 replica — the
+# agent/worker via the HPA (min 2), and the stateful stores ONCE you run them HA (see README).
+# On a single-replica store a PDB would block node drains, so these target the scalable tiers.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agent
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: agent
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: worker

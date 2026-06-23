@@ -1,0 +1,15 @@
+# Production hardening COMPONENT — layer it into any division overlay to add autoscaling +
+# disruption budgets for the stateless tiers:
+#
+#   # k8s/overlays/<div>/kustomization.yaml
+#   components:
+#     - ../../production
+#
+# The stateful-store HA path is environment-specific and documented in README.md (it is NOT a
+# naive replica bump — that would corrupt single-instance stores).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - hpa.yaml
+  - pdb.yaml
