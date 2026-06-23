@@ -2348,6 +2348,81 @@ async def get_audit(
     return JSONResponse(content=result, status_code=200)
 
 
+# ── Artifact storage (durable evidence packs / exports) ───────────────────────
+# These wire the artifact store (artifact_store.py) into a real GOVERNED flow: an admin exports
+# this division's tamper-evident audit trail as a durable, retrievable compliance evidence pack.
+# Admin-only and division-scoped (the store namespaces keys by division_id), so an admin can
+# neither read another division's artifacts nor export another division's trail.
+
+@app.post("/admin/audit/export-pack")
+async def export_audit_pack(
+    authorization: str | None = Header(default=None),
+    event: str | None = Query(default=None, description="Optional exact event-name filter"),
+    limit: int = Query(default=10000, ge=1, le=100000),
+) -> JSONResponse:
+    """Export THIS division's audit trail to durable artifact storage as an evidence pack and
+    return its ArtifactRef (the pack carries the chain-verification status, so it's tamper-
+    evident on its own). Admin-only, division-scoped. Answers SC-11 ("who accessed X, who
+    approved it") as a shareable, durable artifact."""
+    caller, _ = await _require_admin(authorization)
+    await _check_rate_limit(caller)
+    import json as _json
+
+    import artifact_store
+    import audit_log
+    try:
+        chain = audit_log.read_division_chain(
+            settings.division_id, base_dir=settings.audit_log_dir, event=event, limit=limit)
+    except Exception as exc:
+        log.error("audit_export_failed", error=str(exc))
+        raise HTTPException(status_code=503, detail="Could not read audit trail")
+    pack = {
+        "division": settings.division_id,
+        "exported_by": caller,
+        "exported_at": int(time.time()),
+        "verified": chain.get("verified"),
+        "count": chain.get("count"),
+        "audit": chain,
+    }
+    data = _json.dumps(pack, indent=2, default=str).encode("utf-8")
+    name = f"evidence-packs/audit-{int(time.time())}.json"
+    ref = await artifact_store.put_artifact(
+        name, data, content_type="application/json",
+        metadata={"kind": "audit-evidence-pack", "exported_by": caller})
+    log.info("audit_pack_exported", key=ref.key, count=chain.get("count"), agt_audit=True)
+    return JSONResponse(content={"artifact": artifact_store.ref_to_dict(ref)}, status_code=201)
+
+
+@app.get("/admin/artifacts")
+async def list_artifacts_endpoint(
+    authorization: str | None = Header(default=None),
+    prefix: str = Query(default=""),
+) -> JSONResponse:
+    """List THIS division's stored artifacts (names, division-scoped). Admin-only."""
+    await _require_admin(authorization)
+    import artifact_store
+    names = await artifact_store.list_artifacts(prefix)
+    return JSONResponse(content={"division": settings.division_id, "artifacts": names},
+                        status_code=200)
+
+
+@app.get("/admin/artifacts/{name:path}")
+async def get_artifact_endpoint(
+    name: str,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Retrieve a stored artifact by name (division-scoped). Admin-only."""
+    await _require_admin(authorization)
+    import artifact_store
+    try:
+        data = await artifact_store.get_artifact(name)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid artifact name")
+    except Exception:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    return Response(content=data, media_type="application/octet-stream")
+
+
 # ── POST /admin/kill-switch ───────────────────────────────────────────────────
 
 @app.post("/admin/kill-switch")
