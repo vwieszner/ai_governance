@@ -392,24 +392,39 @@ async def _set_runtime_kill_switch(engaged: bool) -> None:
 
 # ── Rate limiting (Finding #7) ────────────────────────────────────────────────
 
-async def _check_rate_limit(subject: str) -> None:
+# In-process fallback counters, used ONLY when Redis is unreachable so the limiter DEGRADES
+# (per-replica enforcement) rather than disappearing. {(prefix:subject, window): count}.
+_local_rl_counts: dict[tuple[str, int], int] = {}
+
+
+async def _check_rate_limit(subject: str, *, limit: int | None = None,
+                            prefix: str = "ratelimit") -> None:
+    """Fixed-window per-subject rate limit. Backed by Redis (INCR + EXPIRE) so it is shared
+    across replicas. On a Redis error it DEGRADES to an in-process per-replica counter instead
+    of failing OPEN — a saturated/attacked Redis can no longer disable the only cost/DoS gate.
+
+    ``limit`` overrides the per-user default (used for the more generous per-peer federation
+    limit); ``prefix`` namespaces the window key (so user and peer budgets don't collide).
     """
-    Finding #7: fixed-window per-subject rate limit for the expensive /query
-    endpoint. Backed by Redis (INCR + EXPIRE). Fails OPEN on a Redis error —
-    availability is preferred over hard-blocking when the limiter is degraded.
-    """
+    cap = settings.rate_limit_per_minute if limit is None else limit
+    window = int(time.time()) // 60
     try:
         r = await _get_redis()
-        window = int(time.time()) // 60
-        key = f"ratelimit:{subject}:{window}"
+        key = f"{prefix}:{subject}:{window}"
         count = await r.incr(key)
         if count == 1:
             await r.expire(key, 120)
     except Exception as exc:
-        log.warning("rate_limit_check_failed", subject=subject, error=str(exc))
-        return
-    if count > settings.rate_limit_per_minute:
-        log.warning("rate_limit_exceeded", subject=subject, count=count, agt_audit=True)  # M8: abuse signal
+        # Degrade, don't disappear: enforce on this replica with an in-process window counter.
+        log.warning("rate_limit_redis_degraded_to_local", subject=subject, error=str(exc))
+        if len(_local_rl_counts) > 10_000:           # cheap bound: drop all stale windows
+            _local_rl_counts.clear()
+        lkey = (f"{prefix}:{subject}", window)
+        count = _local_rl_counts.get(lkey, 0) + 1
+        _local_rl_counts[lkey] = count
+    if count > cap:
+        log.warning("rate_limit_exceeded", subject=subject, count=count, limit=cap,
+                    agt_audit=True)  # M8: abuse signal
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Please slow down.")
 
 
@@ -1359,6 +1374,12 @@ async def a2a_query(request: Request) -> JSONResponse:
             detail="Invalid or missing AgentMesh message signature",
         )
 
+    # Per-PEER rate limit on this federation endpoint: bound a compromised-but-trusted peer
+    # from driving unbounded retrieval/LLM cost through /a2a/query. Keyed on the verified
+    # signer DID (a per-user limit is evadable — a peer can rotate user_ids).
+    await _check_rate_limit(signer_did, limit=settings.peer_rate_limit_per_minute,
+                            prefix="peerlimit")
+
     # Registry trust-score gate on the verified signer (defence in depth).
     verified, trust_score = await agent_identity.verify_peer_identity(signer_did)
     if not verified or trust_score < settings.agent_trust_threshold:
@@ -1574,6 +1595,11 @@ async def a2a_tool(request: Request) -> JSONResponse:
             status_code=401,
             detail="Invalid or missing AgentMesh message signature",
         )
+
+    # ── Step 3b: per-PEER rate limit — bound a compromised-but-trusted peer from driving
+    # unbounded governed-tool/LLM cost through /a2a/tool. Keyed on the verified signer DID.
+    await _check_rate_limit(signer_did, limit=settings.peer_rate_limit_per_minute,
+                            prefix="peerlimit")
 
     # ── Step 4: registry trust-score gate on the verified signer (defence in depth) ──
     verified, trust_score = await agent_identity.verify_peer_identity(signer_did)

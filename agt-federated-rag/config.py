@@ -335,6 +335,11 @@ class Settings(BaseSettings):
     # Finding #7: per-subject (JWT sub) fixed-window rate limit for the
     # expensive /query endpoint (retrieval fan-out + LLM call per request).
     rate_limit_per_minute: int = 60
+    # Per-PEER (sender DID) fixed-window limit on the DID-signed federation endpoints
+    # (/a2a/query, /a2a/tool). Bounds a compromised-but-trusted peer from driving unbounded
+    # LLM/tool cost through federation (a per-user limit is evadable — a peer can rotate
+    # user_ids). More generous than the per-user limit since one peer fronts many users.
+    peer_rate_limit_per_minute: int = 600
 
     # /metrics scrape protection. When set, GET /metrics requires this bearer token (so the
     # governance event counters aren't world-readable recon). Empty = open (dev default);
@@ -457,6 +462,18 @@ class Settings(BaseSettings):
         # division_id (so tenancy threading never sees an empty division).
         if not self.division_id:
             object.__setattr__(self, "division_id", self.cluster_id)
+        return self
+
+    @model_validator(mode="after")
+    def embedder_aware_score_threshold(self) -> "Settings":
+        # The cosine scale differs by embedder: bge-large (local) scores relevant chunks
+        # ~0.55, while the served asymmetric nv-embedqa-e5-v5 (api) scores them ~0.30. If api
+        # mode is on and the operator did NOT explicitly set a threshold, lower the default to
+        # a model-appropriate 0.25 — otherwise the bge-tuned 0.55 default silently drops every
+        # real hit and answers come back empty. An explicit QDRANT_SCORE_THRESHOLD is honored.
+        if (self.embedding_provider == "api"
+                and "qdrant_score_threshold" not in self.model_fields_set):
+            object.__setattr__(self, "qdrant_score_threshold", 0.25)
         return self
 
     @model_validator(mode="after")

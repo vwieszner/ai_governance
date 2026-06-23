@@ -115,6 +115,38 @@ _SEEN_NONCE_MAX = 50_000               # hard cap on the seen-cache (memory boun
 _seen_nonces: dict[tuple[str, str], float] = {}
 _seen_lock: asyncio.Lock = asyncio.Lock()
 
+# Shared replay-nonce store. The in-process dict above only protects WITHIN one process — the
+# moment the agent runs >1 replica behind a Service/LB, a captured envelope replayed to a
+# DIFFERENT replica would pass (that replica never saw the nonce). Recording the nonce in the
+# per-division Redis (atomic SET NX) closes that: the guard holds across replicas. If Redis is
+# unreachable we DEGRADE to the in-process dict (single-replica still protected), never open.
+_redis: Any = None
+_redis_lock: asyncio.Lock = asyncio.Lock()
+
+
+async def _get_redis() -> Any:
+    global _redis
+    if _redis is None:
+        async with _redis_lock:
+            if _redis is None:
+                import redis.asyncio as aioredis
+                _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+    return _redis
+
+
+async def _seen_nonce_redis(sender_did: str, nonce: str) -> bool | None:
+    """Atomically record (sender_did, nonce) in the shared store for the freshness window.
+    Returns True if FRESH (first sighting), False if REPLAY (already recorded), or None if
+    Redis is unavailable (caller then degrades to the in-process guard)."""
+    try:
+        r = await _get_redis()
+        # SET key 1 NX EX <window>: returns truthy only if the key did NOT already exist.
+        ok = await r.set(f"nonce:{sender_did}:{nonce}", "1", nx=True, ex=_REPLAY_MAX_AGE_SECONDS)
+        return bool(ok)
+    except Exception as exc:  # noqa: BLE001 — Redis down: degrade to the in-process guard
+        log.warning("nonce_store_redis_unavailable", sender_did=sender_did, error=str(exc))
+        return None
+
 
 def _canonical_bytes(payload: dict[str, Any]) -> bytes:
     """Deterministic byte serialisation of a message for signing / verifying.
@@ -400,6 +432,15 @@ async def _check_freshness_and_nonce(payload: dict[str, Any], sender_did: str) -
         )
         return False
 
+    # Shared (cross-replica) guard first: an atomic SET NX in the per-division Redis.
+    redis_verdict = await _seen_nonce_redis(sender_did, nonce)
+    if redis_verdict is True:
+        return True                       # fresh, recorded in the shared store
+    if redis_verdict is False:
+        log.warning("verify_signed_message_replayed_nonce", sender_did=sender_did, store="redis")
+        return False
+    # redis_verdict is None -> Redis unavailable: degrade to the in-process guard below
+    # (a single replica is still fully protected; only multi-replica loses cross-replica reach).
     key = (sender_did, nonce)
     async with _seen_lock:
         if key in _seen_nonces and _seen_nonces[key] > now:
