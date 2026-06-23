@@ -74,6 +74,7 @@ from config import settings
 from mesh.agent_identity import verify_peer_identity
 from mesh.peer_client import call_peer_agent as _mesh_call_peer, get_peer_circuit_state
 from rag.fusion import rrf_fuse_many
+from rag.rerank import get_reranker
 from workflow.approval import ApprovalInput, ApprovalWorkflow
 
 log = structlog.get_logger(__name__)
@@ -395,7 +396,22 @@ async def retrieve_local(state: AgentState) -> dict[str, Any]:
     results_per_retriever = await asyncio.gather(*[_retrieve_isolated(r) for r in retrievers])
 
     by_name = {r.name: res for r, res in zip(retrievers, results_per_retriever)}
-    fused = rrf_fuse_many(results_per_retriever, final_limit=settings.qdrant_final_k)
+    # RRF-fuse, then OPTIONALLY rerank the top candidates (precision lever). With a reranker
+    # configured we fuse a LARGER pool so it has candidates to reorder, then keep final_k; a
+    # rerank failure degrades to the plain RRF top-final_k so retrieval never crashes.
+    reranker = get_reranker()
+    if reranker is None:
+        fused = rrf_fuse_many(results_per_retriever, final_limit=settings.qdrant_final_k)
+    else:
+        candidates = rrf_fuse_many(results_per_retriever, final_limit=settings.rerank_candidate_k)
+        try:
+            fused = await asyncio.wait_for(
+                reranker.rerank(query, candidates, settings.qdrant_final_k),
+                timeout=settings.retriever_timeout_seconds + 5.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade to RRF order, never crash retrieval
+            log.warning("rerank_degraded", error=str(exc))
+            fused = candidates[: settings.qdrant_final_k]
 
     # Observability fields stay meaningful: qdrant_results = the qdrant backend's raw
     # hits; graph_results = every other retriever's hits (neo4j seam + any RaaS).

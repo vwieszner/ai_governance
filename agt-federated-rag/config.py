@@ -172,6 +172,15 @@ class Settings(BaseSettings):
     # chunks are dropped before authorization so they never block an answer.
     qdrant_score_threshold: float = 0.55
 
+    # ── Reranking (optional precision stage after RRF fusion) ──────────────────
+    # none → no rerank (RRF order stands); api → NIM-style /ranking endpoint; local → FastEmbed
+    # cross-encoder. A reranker only REORDERS already-retrieved candidates (never widens access).
+    reranker_provider: str = "none"            # "none" | "api" | "local"
+    reranker_model: str = "nvidia/nv-rerankqa-mistral-4b-v3"
+    reranker_api_base: str = ""                # empty → embedding_api_base / openai_api_base
+    reranker_api_key: str = ""                 # empty → embedding_api_key / openai_api_key
+    rerank_candidate_k: int = 20               # fused candidates fed to the reranker before top_k
+
     # ── Neo4j ─────────────────────────────────────────────────────────────────
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
@@ -321,6 +330,17 @@ class Settings(BaseSettings):
     # ── Redis task store ──────────────────────────────────────────────────────
     redis_url: str = "redis://redis:6379/0"
     task_ttl_seconds: int = 86400
+
+    # ── Artifact (object/blob) storage ────────────────────────────────────────
+    # Durable sink for finished outputs (exported evidence packs, reports, uploads). Keys are
+    # namespaced by division_id so a shared bucket stays tenant-isolated. See artifact_store.py.
+    artifact_backend: str = "local"            # "local" | "s3"
+    artifact_local_dir: str = "./artifacts"    # local backend root
+    artifact_s3_bucket: str = ""               # required for the s3 backend
+    artifact_s3_endpoint: str = ""             # set for MinIO / non-AWS S3; empty = AWS
+    artifact_s3_region: str = "us-east-1"
+    artifact_s3_access_key: str = ""           # empty → boto3 default credential chain (env/IAM)
+    artifact_s3_secret_key: str = ""
 
     # ── Notifications ─────────────────────────────────────────────────────────
     slack_bot_token: str | None = None
