@@ -82,7 +82,7 @@ Divisions: **alpha 9000 · beta 9100 · gamma 9200** (ports derive from `port_ba
 - **Workflow:** Temporal (durable approvals + rotation cron).
 - **Edge/transport:** nginx (route-based mTLS), `cryptography` (CA/cert/CRL).
 - **UI:** React 18 + Vite + TypeScript; Playwright e2e; Vitest unit.
-- **Infra:** Docker Compose per division; pinned images; `requirements.lock.txt` (frozen).
+- **Infra:** Docker Compose per division; pinned images; `requirements.lock.txt` (frozen + sha256 hash-pinned; regenerate with the `uv pip compile` command in its header).
   Versions are pinned in `infra/division-stack.template.yml` + `agt-federated-rag/requirements.lock.txt`.
 
 ## Setup
