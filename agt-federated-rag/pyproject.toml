@@ -89,6 +89,17 @@ agent   = "api.main:run"
 worker  = "workflow.worker:run"
 ingest  = "rag.ingest:cli"
 
+[tool.hatch.build.targets.wheel]
+# Flat layout (packages + top-level modules at the project root), which hatchling's
+# default file selection cannot infer. Package data (agent/policies/*.yaml) ships
+# with its package. tests/, conftest.py and _repro_div.py are dev-only.
+only-include = [
+    "agent", "api", "auth", "bench", "connectors", "discovery", "mesh", "rag",
+    "tools", "transport", "workflow",
+    "approval_index.py", "artifact_store.py", "audit_log.py", "config.py",
+    "outcome_store.py", "residency.py", "secrets_backend.py", "sre.py",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

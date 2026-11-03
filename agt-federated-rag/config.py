@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -316,8 +317,10 @@ class Settings(BaseSettings):
     peer_tool_map: str = ""
 
     # ── AGT Policy Engine (Agent OS) ─────────────────────────────────────────
-    # Path to YAML policy directory (loaded at startup).
-    policy_dir: str = "agent/policies"
+    # Path to YAML policy directory (loaded at startup). The default is anchored to
+    # this file, not the CWD, so an installed wheel (or any launch dir) finds the
+    # shipped policies instead of loading zero rules and denying every action.
+    policy_dir: str = str(Path(__file__).resolve().parent / "agent" / "policies")
     # Whether to run in audit-only mode (log violations but don't block).
     policy_audit_only: bool = False
 
