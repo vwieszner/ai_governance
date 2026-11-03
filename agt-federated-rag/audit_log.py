@@ -286,6 +286,9 @@ AUDIT_FIELD_ALLOWLIST = frozenset({
     "did", "hmac", "error", "subject", "count_dropped",
     # context-aggregation (mosaic) guard: category label names / tier / rule names only.
     "labels", "sensitivity", "rules",
+    # FR-2.2 user lifecycle: the division realm roles set + the disable-cascade step summary
+    # (role names / counts / step statuses only — never credentials).
+    "roles", "cascade",
 })
 
 
