@@ -3,8 +3,10 @@
 Puts a gateway between a division's agent and its model providers, for:
 per-division **virtual keys** (model allowlist, rate limits, budgets), **fallback** when
 the NVIDIA NIM free tier throttles or cold-starts, and a **key-enforced residency**
-boundary. Standalone demo; the division stack (`infra/division-stack.template.yml`)
-is not changed yet.
+boundary. This folder is the standalone proof; the same gateway is wired into the real
+division deployments as an **opt-in** (see "Division deployments" below). The LiteLLM
+config they all share lives at [`k8s/llm-gateway/litellm-config.yaml`](../../k8s/llm-gateway/litellm-config.yaml),
+because kustomize can only read files under a component's root.
 
 **App change: environment only.** The gateway's model groups use the exact model IDs
 the agent already sends (`llm_model`, the intent model, `embedding_model`), so a
@@ -71,6 +73,27 @@ curl -s localhost:4000/key/generate -H "Authorization: Bearer $LITELLM_MASTER_KE
    (`v1.106.6`) is byte-identical to the official `ghcr.io/berriai/litellm:v1.106.6`
    index. Admin UI disabled; port bound to loopback.
 
+## Division deployments (opt-in)
+
+**Compose.** Add `llm_gateway: true` to `infra/divisions/<id>.yml`. For a
+residency=local division, also add `llm_gateway_local_base: http://<your vLLM/NIM>/v1`.
+Then run `scripts/onboard_division.py` as usual (`--dry-run` prints the plan).
+Onboarding then:
+- enables the `llm-gateway` profile of `infra/division-stack.template.yml`. That adds the
+  gateway on `127.0.0.1:<port_base+7>`, with network alias `llm-gateway.internal`;
+- gives the gateway its own `litellm` database and role in the division's existing Postgres;
+- mints the master key into `infra/generated/<id>/secrets.json`;
+- issues the agent's virtual key: residency `external` gets NIM + embeddings + the local
+  model; anything else gets only the local model, with the app's model names aliased onto
+  it. The key is reused on re-run, and revoked and re-issued if the residency changes;
+- writes `OPENAI_API_BASE=http://localhost:<port_base+7>/v1` and that key into the agent
+  env.
+
+**Kubernetes.** `python scripts/bootstrap_k8s.py --divisions <id> --llm-gateway` uses the
+`k8s/llm-gateway` component. See k8s/README.md, "Optional: per-division LLM gateway".
+
+Without the flag, nothing changes: no gateway services, and the agent talks to NIM directly.
+
 ## Not covered yet
 
 - AGT policy at the gateway — **blocked upstream** (checked 2026-11-03). The hook
@@ -88,8 +111,27 @@ curl -s localhost:4000/key/generate -H "Authorization: Bearer $LITELLM_MASTER_KE
   422 "Budget has been exceeded"), but spend only *accrues* for models with a price.
   These self-hosted / OpenAI-compatible model groups have none, so measured spend
   stays 0.0 and a budget never trips by itself. Set `input_cost_per_token` /
-  `output_cost_per_token` on each model in `litellm-config.yaml` to your NIM contract
+  `output_cost_per_token` on each model in `k8s/llm-gateway/litellm-config.yaml` to your NIM contract
   or GPU cost; until then, rely on the rpm/tpm limits. The proof checks enforcement
   by setting a key's recorded spend to its cap.
 - cosign signature verification of the image (the digest was checked against GHCR instead).
-- Real NIM traffic, and the division stack / Kubernetes wiring.
+- Real NIM traffic. The division wiring was proven only against the stub upstreams.
+- **Division wiring, what was proven (2026-11-03).** The gateway part of a rendered
+  Compose division stack was brought up live (division Postgres, `litellm` DB init, gateway
+  and stubs). Onboarding's key provisioning and rendered agent env then drove the agent's
+  real `_get_llm`, `_get_intent_llm` and `embed_dense`, and the `llm-gateway.internal`
+  alias was reached from a container on the division network. The k8s component was
+  rendered with kustomize 5.4.3, and its pod settings were tried in plain Docker
+  (init-db.sh as uid 70 on a read-only root filesystem; the gateway with all capabilities
+  dropped).
+- **Not proven yet:**
+  - a full `onboard_division` run with the gateway enabled (needs every division image
+    and an NVIDIA key);
+  - a `bootstrap_k8s --llm-gateway` run on a cluster;
+  - NetworkPolicy enforcement (needs an enforcing CNI);
+  - the containerized agent profile (`.env.<id>.agent` is not generated yet).
+- **No in-boundary embedding model.** A residency=local division's key refuses API-mode
+  embeddings. Compose divisions embed locally with FastEmbed by default, so they are not
+  affected; a k8s local division is.
+- The gateway container trusts only its own CA store. On a TLS-intercepting host (Norton),
+  its calls to NIM need the host CA bundle, like the k8s pods do.

@@ -1,0 +1,25 @@
+# Only THIS division's agent pod may reach the gateway (the gateway holds the provider
+# key and the division's spend/limits; the worker and the stores never call it). The
+# component also narrows the base allow-intra-namespace policy to exclude this pod —
+# without that, the additive base rule would still admit every pod in the namespace.
+# Port-forwards (bootstrap_k8s key provisioning) go through the kubelet, not the pod
+# network, so they are unaffected. Requires a NetworkPolicy-enforcing CNI (see base).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-agent-to-llm-gateway
+  labels:
+    app.kubernetes.io/part-of: agt-federated-rag
+spec:
+  podSelector:
+    matchLabels:
+      app: llm-gateway
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: agent
+      ports:
+        - protocol: TCP
+          port: 4000

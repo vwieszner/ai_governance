@@ -1,4 +1,8 @@
-# LiteLLM Proxy config for one division's LLM gateway.
+# LiteLLM Proxy config for one division's LLM gateway — the SINGLE source for every
+# deployment: the k8s component (this dir, via configMapGenerator), the Compose division
+# stack (infra/division-stack.template.yml, profile llm-gateway) and the standalone proof
+# (examples/llm-gateway/docker-compose.yml). It lives here because kustomize may only read
+# files under the component root.
 #
 # Model groups are named with the EXACT model ids the app already sends
 # (config.llm_model / agent.nodes._INTENT_MODEL / config.embedding_model), so pointing
@@ -7,7 +11,17 @@
 # Upstream URLs/keys come from the environment: the demo compose file points them at
 # stub_upstream.py; production points CHAT_PRIMARY_BASE at NVIDIA NIM
 # (https://integrate.api.nvidia.com/v1) and LOCAL_LLM_BASE at a self-hosted vLLM/NIM.
+# LOCAL_LLM_BASE must never be empty: LiteLLM would then default the in-boundary model to
+# the public OpenAI API. The division deployments default it to http://local-llm.invalid/v1
+# (never resolves -> fails closed) until an operator sets a real in-boundary endpoint.
 model_list:
+  # External (hosted NIM) chat — the LLM_MODEL the division deployments set
+  # (onboard_division.render_agent_env, k8s/base/configmap.yaml).
+  - model_name: meta/llama-3.3-70b-instruct
+    litellm_params:
+      model: openai/meta/llama-3.3-70b-instruct
+      api_base: os.environ/CHAT_PRIMARY_BASE
+      api_key: os.environ/NVIDIA_API_KEY
   # External (hosted NIM) chat — the app's default llm_model and intent model.
   - model_name: meta/llama-3.1-8b-instruct
     litellm_params:
@@ -33,6 +47,7 @@ router_settings:
   num_retries: 1
   timeout: 120
   fallbacks:
+    - meta/llama-3.3-70b-instruct: ["local/llama-3.1-8b-instruct"]
     - meta/llama-3.1-8b-instruct: ["local/llama-3.1-8b-instruct"]
 
 litellm_settings:

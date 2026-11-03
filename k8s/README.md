@@ -125,6 +125,7 @@ k8s/
     agent.yaml worker.yaml
     networkpolicy.yaml      # default-deny + intra-namespace + agent-federation
     kustomization.yaml
+  llm-gateway/              # OPT-IN component: per-division LiteLLM gateway (see below)
   overlays/
     alpha/  beta/  gamma/  delta/  epsilon/   # one overlay per division (mirrors infra/divisions/*.yml)
   README.md
@@ -302,6 +303,55 @@ kubectl -n agt-div-gamma create configmap ca-bundle \
 This is **host-specific and not baked into the base manifests** — a clean deploy on a
 normal network needs none of it. The cleanest avoidance is to **self-host the embedding
 (and LLM) endpoint in-cluster**, so no pod makes an external HTTPS call in the first place.
+
+---
+
+## Optional: per-division LLM gateway (`k8s/llm-gateway/` component)
+
+Puts a LiteLLM Proxy between the division's agent and its model providers (per-division
+virtual key, residency enforced by that key's model allowlist + alias, NIM → in-boundary
+fallback). Prototype, proof and rules: [`examples/llm-gateway/README.md`](../examples/llm-gateway/README.md).
+Off by default; the overlays are unchanged.
+
+```bash
+python scripts/bootstrap_k8s.py --divisions gamma --llm-gateway
+```
+
+With `--llm-gateway` (or `llm_gateway: true` in `infra/divisions/<id>.yml`) the bootstrap:
+1. applies a generated kustomization (`infra/generated/<id>/k8s/`, gitignored) = the
+   overlay unchanged + the component + an `agent-config` patch setting `OPENAI_API_BASE` and
+   `EMBEDDING_API_BASE` to `http://llm-gateway.agt-div-<id>.svc.cluster.local:4000/v1`;
+2. creates `llm-gateway-secrets` (master key + DB password minted into
+   `infra/generated/<id>/secrets.json`, plus the NVIDIA key);
+3. port-forwards the gateway and issues the agent's virtual key with the same code as the
+   Compose onboarding (`onboard_division.provision_gateway_key`): residency `external` →
+   NIM chat + embeddings + the in-boundary model; anything else → only
+   `local/llama-3.1-8b-instruct`, with the app's model names aliased onto it;
+4. ingests through the gateway, and puts the virtual key (not the NVIDIA key) in
+   `agent-secrets` as `OPENAI_API_KEY` / `EMBEDDING_API_KEY`.
+
+The component adds `deploy/llm-gateway` (image pinned by digest) + `svc/llm-gateway:4000`,
+the `llm-gateway-env` ConfigMap (upstreams) and a ConfigMap generated from the **same**
+`litellm-config.yaml` and `init-db.sh` the Compose stack mounts. The gateway gets its own
+`litellm` database and an unprivileged role inside the division's existing Postgres
+(init container), not a second Postgres. NetworkPolicy: only `app: agent` may reach :4000;
+the component also narrows the base `allow-intra-namespace` policy to exclude the gateway
+pod, because policies are additive.
+
+To use it from an overlay by hand: add `components: [../../llm-gateway]`, plus the
+`agent-config` patch from step 1 with that overlay's namespace. The component runs before
+the overlay's namespace transformer, so it cannot work out the FQDN itself. Then create
+the Secret and the key (header of `k8s/llm-gateway/kustomization.yaml`). Use the FQDN, not a
+bare `llm-gateway`: residency=local treats a single-label host as external.
+
+Operator settings and caveats:
+- Set `LOCAL_LLM_BASE` in `llm-gateway-env` to your in-cluster vLLM/NIM. The default
+  `http://local-llm.invalid/v1` never resolves, so the in-boundary model fails closed. Never
+  leave it empty: LiteLLM would then send the "local" model to the public OpenAI API.
+- A residency=local division has no in-boundary **embedding** model in this config, so its
+  key refuses API-mode embeddings. Add a `local/` embedding model group before enabling one.
+- The gateway pod calls NIM over HTTPS, so on a TLS-intercepting host it needs the CA
+  mount described above, the same as the agent.
 
 ---
 

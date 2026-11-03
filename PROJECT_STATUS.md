@@ -26,7 +26,9 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
   for every rule at its boundaries — the parity check for the AgentControl migration.
 - **LLM gateway prototype** (`examples/llm-gateway/`, LiteLLM pinned by digest): per-division
   keys, residency via key allowlist + alias, NIM fallback, rpm + budget limits;
-  `prove_gateway.py` 11/11 live, now a blocking CI job. Not yet wired into the division stack.
+  `prove_gateway.py` 11/11 live, now a blocking CI job. Wired into the division deployments as
+  an opt-in (Compose manifest `llm_gateway: true`; k8s `bootstrap_k8s.py --llm-gateway`). Gateway
+  part proven live on a rendered division stack against stubs; no full cluster run yet.
 - **Open, needs a decision:**
   - Absent-field gap: a deny rule whose field is missing does not fire (e.g. `peer.send_message`
     with no `peer_*` fields is allowed). Latent: every call site sends them. Pinned by
