@@ -448,6 +448,9 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
         # access to data they own; division-admin manages the division (revoke/audit,
         # enforced in M5/M8); member is a regular querying user.
         await _kc_setup_roles(c, kc, h, {"alice": ["member"], "bob": ["data-owner", "division-admin"]})
+        # FR-2.2: the agent's own service account may manage users in THIS realm only
+        # (realm-management manage/view/query-users), backing the /admin/users API.
+        await _kc().grant_user_admin_to_service_account(c, kc, REALM, h, f"agent-{manifest.division_id}")
         log("Keycloak realm + clients + users + roles ready")
 
     # DID identity (per division) + agent .env.
@@ -519,46 +522,28 @@ async def _kc_add_ui_audience(c, kc: str, h: dict, agent_client_id: str) -> None
                  headers=h)
 
 
+def _kc():
+    """The shared Keycloak admin helpers (agt-federated-rag/auth/keycloak_admin.py) — the
+    ONE Keycloak admin client, also used by the agent's FR-2.2 user-lifecycle API."""
+    if str(AGT) not in sys.path:
+        sys.path.insert(0, str(AGT))
+    from auth import keycloak_admin  # type: ignore[import]
+    return keycloak_admin
+
+
 async def _kc_setup_roles(c, kc: str, h: dict, assignments: dict[str, list[str]]) -> None:
     """Create the division RBAC realm roles and assign them to seeded users (FR-2.3).
     Idempotent: role create 409s are fine; assignment is additive."""
-    roles = {"member", "data-owner", "division-admin"}
-    for role in sorted(roles):
-        await c.post(f"{kc}/admin/realms/{REALM}/roles", json={"name": role}, headers=h)  # 201 or 409
-    for username, want in assignments.items():
-        lk = await c.get(f"{kc}/admin/realms/{REALM}/users",
-                         params={"username": username, "exact": "true"}, headers=h)
-        users = lk.json() if lk.status_code == 200 else []
-        if not users:
-            continue
-        uid = users[0]["id"]
-        reps = []
-        for rn in want:
-            rr = await c.get(f"{kc}/admin/realms/{REALM}/roles/{rn}", headers=h)
-            if rr.status_code == 200:
-                reps.append(rr.json())
-        if reps:
-            await c.post(f"{kc}/admin/realms/{REALM}/users/{uid}/role-mappings/realm",
-                         json=reps, headers=h)
+    ka = _kc()
+    await ka.ensure_realm_roles(c, kc, REALM, h, ka.DIVISION_ROLES)
+    await ka.assign_realm_roles_by_username(c, kc, REALM, h, assignments)
 
 
 async def _kc_ensure_user(c, kc: str, h: dict, username: str, email: str, password: str) -> None:
     """Create a realm user and RELIABLY set its password (create + lookup + force
     reset + clear required actions), so the direct-access-grant login works — a
     bare create can leave a required-action that 400s the password grant."""
-    body = {"username": username, "enabled": True, "email": email, "emailVerified": True,
-            "firstName": username.capitalize(), "lastName": "User", "requiredActions": [],
-            "credentials": [{"type": "password", "value": password, "temporary": False}]}
-    await c.post(f"{kc}/admin/realms/{REALM}/users", json=body, headers=h)  # 201 or 409
-    lk = await c.get(f"{kc}/admin/realms/{REALM}/users",
-                     params={"username": username, "exact": "true"}, headers=h)
-    users = lk.json() if lk.status_code == 200 else []
-    if users:
-        uid = users[0]["id"]
-        await c.put(f"{kc}/admin/realms/{REALM}/users/{uid}",
-                    json={"enabled": True, "emailVerified": True, "requiredActions": []}, headers=h)
-        await c.put(f"{kc}/admin/realms/{REALM}/users/{uid}/reset-password",
-                    json={"type": "password", "value": password, "temporary": False}, headers=h)
+    await _kc().ensure_user(c, kc, REALM, h, username, email, password)
 
 
 def _seed_principal(email: str, issuer: str) -> str:

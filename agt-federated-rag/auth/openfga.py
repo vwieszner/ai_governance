@@ -430,6 +430,99 @@ class OpenFGAAuth:
         """
         await self._delete_tuple(user_id, chunk_id, Relation.PENDING_APPROVAL)
 
+    # ── User lifecycle (FR-2.2: division-admin provision / disable / roles) ────
+
+    @staticmethod
+    def role_group(role: str) -> str:
+        """OpenFGA group id mirroring a division RBAC realm role. Prefixed ``role-`` so it
+        can never collide with an IdP group name supplied live via the groups claim."""
+        return f"role-{role}"
+
+    async def _write_raw(self, user: str, relation: str, obj: str) -> None:
+        assert self._client is not None
+        from openfga_sdk.client.models import ClientTuple, ClientWriteRequest  # type: ignore[import]
+        try:
+            await self._client.write(ClientWriteRequest(
+                writes=[ClientTuple(user=user, relation=relation, object=obj)]))
+        except ApiException as exc:
+            detail = (getattr(exc, "body", "") or str(exc)).lower()
+            if exc.status == 400 and "already exist" in detail:
+                return
+            raise
+
+    async def _delete_raw(self, user: str, relation: str, obj: str) -> None:
+        assert self._client is not None
+        from openfga_sdk.client.models import ClientTuple, ClientWriteRequest  # type: ignore[import]
+        try:
+            await self._client.write(ClientWriteRequest(
+                deletes=[ClientTuple(user=user, relation=relation, object=obj)]))
+        except ApiException as exc:
+            body = str(getattr(exc, "body", "") or exc)
+            if exc.status == 404 or "did not exist" in body or "does not exist" in body:
+                return
+            raise
+
+    async def add_role_membership(self, user_id: str, role: str) -> None:
+        """Persist ``user:<p> member group:role-<role>`` (mirror of the Keycloak role)."""
+        await self._write_raw(self._user_id(user_id), "member", f"group:{self.role_group(role)}")
+        log.info("openfga.role_membership_added", user_id=user_id, relation="member",
+                 action=f"role:{role}", agt_audit=True)
+
+    async def remove_role_membership(self, user_id: str, role: str) -> None:
+        """Delete ``user:<p> member group:role-<role>`` (idempotent)."""
+        await self._delete_raw(self._user_id(user_id), "member", f"group:{self.role_group(role)}")
+        log.info("openfga.role_membership_removed", user_id=user_id, relation="member",
+                 action=f"role:{role}", agt_audit=True)
+
+    async def list_user_tuples(self, user_id: str, object_type: str) -> list[tuple[str, str]]:
+        """Every stored ``(relation, object)`` for ``user:<user_id>`` on ``object_type``
+        (Read with a type-only object filter; paginated)."""
+        assert self._client is not None
+        from openfga_sdk.models.read_request_tuple_key import (  # type: ignore[import]
+            ReadRequestTupleKey,
+        )
+        out: list[tuple[str, str]] = []
+        token: str | None = None
+        while True:
+            opts: dict[str, Any] = {"page_size": 100}
+            if token:
+                opts["continuation_token"] = token
+            resp = await self._client.read(
+                ReadRequestTupleKey(user=self._user_id(user_id), relation=None,
+                                    object=f"{object_type}:"), opts)
+            for t in getattr(resp, "tuples", None) or []:
+                out.append((t.key.relation, t.key.object))
+            token = getattr(resp, "continuation_token", None) or None
+            if not token:
+                return out
+
+    async def neutralise_user(self, user_id: str) -> dict[str, int]:
+        """Disable cascade: delete the user's ACCESS-conferring tuples so data access stops
+        at the store, independent of token expiry.
+
+        Deleted: every chunk ``viewer`` (incl. time-bound) / ``editor`` / ``pending_approval``
+        tuple and every persisted ``group`` membership (role mirrors). RETAINED: chunk
+        ``owner`` tuples — ownership is a division asset (approval routing, revoke) and
+        deleting it would orphan the documents; the disabled owner cannot authenticate, and
+        the admin reassigns ownership. Returns per-category counts."""
+        counts = {"viewer": 0, "editor": 0, "pending_approval": 0, "group_member": 0,
+                  "owner_retained": 0}
+        u = self._user_id(user_id)
+        for relation, obj in await self.list_user_tuples(user_id, "chunk"):
+            if relation == Relation.OWNER.value:
+                counts["owner_retained"] += 1
+                continue
+            await self._delete_raw(u, relation, obj)
+            if relation in counts:
+                counts[relation] += 1
+        for relation, obj in await self.list_user_tuples(user_id, "group"):
+            await self._delete_raw(u, relation, obj)
+            counts["group_member"] += 1
+        log.info("openfga.user_neutralised", user_id=user_id,
+                 count=sum(v for k, v in counts.items() if k != "owner_retained"),
+                 agt_audit=True)
+        return counts
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def close(self) -> None:

@@ -74,3 +74,32 @@ async def remove(approver: str, request_id: str) -> None:
         await r.hdel(_key(approver), request_id)
     except Exception as exc:
         log.warning("approval_index_remove_failed", error=str(exc))
+
+
+async def by_requester(requester: str) -> list[tuple[str, str]]:
+    """FR-2.2 disable cascade: every pending ``(approver, request_id)`` in THIS division
+    whose requester is ``requester``. A SCAN over this division's inbox keys — an admin
+    operation (rare), never on the request path. Raises on a store error so the caller
+    can report the cascade as incomplete rather than silently skipping it."""
+    r = await _get_redis()
+    prefix = f"approvals:pending:{settings.division_id}:"
+    out: list[tuple[str, str]] = []
+    async for key in r.scan_iter(match=f"{prefix}*"):
+        approver = key[len(prefix):]
+        for rid, v in (await r.hgetall(key)).items():
+            try:
+                if json.loads(v).get("requester_id") == requester:
+                    out.append((approver, rid))
+            except Exception:
+                continue
+    return out
+
+
+async def count_for(approver: str) -> int:
+    """How many requests currently await ``approver`` (0 on a store error)."""
+    try:
+        r = await _get_redis()
+        return int(await r.hlen(_key(approver)))
+    except Exception as exc:
+        log.warning("approval_index_count_failed", error=str(exc))
+        return 0

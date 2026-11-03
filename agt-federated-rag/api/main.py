@@ -516,7 +516,39 @@ async def _get_bearer_token(authorization: str | None) -> tuple[str, dict[str, A
     if not sub:
         raise HTTPException(status_code=401, detail="Token missing required 'sub' claim")
 
+    # FR-2.2: a division admin's disable takes effect on the NEXT request, not at token
+    # expiry — JWTs are validated locally, so Keycloak's session revocation alone would leave
+    # an already-issued access token usable until it lapses.
+    if await _account_disabled(str(sub)):
+        log.warning("disabled_account_refused", subject=str(sub), agt_audit=True)
+        raise HTTPException(status_code=401, detail="Account disabled",
+                            headers={"WWW-Authenticate": "Bearer"})
+
     return token, claims
+
+
+# ── Disabled-account denylist (FR-2.2 disable cascade) ─────────────────────────
+# Keyed by the Keycloak user id (== the token `sub`) and namespaced by division. No TTL:
+# the entry outlives every token the user could still hold. Checked on every authenticated
+# request; a Redis error FAILS CLOSED (503), like the kill-switch — a store we cannot read
+# must not silently re-admit a disabled account.
+
+def _disabled_key(sub: str) -> str:
+    return f"agt:disabled:{settings.division_id}:{sub}"
+
+
+async def _account_disabled(sub: str) -> bool:
+    try:
+        r = await _get_redis()
+        return bool(await r.get(_disabled_key(sub)))
+    except Exception as exc:
+        log.error("disabled_check_failed_failing_closed", error=str(exc))
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+async def _mark_account_disabled(sub: str) -> None:
+    r = await _get_redis()
+    await r.set(_disabled_key(sub), str(int(time.time())))
 
 
 # ── Division-admin gate (FR-2.2 role: division admin) ──────────────────────────
@@ -2469,6 +2501,317 @@ async def admin_kill_switch(
         },
         status_code=200,
     )
+
+
+# ── Division-admin user lifecycle (FR-2.2) ────────────────────────────────────
+# POST /admin/users, PUT /admin/users/{username}/roles, POST /admin/users/{username}/disable.
+#
+# Scope = THIS division only, by construction (NFR-2): the caller must present a token
+# validated against THIS division's issuer + audience + JWKS (_require_admin) — a foreign
+# division's token never gets past validate_token — and every Keycloak call targets the realm
+# derived from THIS division's own OIDC config, authenticated as THIS division's agent service
+# account (realm-management manage/view/query-users in its own realm only). There is no
+# division parameter to tamper with. OpenFGA writes land in this division's own store.
+#
+# Role model: a division realm role R (member | data-owner | division-admin) in Keycloak is
+# mirrored 1:1 as the OpenFGA tuple `user:<principal> member group:role-R`, written/removed
+# in the same call, so the token's role and the ReBAC graph agree.
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@\-]{0,127}$")
+
+
+def _kc_http_client() -> Any:
+    """HTTP client for the Keycloak admin API (patched to an httpx.MockTransport in tests)."""
+    import httpx
+    return httpx.AsyncClient(timeout=15)
+
+
+@asynccontextmanager
+async def _kc_admin() -> AsyncIterator[tuple[Any, str, str, dict[str, str]]]:
+    """Yield (client, keycloak_base, realm, admin_headers) for THIS division's realm.
+
+    The realm is derived from the JWKS URI (reachable from the agent even where the
+    browser-facing issuer host is not, e.g. k8s). Auth: client-credentials as the agent's
+    own service account — the same agent_client_id/secret the division already holds."""
+    from auth import keycloak_admin as ka
+    kc, realm = ka.split_realm_url(str(settings.oidc_jwks_uri))
+    async with _kc_http_client() as c:
+        h = await ka.service_account_headers(c, kc, realm, settings.agent_client_id,
+                                             settings.agent_client_secret)
+        yield c, kc, realm, h
+
+
+def _user_principal(username: str, email: str) -> str:
+    """The OpenFGA principal a token for this user will resolve to (== principal(claims)):
+    `<subject>|<issuer-ns>` with this division's issuer."""
+    claim = settings.principal_claim
+    if claim == "email":
+        subject = email
+    elif claim == "preferred_username":
+        subject = username
+    else:
+        raise HTTPException(status_code=501,
+                            detail=f"user lifecycle API does not support PRINCIPAL_CLAIM={claim}")
+    if not subject:
+        raise HTTPException(status_code=409, detail="user has no subject claim value")
+    return f"{subject.strip().lower()}|{issuer_namespace(str(settings.oidc_issuer))}"
+
+
+def _validate_username(username: str) -> str:
+    if not _USERNAME_RE.match(username or ""):
+        raise HTTPException(status_code=400, detail="Invalid username")
+    return username
+
+
+def _validate_roles(raw: Any) -> list[str]:
+    from auth.keycloak_admin import DIVISION_ROLES
+    if not isinstance(raw, list) or not all(isinstance(r, str) for r in raw):
+        raise HTTPException(status_code=400, detail="'roles' must be a list of strings")
+    bad = sorted(set(raw) - set(DIVISION_ROLES))
+    if bad:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown role(s) {bad}; allowed: {list(DIVISION_ROLES)}")
+    return sorted(set(raw))
+
+
+async def _json_body(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+    return body
+
+
+def _idp_unavailable(op: str, exc: Exception) -> HTTPException:
+    # Never echo IdP response bodies (may carry internal detail) — log the class + status.
+    log.error("admin_idp_call_failed", action=op, error=type(exc).__name__,
+              detail=str(exc)[:200])
+    return HTTPException(status_code=503, detail="Identity provider admin API unavailable")
+
+
+@app.post("/admin/users")
+async def admin_provision_user(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """FR-2.2: provision a user in THIS division (Keycloak user + realm roles + OpenFGA
+    role mirror). Admin-only. Audited.
+
+    Body: ``{"username", "email", "roles": [..] (default ["member"]), "first_name"?,
+    "last_name"?, "password"?, "temporary"? (default true)}``. Without ``password`` the user
+    must set one via Keycloak's UPDATE_PASSWORD action. 409 if the username exists."""
+    caller, _ = await _require_admin(authorization)
+    await _check_rate_limit(caller)
+    body = await _json_body(request)
+    username = _validate_username(str(body.get("username", "")).strip())
+    email = str(body.get("email", "")).strip().lower()
+    if not re.match(r"^[^@\s]+@[^@\s]+$", email):
+        raise HTTPException(status_code=400, detail="Invalid email")
+    roles = _validate_roles(body.get("roles", ["member"]))
+    password = body.get("password")
+    if password is not None and (not isinstance(password, str) or len(password) < 8):
+        raise HTTPException(status_code=400, detail="'password' must be a string of >= 8 chars")
+    temporary = body.get("temporary", True)
+    if not isinstance(temporary, bool):
+        raise HTTPException(status_code=400, detail="'temporary' must be a boolean")
+    target = _user_principal(username, email)
+
+    from auth import keycloak_admin as ka
+    try:
+        async with _kc_admin() as (c, kc, realm, h):
+            created = await ka.create_user(
+                c, kc, realm, h, username=username, email=email,
+                first_name=str(body.get("first_name", ""))[:100],
+                last_name=str(body.get("last_name", ""))[:100],
+                password=password, temporary=temporary)
+            if not created:
+                raise HTTPException(status_code=409, detail="User already exists")
+            u = await ka.find_user(c, kc, realm, h, username)
+            if not u:
+                raise ka.KeycloakAdminError("find_user_after_create", 404)
+            await ka.add_realm_roles(c, kc, realm, h, u["id"], roles)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _idp_unavailable("provision", exc)
+
+    try:
+        fga = await agent_nodes._get_openfga()
+        for role in roles:
+            await fga.add_role_membership(target, role)
+    except Exception as exc:
+        log.error("admin_user_provision_incomplete", user_id=target, subject=caller,
+                  action="provision", roles=roles, error=type(exc).__name__, agt_audit=True)
+        raise HTTPException(status_code=503,
+                            detail="User created in the IdP but the role mirror failed; "
+                                   "retry PUT /admin/users/{username}/roles")
+
+    log.info("admin_user_provisioned", user_id=target, subject=caller, action="provision",
+             roles=roles, division_id=settings.division_id, agt_audit=True)
+    return JSONResponse(status_code=201, content={
+        "division_id": settings.division_id, "username": username, "principal": target,
+        "keycloak_id": u["id"], "roles": roles, "enabled": True})
+
+
+@app.put("/admin/users/{username}/roles")
+async def admin_set_user_roles(
+    username: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """FR-2.2: set a user's division roles to EXACTLY ``{"roles": [...]}`` (subset of
+    member | data-owner | division-admin; other realm roles are untouched). Keycloak role
+    mappings and the OpenFGA role mirror are converged in the same call. Admin-only, audited.
+    409 for a disabled user, or an admin removing their OWN division-admin role (lockout)."""
+    caller, _ = await _require_admin(authorization)
+    await _check_rate_limit(caller)
+    _validate_username(username)
+    body = await _json_body(request)
+    want = _validate_roles(body.get("roles"))
+
+    from auth import keycloak_admin as ka
+    try:
+        async with _kc_admin() as (c, kc, realm, h):
+            u = await ka.find_user(c, kc, realm, h, username)
+            if not u:
+                raise HTTPException(status_code=404, detail="User not found in this division")
+            if not u.get("enabled", True):
+                raise HTTPException(status_code=409, detail="User is disabled")
+            target = _user_principal(username, str(u.get("email", "")))
+            if target == caller and "division-admin" not in want:
+                raise HTTPException(status_code=409,
+                                    detail="An admin cannot remove their own division-admin role")
+            current = set(await ka.get_realm_roles(c, kc, realm, h, u["id"])) & set(ka.DIVISION_ROLES)
+            added = await ka.add_realm_roles(c, kc, realm, h, u["id"], sorted(set(want) - current))
+            removed = await ka.remove_realm_roles(c, kc, realm, h, u["id"], sorted(current - set(want)))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _idp_unavailable("set_roles", exc)
+
+    try:
+        fga = await agent_nodes._get_openfga()
+        # Converge the mirror to `want` (re-asserting is idempotent; heals any prior drift).
+        for role in want:
+            await fga.add_role_membership(target, role)
+        for role in sorted(set(ka.DIVISION_ROLES) - set(want)):
+            await fga.remove_role_membership(target, role)
+    except Exception as exc:
+        log.error("admin_user_roles_incomplete", user_id=target, subject=caller,
+                  action="set_roles", roles=want, error=type(exc).__name__, agt_audit=True)
+        raise HTTPException(status_code=503,
+                            detail="IdP roles updated but the role mirror failed; retry")
+
+    log.info("admin_user_roles_set", user_id=target, subject=caller, action="set_roles",
+             roles=want, cascade={"added": added, "removed": removed},
+             division_id=settings.division_id, agt_audit=True)
+    return JSONResponse(status_code=200, content={
+        "division_id": settings.division_id, "username": username, "principal": target,
+        "roles": want, "added": added, "removed": removed})
+
+
+@app.post("/admin/users/{username}/disable")
+async def admin_disable_user(
+    username: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """FR-2.2: disable a user in THIS division, cascading so data access stops NOW.
+
+    Cascade (each step reported; the whole call is idempotent — re-run to finish a partial):
+      1. denylist   — the agent refuses the user's still-valid access tokens on the next
+                      request (401), independent of token expiry;
+      2. keycloak   — user disabled + ALL sessions revoked (no new tokens, refresh dies);
+      3. openfga    — viewer/editor/pending_approval chunk tuples + role-group memberships
+                      deleted; ``owner`` tuples RETAINED (documents are not orphaned; the
+                      count is reported so the admin can reassign ownership);
+      4. approvals  — requests the user MADE are auto-DENIED in Temporal (attributed to the
+                      admin) and dropped from approvers' inboxes; requests AWAITING the user
+                      as approver are left pending (counted) — they fail closed at timeout
+                      unless ownership is reassigned, never auto-approved;
+      5. inbox      — the user's outcome inbox + badge are purged (records carry no answer
+                      text; the decisions remain in the audit chain).
+    200 when every step succeeded, 502 with the per-step report otherwise. Admin-only;
+    audited. 409 if an admin tries to disable themselves."""
+    caller, _ = await _require_admin(authorization)
+    await _check_rate_limit(caller)
+    _validate_username(username)
+
+    from auth import keycloak_admin as ka
+    steps: dict[str, Any] = {}
+    try:
+        async with _kc_admin() as (c, kc, realm, h):
+            u = await ka.find_user(c, kc, realm, h, username)
+            if not u:
+                raise HTTPException(status_code=404, detail="User not found in this division")
+            target = _user_principal(username, str(u.get("email", "")))
+            if target == caller:
+                raise HTTPException(status_code=409, detail="An admin cannot disable themselves")
+            # 1. denylist first: the cheapest step and the one that bites immediately.
+            try:
+                await _mark_account_disabled(u["id"])
+                steps["denylist"] = "ok"
+            except Exception as exc:
+                steps["denylist"] = f"failed:{type(exc).__name__}"
+            # 2. Keycloak: disable + revoke sessions.
+            try:
+                await ka.set_enabled(c, kc, realm, h, u["id"], False)
+                await ka.logout_user(c, kc, realm, h, u["id"])
+                steps["keycloak"] = "ok"
+            except Exception as exc:
+                steps["keycloak"] = f"failed:{type(exc).__name__}"
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _idp_unavailable("disable", exc)
+
+    # 3. OpenFGA: neutralise access-conferring tuples.
+    try:
+        fga = await agent_nodes._get_openfga()
+        steps["openfga"] = await fga.neutralise_user(target)
+    except Exception as exc:
+        steps["openfga"] = f"failed:{type(exc).__name__}"
+
+    # 4. Pending approvals.
+    import approval_index
+    try:
+        mine = await approval_index.by_requester(target)
+        tc = getattr(request.app.state, "temporal_client", None)
+        denied = 0
+        for approver, rid in mine:
+            if tc is not None:
+                try:
+                    await tc.get_workflow_handle(f"approval-{rid}").signal(
+                        "approval_decision",
+                        ApprovalDecisionSignal(decision="denied",
+                                               reason="requester account disabled by division admin",
+                                               approver_id=caller))
+                    denied += 1
+                except Exception as exc:   # workflow already closed → just drop the entry
+                    log.warning("disable_cascade_signal_failed", request_id=rid,
+                                error=type(exc).__name__)
+            await approval_index.remove(approver, rid)
+        steps["approvals"] = {"requested_withdrawn": len(mine), "denied_in_workflow": denied,
+                              "pending_as_approver": await approval_index.count_for(target)}
+    except Exception as exc:
+        steps["approvals"] = f"failed:{type(exc).__name__}"
+
+    # 5. Outcome inbox.
+    import outcome_store
+    try:
+        steps["inbox"] = {"purged": await outcome_store.purge(target)}
+    except Exception as exc:
+        steps["inbox"] = f"failed:{type(exc).__name__}"
+
+    ok = not any(isinstance(v, str) and v.startswith("failed") for v in steps.values())
+    log.warning("admin_user_disabled" if ok else "admin_user_disable_incomplete",
+                user_id=target, subject=caller, action="disable", cascade=steps,
+                division_id=settings.division_id, agt_audit=True)
+    return JSONResponse(status_code=200 if ok else 502, content={
+        "division_id": settings.division_id, "username": username, "principal": target,
+        "enabled": False, "complete": ok, "cascade": steps})
 
 
 # ── Exception handlers ────────────────────────────────────────────────────────

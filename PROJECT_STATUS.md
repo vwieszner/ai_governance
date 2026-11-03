@@ -118,10 +118,10 @@ engine, trust gate, and DLP genuinely fail closed.
    execute only against ≥3 live stacks (`RUN_E2E=1` + reachability probe).
 
 Smaller gaps — **now closed:** grant expiry ✅, `GET /audit` ✅, runtime kill-switch ✅,
-division-native UI ✅ (FR-2.4), bounded discovery lookups ✅ (NFR-6), CRL revocation ✅ (NFR-3),
+division-native UI ✅ (FR-2.4), admin user-lifecycle API ✅ (FR-2.2), bounded discovery lookups ✅ (NFR-6), CRL revocation ✅ (NFR-3),
 proving-test debt largely ✅. **Remaining residuals:** OCSP (needs a responder — infra), the
 3-division e2e run (needs live stacks), and true multi-peer transport reroute (discovery
-confirms+observes today). Plus pre-existing items: admin user-lifecycle API (FR-2.2), HA stores,
+confirms+observes today). Plus pre-existing items: HA stores,
 **independent external pen-test** (the red-team below was an internal adversarial pass, not a
 third-party engagement) — see the Security review section.
 
@@ -166,7 +166,7 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
 | Milestone | Requirements | Status | One-line verdict |
 |---|---|---|---|
 | **M0** Tenancy + onboarding | FR-1, NFR-2, NFR-8 | ✅ DONE | Physical per-division stacks + manifest-driven onboarding (`--dry-run/--force/--teardown`); `division_id` threaded + signed. Kill-B/cross-store proof exists but skips without live stacks. |
-| **M1** Per-division identity | FR-2 | ✅ DONE | Backend rejects foreign-division tokens (issuer+audience+key, tested); **UI now division-native** — N-division model via `VITE_DIVISIONS`, FR-2.4. Residual: admin user lifecycle is script-driven, no self-service API (FR-2.2). |
+| **M1** Per-division identity | FR-2 | ✅ DONE | Backend rejects foreign-division tokens (issuer+audience+key, tested); **UI now division-native** — N-division model via `VITE_DIVISIONS`, FR-2.4. **FR-2.2 admin user-lifecycle API** — `POST /admin/users`, `PUT /admin/users/{u}/roles`, `POST /admin/users/{u}/disable` (division-admin of THIS division only; Keycloak role ↔ OpenFGA `group:role-<r>` mirror; disable cascades denylist→Keycloak disable+logout→OpenFGA access tuples (owner kept)→own pending requests denied→inbox purged; audited). Hermetic `tests/test_user_lifecycle.py` + live-proven vs real Keycloak 26/OpenFGA/Redis/Temporal. |
 | **M2** Verifiable X-division identity | FR-3.6, FR-3.7 | ✅ DONE | FR-3.7 (authorized→immediate vs needs-approval) works; **FR-3.6 now hardened** — recipient-bound (`aud`=target DID), 300s-expiry, `jti` signed assertion validated far-side (recipient+expiry+signer) then re-authorized (`test_assertion.py`). |
 | **M3** Discovery + negotiation | FR-3.1–3.5 | ✅ DONE | FR-3.3 signed/replay-protected agent identity ✅; **discovery now wired** — discover→negotiate→delegate with graceful fallback, bounded `registry.find()`, observable FR-3.4 markers in MonitorPanel. Residual: signed transport still routes to the configured peer (true multi-peer reroute is a transport follow-up). |
 | **M4** Offline delivery | FR-5, FR-6 | ✅ DONE | FR-5 durable approval + authenticated owner inbox; **FR-6 now done** — durable per-user inbox seeded at park, `GET /inbox` regenerate-at-delivery, cross-division callback delivery, in-app badge (`outcome_store.py`, `test_offline.py`). |
