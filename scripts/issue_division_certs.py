@@ -21,8 +21,14 @@ To REVOKE a division (regenerate the CRL with the revoked cert serials), pass --
 followed by the serial numbers of the certs to revoke. The serving context reloads the CRL
 on its next bind (mtime cache) and rejects the revoked client cert at the handshake.
 
+OCSP (NFR-3): ``--ocsp-url URL`` bakes URL into each cert's AIA OCSP field (overrides
+TLS_OCSP_URL; ``--ocsp-url ""`` omits the extension). To ENFORCE it inbound, set
+TLS_OCSP_MODE=soft|hard on the serving agent (transport/ocsp.py); TLS_OCSP_RESPONDER_URL
+optionally overrides the per-cert AIA URL.
+
 Usage:
     .venv\\Scripts\\python.exe scripts/issue_division_certs.py alpha beta gamma
+    .venv\\Scripts\\python.exe scripts/issue_division_certs.py --ocsp-url http://ocsp.fed:8080 alpha beta
     .venv\\Scripts\\python.exe scripts/issue_division_certs.py --revoke <serial> [<serial>...]
 """
 from __future__ import annotations
@@ -56,8 +62,14 @@ def _revoke(serials: list[str]) -> int:
 def main(argv: list[str]) -> int:
     if argv and argv[0] == "--revoke":
         return _revoke(argv[1:])
+    ocsp_url = None
+    if argv and argv[0] == "--ocsp-url":
+        if len(argv) < 2:
+            print("--ocsp-url needs a URL (or \"\" to omit the AIA extension)", file=sys.stderr)
+            return 2
+        ocsp_url, argv = argv[1], argv[2:]
     divisions = argv or ["alpha", "beta", "gamma"]
-    result = issue_federation_certs(CERT_DIR, divisions)
+    result = issue_federation_certs(CERT_DIR, divisions, ocsp_url=ocsp_url)
     print(f"[certs] federation CA:  {result['_ca']}")
     print(f"[certs] federation CRL: {result['_crl']}")
     for div in divisions:
@@ -69,6 +81,7 @@ def main(argv: list[str]) -> int:
     print("  TLS_KEY_FILE=<...>/<division>.key")
     print(f"  TLS_CRL_FILE={result['_crl']}")
     print("  REQUIRE_MTLS=true")
+    print("  TLS_OCSP_MODE=soft|hard   # optional: query the AIA OCSP responder per peer cert")
     return 0
 
 
