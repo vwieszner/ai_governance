@@ -1,0 +1,44 @@
+# LiteLLM Proxy config for one division's LLM gateway.
+#
+# Model groups are named with the EXACT model ids the app already sends
+# (config.llm_model / agent.nodes._INTENT_MODEL / config.embedding_model), so pointing
+# the agent at the gateway is a base-URL + key change only — no app code change.
+#
+# Upstream URLs/keys come from the environment: the demo compose file points them at
+# stub_upstream.py; production points CHAT_PRIMARY_BASE at NVIDIA NIM
+# (https://integrate.api.nvidia.com/v1) and LOCAL_LLM_BASE at a self-hosted vLLM/NIM.
+model_list:
+  # External (hosted NIM) chat — the app's default llm_model and intent model.
+  - model_name: meta/llama-3.1-8b-instruct
+    litellm_params:
+      model: openai/meta/llama-3.1-8b-instruct
+      api_base: os.environ/CHAT_PRIMARY_BASE
+      api_key: os.environ/NVIDIA_API_KEY
+  # In-boundary (self-hosted) chat — the only model a residency=local division may use.
+  - model_name: local/llama-3.1-8b-instruct
+    litellm_params:
+      model: openai/meta/llama-3.1-8b-instruct
+      api_base: os.environ/LOCAL_LLM_BASE
+      api_key: os.environ/LOCAL_LLM_KEY
+  # External embeddings (NIM nv-embedqa: asymmetric, needs input_type + truncate).
+  - model_name: nvidia/nv-embedqa-e5-v5
+    litellm_params:
+      model: openai/nvidia/nv-embedqa-e5-v5
+      api_base: os.environ/CHAT_PRIMARY_BASE
+      api_key: os.environ/NVIDIA_API_KEY
+
+router_settings:
+  # NIM free tier throttles / cold-starts: on failure, retry once, then fall back to the
+  # in-boundary model. Fallback only goes external -> local, never local -> external.
+  num_retries: 1
+  timeout: 120
+  fallbacks:
+    - meta/llama-3.1-8b-instruct: ["local/llama-3.1-8b-instruct"]
+
+litellm_settings:
+  drop_params: false          # forward provider-specific fields (NIM input_type/truncate)
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY   # admin only; agents get per-division keys
+  database_url: os.environ/DATABASE_URL       # virtual keys, budgets, spend
+  disable_admin_ui: true                      # hardening: no admin UI exposed

@@ -1,0 +1,54 @@
+# Per-division LLM gateway (LiteLLM Proxy) — demo stack. See README.md.
+#
+#   LITELLM_MASTER_KEY=sk-$(openssl rand -hex 16) GATEWAY_DB_PASSWORD=$(openssl rand -hex 16) \
+#     docker compose -f examples/llm-gateway/docker-compose.yml up -d
+#
+# Images are pinned by DIGEST, not tag (LiteLLM's 2026 PyPI compromise is why: never
+# `pip install litellm` unpinned; use the official image, pinned).
+#   litellm v1.106.6: the Docker Hub index digest below is byte-identical to the official
+#   ghcr.io/berriai/litellm:v1.106.6 index (checked 2026-11-03).
+services:
+  gateway-db:
+    image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_DB: litellm
+      POSTGRES_PASSWORD: ${GATEWAY_DB_PASSWORD:?set GATEWAY_DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 3s
+      retries: 20
+
+  litellm:
+    image: litellm/litellm@sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "127.0.0.1:4000:4000"   # loopback only; the agent reaches it in-boundary
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY}
+      DATABASE_URL: postgresql://litellm:${GATEWAY_DB_PASSWORD}@gateway-db:5432/litellm
+      # Demo upstreams = the stubs below. Production: CHAT_PRIMARY_BASE=https://integrate.api.nvidia.com/v1
+      # with the real NVIDIA_API_KEY, LOCAL_LLM_BASE=<your vLLM/NIM service>/v1.
+      CHAT_PRIMARY_BASE: ${CHAT_PRIMARY_BASE:-http://stub-external:8000/v1}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-stub}
+      LOCAL_LLM_BASE: ${LOCAL_LLM_BASE:-http://stub-local:8000/v1}
+      LOCAL_LLM_KEY: ${LOCAL_LLM_KEY:-stub}
+    depends_on:
+      gateway-db:
+        condition: service_healthy
+
+  # ── demo-only stand-ins for NIM (external) and vLLM (local) ────────────────
+  stub-external:
+    image: python:3.12-slim
+    command: ["python", "/stub/stub_upstream.py"]
+    volumes: ["./stub_upstream.py:/stub/stub_upstream.py:ro"]
+    environment: {STUB_NAME: external-nim, STUB_FAIL: "${STUB_EXTERNAL_FAIL:-0}"}
+    ports: ["127.0.0.1:4101:8000"]   # exposed only so the proof can read GET /last
+  stub-local:
+    image: python:3.12-slim
+    command: ["python", "/stub/stub_upstream.py"]
+    volumes: ["./stub_upstream.py:/stub/stub_upstream.py:ro"]
+    environment: {STUB_NAME: local-vllm, STUB_FAIL: "${STUB_LOCAL_FAIL:-0}"}
+    ports: ["127.0.0.1:4102:8000"]
