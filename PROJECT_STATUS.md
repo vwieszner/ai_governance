@@ -12,6 +12,30 @@ comments, or prior handoff notes. Full backend suite (current): **252 passed, 2 
 (254 collected)**. The skips are live-infra integration tests (cross-store isolation,
 admin-lifecycle) plus one honest abstention (discovery lookup is not bounded — see NFR-6).
 
+### Update log — 2026-11-03 (AGT 5.0, supply chain, LLM gateway)
+- **AGT 3.7 → 5.0.** The six per-component packages became `agent-governance-toolkit-core` +
+  `-cli` 5.0.0 (import names unchanged; they now emit `DeprecationWarning`). Capped `<6.0`:
+  AGT `main` removes `agent_os.policies.PolicyEvaluator` (`agent/nodes.py`) for the ACS
+  `AgentControl` runtime. Suite identical on 3.7 and 5.0.
+- **Installable wheel.** `pip install .` works (explicit hatch file list). Fixed a latent bug
+  found that way: `policy_dir` defaulted to a CWD-relative path, so an installed app loaded
+  **0 rules** and default-denied everything; the default is now anchored to the code.
+- **Supply chain.** `requirements.lock.txt` is sha256 hash-pinned (pip enforces it on every
+  install path); Dependabot watches AGT releases (`.github/dependabot.yml`).
+- **Policy decision matrix** (`tests/test_governance.py`): 27 rows pin allow/deny + deciding rule
+  for every rule at its boundaries — the parity check for the AgentControl migration.
+- **LLM gateway prototype** (`examples/llm-gateway/`, LiteLLM pinned by digest): per-division
+  keys, residency via key allowlist + alias, NIM fallback, rpm + budget limits;
+  `prove_gateway.py` 11/11 live, now a blocking CI job. Not yet wired into the division stack.
+- **Open, needs a decision:**
+  - Absent-field gap: a deny rule whose field is missing does not fire (e.g. `peer.send_message`
+    with no `peer_*` fields is allowed). Latent: every call site sends them. Pinned by
+    `test_absent_field_semantics_are_pinned`.
+  - The embedding SSRF guard refuses `127.0.0.1` but not `localhost`.
+- **Blocked upstream:** the AgentControl migration and AGT policy at the gateway wait on ACS 0.4
+  reaching PyPI (`agt migrate` does not convert this repo's rule YAMLs).
+- **Not re-verified in this pass:** live division stacks, `prove_live.py`, k8s, the UI.
+
 ### Update log — 2026-06-17 (post-audit fixes)
 - **New feature — pluggable multi-retriever + retrieval-as-a-service.** N retrievers (Qdrant,
   Neo4j seam, any number of external RaaS endpoints) fan out and are RRF-fused; every returned
@@ -243,7 +267,8 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
 
 ## Test reality
 
-- Full backend suite: **343 passed, 1 skipped** (as of 2026-06-19, post Wave-7 cross-agent tool
+- Full backend suite: **404 passed, 8 skipped** (2026-11-03, on AGT 5.0, Python 3.11 and 3.12 —
+  incl. the new 27-row policy decision matrix). Earlier: **343 passed, 1 skipped** (as of 2026-06-19, post Wave-7 cross-agent tool
   delegation + its F2 security-review fix; was **252 passed, 2 skipped** at the 2026-06-17 audit,
   itself up from 138/2 at first audit — the growth is this session's retriever feature + gap-fix +
   red-team + hardening + Wave-7 governed-tool-delegation regression tests).
