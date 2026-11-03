@@ -1,9 +1,6 @@
-agent_governance_toolkit==3.7.0
-agent_hypervisor==3.7.0
-agent_os_kernel==3.7.0
-agent_sre==3.7.0
-agentmesh_platform==3.5.0
-agentmesh_runtime==3.7.0
+agent_governance_toolkit_cli==5.0.0
+agent_governance_toolkit_core==5.0.0
+agentrust_trace==0.2.0
 aiohappyeyeballs==2.6.2
 aiohttp==3.13.5
 aiosignal==1.4.0
