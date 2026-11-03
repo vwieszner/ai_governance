@@ -54,3 +54,86 @@ def test_output_dlp_allows_clean_answer_and_does_not_overblock():
     assert _allowed(ev, "agent.output_check",
                     llm_output="Access requires the data owner's approval; your token is validated at login "
                                "and the secret rotation policy is quarterly.")
+
+
+# ── Decision matrix: engine-migration parity contract ─────────────────────────
+#
+# AGT main removes agent_os.policies.PolicyEvaluator in favour of the ACS
+# AgentControl runtime (manifests from `agt migrate`). This matrix pins the
+# CURRENT decision — allow/deny AND the deciding rule — for every rule in
+# agent/policies at both sides of its boundary, using the contexts the real call
+# sites send (agent/nodes.py, api/main.py, tools/mcp.py). Point `_evaluator` at
+# the new engine and this table is the parity check: a row that changes is either
+# a migration bug or a semantic change to accept consciously, never silently.
+#
+# Columns: (id, action, context, allowed, deciding rule)
+_TRUSTED_PEER = {"peer_did_verified": True, "transport_encrypted": True,
+                 "peer_trust_score": 0.9, "peer_execution_ring": "TRUSTED",
+                 "peer_circuit_state": "CLOSED"}
+_DECISIONS = [
+    # base-policy: allow-listed actions (contexts as sent by the call sites)
+    ("retrieve", "rag.retrieve",
+     {"query_length": 20, "qdrant_collection": "knowledge_base"}, True, "allow-rag-retrieve"),
+    ("authz", "auth.check_permission", {"chunk_count": 5}, True, "allow-auth-check"),
+    ("generate", "llm.generate", {"context_char_count": 1000}, True, "allow-llm-generate"),
+    ("approval", "approval.start_workflow", {"pending_chunk_count": 2}, True,
+     "allow-approval-start"),
+    ("peer-send", "peer.send_message", _TRUSTED_PEER, True, "allow-peer-send"),
+    ("peer-callback", "peer.receive_callback", _TRUSTED_PEER, True,
+     "allow-peer-receive-callback"),
+    ("mcp", "mcp.call", {"server": "s", "tool": "t"}, True, "allow-mcp-call"),
+    ("format", "agent.format_response", {}, True, "allow-format-response"),
+    # base-policy: deny rules (priority beats the action allow-rule)
+    ("trust-0.6-ok", "rag.retrieve", {"agent_trust_score": 0.6}, True, "allow-rag-retrieve"),
+    ("trust-0.59", "rag.retrieve", {"agent_trust_score": 0.59}, False, "block-low-trust-agents"),
+    ("goal-replace", "goal.replace", {}, False, "block-goal-override"),
+    ("prompt-override", "system_prompt.override", {}, False, "block-goal-override"),
+    ("shell-tool", "mcp.call", {"tool_category": "shell_exec"}, False, "block-code-execution"),
+    ("file-write", "mcp.call", {"tool_category": "file_write"}, False,
+     "block-filesystem-writes"),
+    # data-access-policy: caps at both sides of each boundary
+    ("query-4096", "rag.retrieve", {"query_length": 4096}, True, "allow-rag-retrieve"),
+    ("query-4097", "rag.retrieve", {"query_length": 4097}, False, "reject-oversized-query"),
+    ("query-empty", "rag.retrieve", {"query_length": 0}, False, "reject-empty-query"),
+    ("chunks-50", "rag.retrieve", {"requested_chunk_count": 50}, True, "allow-rag-retrieve"),
+    ("chunks-51", "rag.retrieve", {"requested_chunk_count": 51}, False, "cap-chunk-retrieval"),
+    ("bad-collection", "rag.retrieve", {"qdrant_collection": "evil"}, False,
+     "block-untrusted-collection"),
+    ("ctx-24000", "llm.generate", {"context_char_count": 24000}, True, "allow-llm-generate"),
+    ("ctx-24001", "llm.generate", {"context_char_count": 24001}, False, "cap-llm-context"),
+    # peer-comms-policy: each deny rule against an otherwise-trusted peer
+    ("peer-unverified", "peer.send_message", {**_TRUSTED_PEER, "peer_did_verified": False},
+     False, "require-peer-did-verified"),
+    ("peer-plaintext", "peer.send_message", {**_TRUSTED_PEER, "transport_encrypted": False},
+     False, "require-iatp-encryption"),
+    ("peer-circuit-open", "peer.send_message", {**_TRUSTED_PEER, "peer_circuit_state": "OPEN"},
+     False, "block-when-circuit-open"),
+    ("peer-low-trust", "peer.send_message", {**_TRUSTED_PEER, "peer_trust_score": 0.5},
+     False, "block-low-trust-peer"),
+    ("peer-untrusted-ring", "peer.send_message",
+     {**_TRUSTED_PEER, "peer_execution_ring": "SANDBOX"}, False, "require-trusted-ring"),
+]
+
+
+def test_policy_decision_matrix():
+    ev = _evaluator()
+    for case_id, action, ctx, allowed, rule in _DECISIONS:
+        d = ev.evaluate({"action": action, **ctx})
+        assert (d.allowed, d.matched_rule) == (allowed, rule), (
+            f"{case_id}: got ({d.allowed}, {d.matched_rule!r}), "
+            f"pinned ({allowed}, {rule!r})")
+
+
+def test_absent_field_semantics_are_pinned():
+    # KNOWN SEMANTIC GAP, pinned on purpose: under the current engine a deny rule
+    # whose field is ABSENT from the context does not match, so the action's allow
+    # rule wins. E.g. peer.send_message with no peer_* fields at all is ALLOWED.
+    # Every real call site sends these fields (see the matrix above), so this is
+    # latent, not exploitable today. AGT's ACS migration changes `ne`/`not_in` on an
+    # absent field to fail CLOSED — when this test fails after migration, that is the
+    # expected (safer) change: update the pins deliberately.
+    ev = _evaluator()
+    assert _allowed(ev, "peer.send_message")
+    assert _allowed(ev, "peer.send_message", peer_did_verified=True,
+                    transport_encrypted=True, peer_trust_score=0.9)  # ring absent
+    assert _allowed(ev, "rag.retrieve", query_length=10)  # collection absent
