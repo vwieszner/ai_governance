@@ -953,39 +953,48 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     query's capability and negotiate before committing (mesh/discovery.py).
     GRACEFUL DEGRADATION: if the broker is unreachable / returns nothing / the
     discovered peer isn't a configured trust partner, fall back to the configured
-    peer so existing single-peer federation never regresses. The signed transport
-    (mesh/peer_client.call_peer_agent) is unchanged — it sends to the configured
-    peer; we delegate through it only when the discovered target resolves to that
-    peer (the demo's single trusted partner). The discovered target is recorded in
-    ``discovery_summary`` for the observable inter-agent conversation (FR-3.4).
+    peer so existing single-peer federation never regresses. A discovered target is
+    delegated to THAT peer: the signed transport (mesh/peer_client.call_peer_agent,
+    ``target_did=``) resolves its URL + verification key from the local peer_trust
+    anchor — never from the broker. The target is recorded in ``discovery_summary``
+    for the observable inter-agent conversation (FR-3.4).
 
     Security: user_token is read from _user_token_ctx, never from state.
     The peer_client layer handles DID verification, trust-score gating,
     IATP encryption, and circuit-breaker management.
     """
-    if not settings.peer_agent_url:
-        return {
-            "error": "No peer agent configured.",
-            "flow": FlowDecision.REMOTE_DENIED,
-            "status_message": "No remote cluster available.",
-        }
+    no_peer = {
+        "error": "No peer agent configured.",
+        "flow": FlowDecision.REMOTE_DENIED,
+        "status_message": "No remote cluster available.",
+    }
+    # Multi-peer: a deployment may federate via the peer_trust map + discovery alone
+    # (no legacy PEER_AGENT_URL). With neither, there is nobody to delegate to.
+    if not settings.peer_agent_url and not settings.peer_trust:
+        return no_peer
 
     # ── FR-3.1/3.2: discover → negotiate → resolve the delegation target ──────
     # Never raises (graceful degradation to the configured peer inside the helper).
     from mesh.discovery import resolve_delegation_target
     target = await resolve_delegation_target(state["query"])
 
-    # HONESTY GUARD: the signed transport (_mesh_call_peer) sends to the configured
-    # peer. If discovery selected a peer that is NOT the configured one (possible only
-    # in a future multi-peer mesh, never in the single-peer demo), we cannot route
-    # there through this transport — so we report it as a configured-fallback for THIS
-    # send rather than claim a hop that didn't happen. The discovered division is kept
-    # in the marker for observability of WHAT WAS DISCOVERED.
+    # MULTI-PEER ROUTING: a DISCOVERED target is delegated to THAT peer — we hand only its
+    # DID to the signed transport, which resolves the destination URL + verification key
+    # from OUR trust anchor (never the broker entry), binds the assertion aud to it, and
+    # uses that peer's own circuit breaker. A discovered target without an anchor URL
+    # (defence-in-depth — resolve_delegation_target already skips those) degrades to the
+    # configured peer. configured-fallback keeps the legacy single-peer path unchanged.
     source = target.source
-    if source == "discovered" and not target.is_configured_peer():
-        log.warning("discovered_peer_not_configured_transport_fallback",
-                    discovered_url=target.agent_url, discovered_did=target.agent_did)
-        source = "configured-fallback"
+    route_did: str | None = None
+    if source == "discovered":
+        if target.agent_did and target.agent_url:
+            route_did = target.agent_did
+        else:
+            log.warning("discovered_peer_unroutable_configured_fallback",
+                        discovered_did=target.agent_did)
+            source = "configured-fallback"
+    if route_did is None and not settings.peer_agent_url:
+        return no_peer
 
     # Structured marker the UI MonitorPanel parses into discovered/negotiated/
     # delegated rows (FR-3.4) — explicit signal, not inferred from arbitrary prose.
@@ -1007,13 +1016,16 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     )
 
     # Include circuit breaker state in policy context (ASI-08, peer-comms-policy)
-    circuit_state = await get_peer_circuit_state(str(settings.peer_agent_url))
+    # ...for the ACTUAL target (the discovered peer's own breaker, or the configured one).
+    circuit_state = await get_peer_circuit_state(
+        target.agent_url if route_did else str(settings.peer_agent_url))
 
     # Finding #4: feed the policy engine the REAL verification results, not
     # hardcoded "all verified" constants. With the old hardcoded values the
     # peer-comms-policy DENY rules on peer_did_verified / peer_trust_score
-    # could never fire — the policy layer was decorative.
-    peer_did = settings.peer_agent_did or ""
+    # could never fire — the policy layer was decorative. (Verified for the
+    # ACTUAL target DID, not the legacy configured one.)
+    peer_did = route_did or settings.peer_agent_did or ""
     if peer_did:
         peer_verified, peer_trust = await verify_peer_identity(peer_did)
     else:
@@ -1043,8 +1055,12 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
         # fail the receiver's SSRF prefix check and silently drop the callback — M4).
         callback_url = f"{str(settings.agent_url).rstrip('/')}/tasks/{task_id}/callback"
 
+    # Route to the discovered peer only when one was selected; otherwise call exactly as
+    # before (no target_did kwarg) so the legacy single-peer path is byte-for-byte unchanged.
+    route_kwargs: dict[str, Any] = {"target_did": route_did} if route_did else {}
     try:
         peer_response = await _mesh_call_peer(
+            **route_kwargs,
             query=state["query"],
             user_id=state["user_id"],
             context_id=state.get("context_id", ""),

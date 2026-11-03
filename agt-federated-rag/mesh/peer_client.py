@@ -79,8 +79,19 @@ _circuit_breakers: dict[str, CircuitBreaker] = {}
 _cb_lock: asyncio.Lock = asyncio.Lock()
 
 
+def _breaker_key(peer_url: str) -> str:
+    """Normalised breaker key for a peer's (trust-anchored) URL.
+
+    Multi-peer: each ACTUAL target gets its own breaker, so a failing peer B opening its
+    breaker never fails calls to a healthy peer C. Trailing-slash normalised so the legacy
+    configured URL (pydantic renders ``http://h:9100/``) and the same peer's trust-anchor
+    URL (``http://h:9100``) share ONE breaker instead of splitting its failure count."""
+    return str(peer_url or "").rstrip("/")
+
+
 async def _get_circuit_breaker(peer_url: str) -> CircuitBreaker:
     """Return (creating once) the circuit breaker for a peer URL."""
+    peer_url = _breaker_key(peer_url)
     cb = _circuit_breakers.get(peer_url)
     if cb is not None:
         return cb
@@ -124,6 +135,32 @@ async def get_peer_circuit_state(peer_url: str | None = None) -> CircuitState:
         return CircuitState.CLOSED
     cb = await _get_circuit_breaker(url)
     return cb.get_state()
+
+
+def resolve_trusted_peer_url(peer_did: str) -> str:
+    """Return the DATA-PATH destination URL for ``peer_did`` from the LOCAL trust anchor.
+
+    Multi-peer routing (FR-3 residual): when discovery selects a peer, the signed request
+    must go to THAT peer — but WHERE it goes is taken ONLY from the operator-curated
+    ``settings.peer_trust[peer_did]["agent_url"]``, never from the discovery broker's
+    advertised ``agent_url`` (an open, self-asserted registry: trusting its URL would let a
+    rogue registration steer signed traffic — broker-spoofed SSRF/redirect). The response is
+    then verified against the same anchor's public key (verify_signed_message), so the
+    destination and the verification key come from ONE trusted entry.
+
+    FAIL CLOSED: a DID that is not a trust anchor, or an anchor with no agent_url, raises
+    AgentMeshError before anything is signed or sent.
+    """
+    did = str(peer_did or "").strip()
+    entry = settings.peer_trust.get(did) if did else None
+    if not entry:
+        log.warning("peer_target_untrusted_refused", peer_did=did)
+        raise AgentMeshError(f"Peer DID '{did}' is not in the local trust map — refusing to route")
+    url = str(entry.get("agent_url") or "").strip().rstrip("/")
+    if not url:
+        log.warning("peer_target_no_anchor_url_refused", peer_did=did)
+        raise AgentMeshError(f"Trusted peer '{did}' has no agent_url in the trust map")
+    return url
 
 
 def _bind_user_assertion(claims: dict, *, audience: str) -> dict:
@@ -268,6 +305,7 @@ async def call_peer_agent(
     callback_url: str | None = None,
     user_assertion: dict | None = None,
     check_only: bool = False,
+    target_did: str | None = None,
 ) -> PeerResponse:
     """
     Send a governed, DID-signed query to the peer agent over HTTP.
@@ -281,14 +319,25 @@ async def call_peer_agent(
     peer gets no credential it could replay against the user's home division, and the
     `aud` binding means it cannot even forward this assertion to a THIRD division. The
     plain user_id is diagnostic only.
-    """
-    if not settings.peer_agent_url:
-        raise RuntimeError("No peer agent URL configured")
-    peer_url = str(settings.peer_agent_url)
 
-    peer_did = settings.peer_agent_did
-    if not peer_did:
-        raise ValueError("PEER_AGENT_DID not configured — cannot verify peer identity")
+    Routing (multi-peer): ``target_did`` is the DID discovery selected. When given, the
+    request goes to THAT peer — its URL comes from the local trust anchor
+    (resolve_trusted_peer_url; an untrusted DID is refused before signing), the assertion
+    ``aud`` is bound to it, the response must be signed by it (verified against its
+    anchored key), and the circuit breaker is that peer's own. When omitted, the legacy
+    single configured peer (PEER_AGENT_URL / PEER_AGENT_DID) is used exactly as before.
+    """
+    if target_did:
+        peer_did = str(target_did)
+        peer_url = resolve_trusted_peer_url(peer_did)   # fail closed: untrusted → AgentMeshError
+    else:
+        if not settings.peer_agent_url:
+            raise RuntimeError("No peer agent URL configured")
+        peer_url = str(settings.peer_agent_url)
+
+        peer_did = settings.peer_agent_did
+        if not peer_did:
+            raise ValueError("PEER_AGENT_DID not configured — cannot verify peer identity")
 
     # Build the outbound query payload. Authenticity/freshness/trust + the response
     # signature check are handled uniformly by _deliver_signed_payload (which mirrors
@@ -358,7 +407,20 @@ async def call_peer_tool(
     orchestrator via _bind_user_assertion / mint_user_assertion with aud = this peer's DID).
     NO raw bearer token is ever placed on the wire, so a compromised peer gets no credential
     to replay, and the aud binding stops it re-presenting the assertion to a third division.
+
+    Destination pinning (multi-peer): ``peer_url`` must equal the local trust anchor's URL for
+    ``peer_did`` (resolve_trusted_peer_url). An untrusted DID, or a URL that differs from the
+    anchor (e.g. one copied from a broker advertisement), is refused before anything is signed,
+    so the bytes can only ever go where the operator-curated trust map says that DID lives.
     """
+    anchored_url = resolve_trusted_peer_url(peer_did)   # fail closed: untrusted → AgentMeshError
+    if str(peer_url or "").strip().rstrip("/") != anchored_url:
+        log.warning("peer_tool_url_not_anchored_refused", peer_did=peer_did,
+                    requested_url=peer_url, anchored_url=anchored_url)
+        raise AgentMeshError(
+            f"Destination for '{peer_did}' does not match its trust-anchor agent_url — refusing")
+    peer_url = anchored_url
+
     payload: dict[str, Any] = {
         # The capability the peer must serve (e.g. "tool.calc"); the peer resolves it to its
         # own local server via server_for_capability — we never name the peer's server/tool.
