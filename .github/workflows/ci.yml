@@ -5,6 +5,8 @@ name: CI
 #   1. ruff   — backend lint must stay clean
 #   2. pytest — backend test suite must pass
 #   3. UI     — npm ci + vitest + production build must succeed
+#   4. LLM gateway — examples/llm-gateway/prove_gateway.py (11 live scenarios
+#               against the pinned LiteLLM image + stub upstreams)
 # One NON-BLOCKING informational step:
 #   4. mypy   — a ratchet for NEW code; the legacy codebase still has ~924
 #               pre-existing `--strict` findings, so it is not a gate yet.
@@ -88,3 +90,52 @@ jobs:
 
       - name: Production build
         run: npm run build
+
+  # ── Gate 4 (BLOCKING): LLM gateway live proof ──────────────────────────────
+  # Brings up examples/llm-gateway (LiteLLM pinned by digest + Postgres + stub
+  # NIM/vLLM upstreams) and drives the agent's real client factories through it.
+  # Guards the residency rule "no in-boundary -> external fallback" on every PR.
+  llm-gateway:
+    name: LLM gateway (live proof)
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE_FILE: examples/llm-gateway/docker-compose.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pinned dependencies (the proof imports the agent code)
+        run: pip install -r agt-federated-rag/requirements.lock.txt
+
+      - name: Generate throwaway gateway credentials
+        run: |
+          k="sk-$(openssl rand -hex 16)"; p="$(openssl rand -hex 16)"
+          echo "::add-mask::$k"; echo "::add-mask::$p"
+          echo "LITELLM_MASTER_KEY=$k" >> "$GITHUB_ENV"
+          echo "GATEWAY_DB_PASSWORD=$p" >> "$GITHUB_ENV"
+
+      - name: Start the gateway stack
+        run: |
+          docker compose up -d
+          for i in $(seq 1 90); do
+            curl -sf http://localhost:4000/health/liveliness && exit 0
+            sleep 2
+          done
+          docker compose logs litellm | tail -50
+          exit 1
+
+      - name: Prove the gateway
+        run: python examples/llm-gateway/prove_gateway.py
+
+      - name: Gateway logs on failure
+        if: failure()
+        run: docker compose logs --tail 100
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

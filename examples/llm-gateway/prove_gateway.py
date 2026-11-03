@@ -130,7 +130,11 @@ def main() -> int:
     if not MASTER:
         print("set LITELLM_MASTER_KEY (the gateway admin key)")
         return 2
-    print(f"gateway {GATEWAY}: {_http('GET', f'{GATEWAY}/health/liveliness')}")
+    try:
+        print(f"gateway {GATEWAY}: {_http('GET', f'{GATEWAY}/health/liveliness')}")
+    except urllib.error.URLError as exc:
+        print(f"gateway {GATEWAY} is not reachable ({exc.reason}); start it first (see README)")
+        return 2
     outage("stub-external", False)   # start from a known-healthy state
     outage("stub-local", False)
 
