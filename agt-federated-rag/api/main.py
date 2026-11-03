@@ -609,6 +609,30 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "to enforce NFR-3 revocation.",
                 agt_audit=True,
             )
+    # 3) OCSP posture (transport/ocsp.py). Off by default. soft = fail-OPEN on a responder
+    #    outage (an attacker who can block the responder defeats it — the classic soft-fail
+    #    caveat); a mode set without require_mtls is inert (no inbound peer cert to check).
+    try:
+        from transport.ocsp import ocsp_mode_for
+        ocsp_mode = ocsp_mode_for(settings)
+    except ValueError as exc:
+        ocsp_mode = "invalid"
+        log.warning("ocsp_mode_invalid", detail=str(exc), agt_audit=True)
+    if ocsp_mode != "off" and not settings.require_mtls:
+        log.warning(
+            "ocsp_without_mtls",
+            detail=f"TLS_OCSP_MODE={ocsp_mode} but require_mtls is false — there is no inbound "
+            "client cert to check, so OCSP is NOT enforced on this agent.",
+            agt_audit=True,
+        )
+    elif ocsp_mode == "soft":
+        log.warning(
+            "ocsp_soft_fail",
+            detail="TLS_OCSP_MODE=soft — a REVOKED answer is refused, but an unreachable/invalid "
+            "responder or an UNKNOWN status is ALLOWED (logged). Use TLS_OCSP_MODE=hard to fail "
+            "closed once the responder is HA.",
+            agt_audit=True,
+        )
 
     # Initialise AgentMesh identity — resolves or creates the DID
     await agent_identity.get_mesh()
@@ -2497,9 +2521,11 @@ def run() -> None:
     from transport.mtls import crl_path_for, tls_serving_kwargs
     ssl_kwargs = tls_serving_kwargs(settings)
     if ssl_kwargs:
+        from transport.ocsp import ocsp_mode_for
         crl = crl_path_for(settings)
         log.info("serving_mtls", cert=settings.tls_cert_file, client_cert="required",
-                 crl_revocation="enforced" if crl else "none", crl_file=crl or None)
+                 crl_revocation="enforced" if crl else "none", crl_file=crl or None,
+                 ocsp_mode=ocsp_mode_for(settings))
     uvicorn.run(
         "api.main:app",
         host=settings.host,

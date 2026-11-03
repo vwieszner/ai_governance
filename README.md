@@ -23,7 +23,7 @@ Qdrant, and Keycloak.
 > **📍 Current state:** the governance core, **offline/account-bound delivery (FR-6)**,
 > **verifiable cross-division identity (FR-3.6)**, **dynamic discovery (FR-3.1/3.2)**,
 > **CRL revocation (NFR-3)**, and the **division-native UI** are built and tested (223 backend tests).
-> Remaining residuals: OCSP (needs a responder), the 3-division e2e run (needs live stacks), and an
+> OCSP peer checking is opt-in (`TLS_OCSP_MODE`). Remaining residuals: the 3-division e2e run (needs live stacks), and an
 > independent pen-test. **See `PROJECT_STATUS.md` for the verified done / not-done picture.**
 
 ---

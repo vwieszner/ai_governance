@@ -4,7 +4,8 @@ A division-federation private CA issues a client/server cert per division; cross
 and discovery endpoints require mutual TLS — a peer with no client cert, a self-signed
 cert, or a CRL-revoked cert is rejected. This module builds the CA + division certs, the
 client-cert-REQUIRED server SSL context + the client SSL context, and an application-layer
-CRL revocation check (mirrors the CRL/OCSP gate on the data path).
+CRL revocation check (mirrors the CRL/OCSP gate on the data path). Optional OCSP checking of
+the inbound peer leaf lives in transport/ocsp.py and is installed by server_context.
 
 Cert-identity: each division cert's CN + SAN is the division_id, so after the handshake the
 peer's certificate identifies WHICH division connected (defence-in-depth on top of the
@@ -42,11 +43,11 @@ CRL_FILE = os.environ.get("TLS_CRL_FILE", "")
 
 # OCSP responder URL baked into issued certs via the Authority Information Access (AIA)
 # extension, so a relying party can do an ONLINE revocation check (lower latency than a CRL
-# for a freshly-revoked serial) once a responder is deployed (NFR-3). This is READINESS only:
-# it advertises WHERE the responder lives; standing up the responder + turning on stapling is
-# a deploy-time step (see ocsp_stapling_file / the OCSP note in server_context). Overridable by
-# env so config.py needn't grow a field. Empty → no AIA/OCSP extension is added (the CRL gate
-# still applies), keeping issuance backward-compatible.
+# for a freshly-revoked serial) (NFR-3). It advertises WHERE the responder lives; the inbound
+# OCSP CHECK that consults it is transport/ocsp.py (TLS_OCSP_MODE=soft|hard, default off).
+# Overridable by env (or issue_division_cert(ocsp_url=...) / the issuer script's --ocsp-url).
+# Empty → no AIA/OCSP extension is added (the CRL gate still applies), keeping issuance
+# backward-compatible.
 OCSP_RESPONDER_URL = os.environ.get(
     "TLS_OCSP_URL", "http://ocsp.federation.local"
 )
@@ -121,8 +122,13 @@ def generate_ca(common_name: str = "AGT Federation CA") -> tuple[ec.EllipticCurv
     return key, cert
 
 
-def issue_division_cert(ca_key, ca_cert, division_id: str) -> CertPair:
-    """Issue a CA-signed cert whose CN + SAN identify the division."""
+def issue_division_cert(ca_key, ca_cert, division_id: str,
+                        ocsp_url: str | None = None) -> CertPair:
+    """Issue a CA-signed cert whose CN + SAN identify the division.
+
+    ``ocsp_url`` overrides the AIA OCSP responder URL baked into the cert (default: the
+    ``TLS_OCSP_URL`` module setting; "" → no AIA extension)."""
+    ocsp_url = OCSP_RESPONDER_URL if ocsp_url is None else ocsp_url
     key = ec.generate_private_key(ec.SECP256R1())
     builder = (
         x509.CertificateBuilder()
@@ -147,14 +153,14 @@ def issue_division_cert(ca_key, ca_cert, division_id: str) -> CertPair:
     )
     # AuthorityInformationAccess (OCSP): advertise the responder so a relying party can do an
     # ONLINE revocation check / OCSP stapling once a responder is deployed (NFR-3 readiness).
-    # Added only when OCSP_RESPONDER_URL is set so issuance stays backward-compatible when it
-    # isn't. ENFORCEMENT (responder + stapling) is a deploy-time step — see server_context.
-    if OCSP_RESPONDER_URL:
+    # Added only when an OCSP URL is set so issuance stays backward-compatible when it isn't.
+    # ENFORCEMENT on the inbound side is transport/ocsp.py (TLS_OCSP_MODE=soft|hard).
+    if ocsp_url:
         builder = builder.add_extension(
             x509.AuthorityInformationAccess([
                 x509.AccessDescription(
                     AuthorityInformationAccessOID.OCSP,
-                    x509.UniformResourceIdentifier(OCSP_RESPONDER_URL)),
+                    x509.UniformResourceIdentifier(ocsp_url)),
             ]), critical=False)
     cert = builder.sign(ca_key, hashes.SHA256())
     return CertPair(
@@ -228,7 +234,8 @@ def load_crl_bundle(ca_path: str, crl_path: str) -> str:
 
 def server_context(cert_path: str, key_path: str, ca_path: str,
                    crl_path: str | None = None,
-                   ocsp_staple_file: str | None = None) -> ssl.SSLContext:
+                   ocsp_staple_file: str | None = None,
+                   ocsp_checker=None) -> ssl.SSLContext:
     """Server SSL context that REQUIRES a client certificate signed by our CA (mTLS).
     (check_hostname is a client-side setting; not applicable on a server context.)
 
@@ -247,7 +254,12 @@ def server_context(cert_path: str, key_path: str, ca_path: str,
     or HAProxy) — see THREAT_MODEL §3 (nginx edge) and the deploy note. We therefore VALIDATE
     the hook (fail loud if a path is configured but absent — same posture as the CRL) but do
     NOT silently pretend to staple. Passing it without a front-end that staples is a no-op at
-    the Python layer by design, documented here so it is never mistaken for enforcement."""
+    the Python layer by design, documented here so it is never mistaken for enforcement.
+
+    OCSP CHECKING (enforced, NFR-3): ``ocsp_checker`` (a ``transport.ocsp.OCSPChecker``) queries
+    the peer cert's OCSP responder right after OpenSSL verifies the chain, inside the handshake
+    object, and aborts the connection on REVOKED (or any non-GOOD in hard mode) — see
+    transport/ocsp.py for why it is post-verify rather than an OpenSSL callback."""
     if ocsp_staple_file:
         # Fail loud on a configured-but-missing staple, mirroring load_crl_bundle: a
         # misconfigured stapling path must not be silently ignored.
@@ -268,6 +280,9 @@ def server_context(cert_path: str, key_path: str, ca_path: str,
             ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
         else:
             ctx.load_verify_locations(ca_path)
+        if ocsp_checker is not None and ocsp_checker.mode != "off":
+            from transport.ocsp import install_on_context
+            install_on_context(ctx, ocsp_checker)
     return ctx
 
 
@@ -328,15 +343,21 @@ def tls_serving_kwargs(s) -> dict:
         )
     crl = crl_path_for(s)
     staple = ocsp_staple_file_for(s)
-    if crl or staple:
+    from transport.ocsp import checker_from_env, ocsp_mode_for, ocsp_responder_override_for
+    ocsp_mode = ocsp_mode_for(s)            # raises on a typo'd mode (fail loud)
+    checker = (checker_from_env(ca, ocsp_mode, ocsp_responder_override_for(s))
+               if ocsp_mode != "off" else None)
+    if crl or staple or checker:
         # uvicorn's built-in ssl_* path can't set verify_flags / load a CRL (or validate an
         # OCSP staple hook), so hand it a factory that returns our hardened server_context. The
         # factory is invoked per (re)bind, so load_crl_bundle's mtime cache refreshes a
         # republished CRL on a reload. ``staple`` is the OCSP-stapling readiness hook (validated
         # by server_context; enforcement still needs a TLS front-end — see its docstring).
+        # ``checker`` (TLS_OCSP_MODE=soft|hard) adds the post-verify OCSP gate; it is created
+        # once here so its per-serial cache survives a rebind.
         def _factory(_config, _default):
             return server_context(cert, key, ca, crl_path=crl or None,
-                                  ocsp_staple_file=staple or None)
+                                  ocsp_staple_file=staple or None, ocsp_checker=checker)
         return {"ssl_context_factory": _factory}
     return {
         "ssl_certfile": cert,
@@ -376,7 +397,8 @@ def _write_ca_key(ca_key, path) -> str:
     return str(p)
 
 
-def issue_federation_certs(out_dir, division_ids: list[str], ca_name: str = "AGT Federation CA"):
+def issue_federation_certs(out_dir, division_ids: list[str], ca_name: str = "AGT Federation CA",
+                           ocsp_url: str | None = None):
     """Generate one shared CA + a per-division cert/key under out_dir, returning
     {division_id: (cert_path, key_path), '_ca': ca_path, '_ca_key': key_path, '_crl': crl_path}.
     Also persists the CA private key + an initial (empty) CRL so revocation can be enforced and
@@ -393,7 +415,7 @@ def issue_federation_certs(out_dir, division_ids: list[str], ca_name: str = "AGT
     crl_path = write_crl(build_crl(ca_key, ca_cert, []), d / "federation-ca.crl")
     result: dict = {"_ca": str(ca_path), "_ca_key": ca_key_path, "_crl": crl_path}
     for div in division_ids:
-        pair = issue_division_cert(ca_key, ca_cert, div)
+        pair = issue_division_cert(ca_key, ca_cert, div, ocsp_url=ocsp_url)
         crt, key = pair.write(d, div)
         result[div] = (crt, key)
     return result

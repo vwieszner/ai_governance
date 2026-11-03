@@ -29,7 +29,7 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
   far-side), discovery wiring (discover→negotiate→delegate + graceful fallback + observable FR-3.4),
   and bounded `registry.find` (NFR-6).
 - **Wave 4 (closed):** CRL certificate-revocation now enforced at the mTLS handshake (refresh +
-  distribution point); OCSP deferred (needs a responder). **All six selected gaps are now addressed.**
+  distribution point); OCSP checking since added (see NFR-3 below). **All six selected gaps are now addressed.**
 - **Wave 5 (independent red-team + fixes, closed):** a 4-agent adversarial pass (each finding
   demonstrated, default-DEFENDED) found **3 VULNERABLE** + several hardening items — **all fixed with
   regression tests.** Every confidentiality control held. See the Security review section below.
@@ -39,8 +39,8 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
     legacy `--strict` findings ratcheted for new code, not faked).
   - **Governance hardened:** **HMAC-keyed audit chain** — tamper-EVIDENT → tamper-PROOF when keyed
     with off-host key custody (backward-compatible; `tests/test_audit_hmac.py`); **OCSP readiness**
-    (AIA responder URL in issued certs + a validated stapling hook — enforcement still needs a
-    responder); **MCP** executor proven to never forward a raw user token (`_assert_no_user_credential`).
+    (AIA responder URL in issued certs + a validated stapling hook) — now **enforced** inbound by
+    `transport/ocsp.py` (see NFR-3 below); **MCP** executor proven to never forward a raw user token (`_assert_no_user_credential`).
   - **Real Kubernetes deployment** (`k8s/` kustomize, alongside Compose) — **deployed LIVE on a local
     kind cluster**: the full division (6 stateful services + agent + worker) reaches Running; agent
     `GET /health` → **200** with its DID. Fixed two real manifest bugs en route (the distroless
@@ -119,8 +119,8 @@ engine, trust gate, and DLP genuinely fail closed.
 
 Smaller gaps — **now closed:** grant expiry ✅, `GET /audit` ✅, runtime kill-switch ✅,
 division-native UI ✅ (FR-2.4), bounded discovery lookups ✅ (NFR-6), CRL revocation ✅ (NFR-3),
-proving-test debt largely ✅. **Remaining residuals:** OCSP (needs a responder — infra), the
-3-division e2e run (needs live stacks), and true multi-peer transport reroute (discovery
+proving-test debt largely ✅, OCSP checking ✅ (NFR-3; an HA production responder is deploy-time
+infra). **Remaining residuals:** the 3-division e2e run (needs live stacks), and true multi-peer transport reroute (discovery
 confirms+observes today). Plus pre-existing items: admin user-lifecycle API (FR-2.2), HA stores,
 **independent external pen-test** (the red-team below was an internal adversarial pass, not a
 third-party engagement) — see the Security review section.
@@ -145,7 +145,8 @@ tests; every confidentiality control held.**
 **Residuals that need deployment, not code:** the audit hash-chain is keyless with a local anchor
 (forgeable only by a host-compromise attacker) → set `AUDIT_ANCHOR_URL` to a remote append-only sink;
 `require_mtls` without `TLS_CRL_FILE` serves no revocation gate → set it. Both now **warn at startup**.
-Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + write-ups:
+OCSP is now checked inbound (opt-in `TLS_OCSP_MODE=soft|hard`; `soft` also warns at startup).
+Still open: a true third-party pen-test. Probes + write-ups:
 `redteam/REDTEAM_*.md` + `redteam/probe_*.py`.
 
 ---
@@ -172,7 +173,7 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
 | **M4** Offline delivery | FR-5, FR-6 | ✅ DONE | FR-5 durable approval + authenticated owner inbox; **FR-6 now done** — durable per-user inbox seeded at park, `GET /inbox` regenerate-at-delivery, cross-division callback delivery, in-app badge (`outcome_store.py`, `test_offline.py`). |
 | **M5** Access lifecycle | FR-7 | ✅ DONE | Revoke (FR-7.2) owner-gated; **expiry (FR-7.1) now wired** — approvals honor `approval_grant_ttl_seconds` via `grant_viewer_until`; re-ask re-enters approval on both revoke and expiry (`test_lifecycle.py`). |
 | **M6** Data residency | NFR-1 | ✅ DONE | Egress guard wired into **both** the answer LLM and the intent LLM; fail-closed. Self-hosted backend is operator-supplied (config-driven), not bundled — acceptable per plan. |
-| **M7** Transport + IaC + secrets | NFR-3,4,5,8,10 | ✅ MOSTLY DONE | mTLS serving + outbound peer certs ✅; rotation ✅; secrets ✅; **CRL revocation enforced** at the handshake (+ OCSP AIA/staple readiness). **Real Kubernetes deployment** (`k8s/` kustomize, per-namespace NetworkPolicy isolation) — **deployed + verified Running on a local kind cluster** (agent `/health`→200); Compose path retained. Remaining: OCSP responder, HA stores, a NetworkPolicy-enforcing CNI in prod. |
+| **M7** Transport + IaC + secrets | NFR-3,4,5,8,10 | ✅ MOSTLY DONE | mTLS serving + outbound peer certs ✅; rotation ✅; secrets ✅; **CRL revocation enforced** at the handshake + **OCSP checking** of inbound peers (opt-in soft/hard; proven live vs `openssl ocsp`). **Real Kubernetes deployment** (`k8s/` kustomize, per-namespace NetworkPolicy isolation) — **deployed + verified Running on a local kind cluster** (agent `/health`→200); Compose path retained. Remaining: an HA production OCSP responder (infra), HA stores, a NetworkPolicy-enforcing CNI in prod. |
 | **M8** Audit & accountability | FR-8, NFR-9 | ✅ DONE | Tamper-evident hash chain + anchor, now **optionally HMAC-keyed → tamper-PROOF** with off-host key custody (`test_audit_hmac.py`); admin-gated division-scoped **`GET /audit`** export + CLI `verify_audit.py`. |
 | **M-GOV** Governance | FR-4, NFR-6, NFR-7 | 🟡 MOSTLY DONE | Per-node `_enforce` ✅, trust gate ✅, output DLP ✅, needs-approval-from-ReBAC ✅, injection containment ✅ — now with named proving tests (`test_governance_controls.py`, `test_mesh.py`). **Kill-switch is now a runtime lever** (`POST /admin/kill-switch`, FR-4.3). NFR-6: inbox lookup is O(1) (`test_scaling.py`) **and discovery `registry.find()` is now bounded** (capability index, `test_discovery_wiring.py`). NFR-7 is measure-and-log, not a budget gate. |
 
@@ -217,8 +218,17 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
   flag honored per request on `/query` (and `/a2a/query`), no restart; `tests/test_killswitch.py`.
 - ✅ **NFR-3 — CRL revocation — DONE (2026-06-17).** Enforced at the inbound mTLS handshake
   (`VERIFY_CRL_CHECK_LEAF`, mtime-cached CRL refresh, `CRLDistributionPoints` in issued certs,
-  `--revoke` to republish); `test_transport.py`. **OCSP** not done — needs a live responder
-  (infra follow-up); the **nginx-edge** mode needs `ssl_crl` wired separately.
+  `--revoke` to republish); `test_transport.py`. **OCSP — DONE (2026-11-03):** `transport/ocsp.py`
+  checks the authenticated peer leaf right after the handshake verifies it (an `sslobject_class`
+  hook on the server context — the stdlib has no in-handshake OCSP callback), POSTing a nonce'd
+  request to the cert's AIA URL (or `TLS_OCSP_RESPONDER_URL`), verifying signer (CA or CA-delegated
+  `OCSPSigning`), CertID, nonce and thisUpdate/nextUpdate, caching per serial until nextUpdate.
+  `TLS_OCSP_MODE=off` (default) | `soft` (outage/unknown → allow + warn) | `hard` (fail closed);
+  REVOKED always refused. Issuer: `issue_division_certs.py --ocsp-url`. Hermetic `tests/test_ocsp.py`
+  (30) + **live proof** `examples/mtls-ocsp/prove_ocsp_live.py` (real `openssl ocsp` responder +
+  uvicorn via `tls_serving_kwargs`: good accepted, revoked/unknown refused, hard vs soft on outage).
+  Caveats: a cache miss blocks the event loop for ≤`TLS_OCSP_TIMEOUT` (3s); server-side stapling
+  still needs a TLS front-end; the **nginx-edge** mode needs `ssl_crl`/`ssl_ocsp` wired separately.
 - ✅ **NFR-6 — Bounded lookups — DONE (2026-06-17).** Inbox is O(1); `discovery/registry.py::find()`
   now uses a capability→DIDs index (point read, not O(N) scan); `test_discovery_wiring.py` proves the
   lookup touches only matching entries regardless of registry size.
