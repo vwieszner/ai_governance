@@ -50,7 +50,6 @@ def test_reserved_port_base_rejected():
     # A co-resident project reserves port_base+1 (=8000+N*100+1) as its BACKEND, so the
     # old 8100/8200/8300/8400 bases (openfga=+1) collide. The guard must refuse them.
     import pytest
-
     from scripts.onboard_division import assert_port_base_clean
     for colliding in (8100, 8200, 8300, 8400):
         with pytest.raises(ValueError):
@@ -110,3 +109,191 @@ def test_onboard_no_source_edit():
     # division to a free port slot doesn't break this test.
     exp_ofga = derive_ports(load_manifest(DIVISIONS_DIR / "alpha.yml").port_base)["openfga"]
     assert "DIV_ID=alpha" in body and f"DIV_OPENFGA_PORT={exp_ofga}" in body
+
+
+# ── Optional per-division LLM gateway (manifest `llm_gateway: true`) ─────────────
+# Hermetic: render-only (dry_run), no docker/network. The live proof is
+# examples/llm-gateway/prove_gateway.py; these pin the deployment wiring.
+
+_FAKE_SECRETS = {"openfga_api_token": "t", "agent_client_secret": "c", "approval_hmac_secret": "h"}
+
+
+def _gw_manifest(tmp_path, div: str, residency: str = "external", extra: str = "") -> Path:
+    p = tmp_path / f"{div}.yml"
+    p.write_text(f"division_id: {div}\ndisplay_name: GW\nport_base: 9600\n"
+                 f"docs_dir: tests/docs/cluster-a\nresidency_mode: {residency}\n"
+                 f"llm_gateway: true\n{extra}", encoding="utf-8")
+    return p
+
+
+def _env_dict(text: str) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def _gateway_model_names() -> set[str]:
+    import yaml
+    from scripts.onboard_division import GATEWAY_CONFIG
+    cfg = yaml.safe_load(GATEWAY_CONFIG.read_text(encoding="utf-8"))
+    return {m["model_name"] for m in cfg["model_list"]}
+
+
+def test_gateway_off_by_default_leaves_onboarding_unchanged():
+    for p in discover_manifests(DIVISIONS_DIR):
+        assert load_manifest(p).llm_gateway is False, f"{p.name}: gateway must stay opt-in"
+    plan = onboard(DIVISIONS_DIR / "alpha.yml", dry_run=True)
+    assert plan["profiles"] == [] and plan["llm_gateway"] is None
+    body = Path(plan["stack_env"]).read_text(encoding="utf-8")
+    assert "LITELLM" not in body and "DIV_LLM_GATEWAY_PORT" not in body
+
+
+def test_gateway_dry_run_renders_profile_port_and_secrets(tmp_path):
+    import json
+    import shutil
+
+    from scripts.onboard_division import (
+        GATEWAY_PROFILE,
+        LOCAL_LLM_UNSET,
+        gateway_port,
+        generated_dir,
+    )
+    div = "gwunittest"
+    try:
+        plan = onboard(_gw_manifest(tmp_path, div), dry_run=True)
+        assert plan["profiles"] == [GATEWAY_PROFILE]
+        assert plan["llm_gateway"]["port"] == gateway_port(9600) == 9607
+        env = _env_dict(Path(plan["stack_env"]).read_text(encoding="utf-8"))
+        assert env["DIV_LLM_GATEWAY_PORT"] == "9607"
+        assert env["LITELLM_MASTER_KEY"].startswith("sk-") and len(env["LITELLM_DB_PASSWORD"]) == 32
+        assert env["LOCAL_LLM_BASE"] == LOCAL_LLM_UNSET          # never empty (fails closed)
+        sec = json.loads((generated_dir(div) / "secrets.json").read_text(encoding="utf-8"))
+        assert sec["litellm_master_key"] == env["LITELLM_MASTER_KEY"]
+        # Re-run is idempotent: the gateway secrets are reused, not rotated.
+        onboard(_gw_manifest(tmp_path, div), dry_run=True)
+        assert json.loads((generated_dir(div) / "secrets.json").read_text(encoding="utf-8")) == sec
+    finally:
+        shutil.rmtree(generated_dir(div), ignore_errors=True)
+
+
+def test_gateway_key_spec_by_residency(tmp_path):
+    from scripts.onboard_division import (
+        GATEWAY_EXTERNAL_CHAT,
+        GATEWAY_LOCAL_CHAT,
+        gateway_key_spec,
+    )
+    ext = gateway_key_spec(load_manifest(_gw_manifest(tmp_path, "gwext")))
+    assert GATEWAY_LOCAL_CHAT in ext["models"] and "aliases" not in ext
+    loc = gateway_key_spec(load_manifest(_gw_manifest(
+        tmp_path, "gwloc", "local", "llm_gateway_local_base: http://vllm.internal:8000/v1\n")))
+    # residency=local: ONLY the in-boundary model; every external chat model the app may
+    # send is aliased onto it by the key.
+    assert loc["models"] == [GATEWAY_LOCAL_CHAT]
+    assert loc["aliases"] == {m: GATEWAY_LOCAL_CHAT for m in GATEWAY_EXTERNAL_CHAT}
+    # An unknown residency value fails closed to the local-only key.
+    odd = gateway_key_spec(load_manifest(_gw_manifest(tmp_path, "gwodd", "eu-only")))
+    assert odd["models"] == [GATEWAY_LOCAL_CHAT]
+    # Every model a key names is a real model group in the shared gateway config.
+    names = _gateway_model_names()
+    assert set(ext["models"]) <= names and set(loc["aliases"]) <= names
+
+
+def test_gateway_config_never_falls_back_local_to_external():
+    import yaml
+    from scripts.onboard_division import GATEWAY_CONFIG
+    cfg = yaml.safe_load(GATEWAY_CONFIG.read_text(encoding="utf-8"))
+    for fb in cfg["router_settings"]["fallbacks"]:
+        for src, targets in fb.items():
+            if src.startswith("local/"):
+                assert all(t.startswith("local/") for t in targets), f"local->external fallback: {fb}"
+
+
+def test_deployment_llm_models_are_gateway_model_groups():
+    import yaml
+    from scripts.onboard_division import render_agent_env
+    names = _gateway_model_names()
+    cm = yaml.safe_load((ROOT / "k8s" / "base" / "configmap.yaml").read_text(encoding="utf-8"))
+    assert cm["data"]["LLM_MODEL"] in names and cm["data"]["EMBEDDING_MODEL"] in names
+    m = load_manifest(DIVISIONS_DIR / "alpha.yml")
+    env = _env_dict(render_agent_env(m, derive_ports(m.port_base), _FAKE_SECRETS, "s", "m", "nv"))
+    assert env["LLM_MODEL"] in names and env["EMBEDDING_MODEL"] in names
+
+
+def test_agent_env_points_at_gateway_only_when_keyed(tmp_path):
+    from scripts.onboard_division import render_agent_env
+    m = load_manifest(_gw_manifest(tmp_path, "gwenv"))
+    ports = derive_ports(m.port_base)
+    direct = _env_dict(render_agent_env(m, ports, _FAKE_SECRETS, "s", "m", "nv-key"))
+    assert direct["OPENAI_API_BASE"] == "https://integrate.api.nvidia.com/v1"
+    assert direct["OPENAI_API_KEY"] == "nv-key"
+    gw = _env_dict(render_agent_env(m, ports, _FAKE_SECRETS, "s", "m", "nv-key",
+                                    llm_gateway_key="sk-virtual"))
+    assert gw["OPENAI_API_BASE"] == "http://localhost:9607/v1"
+    assert gw["OPENAI_API_KEY"] == "sk-virtual"     # the provider key never reaches the agent
+
+
+def test_gateway_port_reserved_collision_rejected(tmp_path):
+    import pytest
+    from scripts.onboard_division import RESERVED_PORTS, assert_port_base_clean
+    # 8094's own ports are clean, but its gateway port (8094+7=8101) is a reserved port.
+    assert 8101 in RESERVED_PORTS
+    assert_port_base_clean(8094)
+    p = tmp_path / "bad.yml"
+    p.write_text("division_id: gwbad\nport_base: 8094\nllm_gateway: true\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_manifest(p)
+
+
+def test_compose_gateway_services_are_opt_in_and_pinned():
+    import yaml
+    from scripts.onboard_division import GATEWAY_PROFILE, TEMPLATE
+    svcs = yaml.safe_load(TEMPLATE.read_text(encoding="utf-8"))["services"]
+    gw, init = svcs["llm-gateway"], svcs["llm-gateway-db-init"]
+    assert gw["profiles"] == [GATEWAY_PROFILE] and init["profiles"] == [GATEWAY_PROFILE]
+    assert "@sha256:" in gw["image"]                                   # pinned by digest
+    assert "llm-gateway.internal" in gw["networks"]["default"]["aliases"]
+    # compose interpolates DISABLED profiles too: a `${VAR:?}` here would break every
+    # division that does not opt in.
+    for name in ("llm-gateway", "llm-gateway-db-init"):
+        assert ":?" not in yaml.safe_dump(svcs[name]), name
+    # The shared config + init script are mounted from their single source.
+    assert any("k8s/llm-gateway/litellm-config.yaml" in v for v in gw["volumes"])
+    assert any("k8s/llm-gateway/init-db.sh" in v for v in init["volumes"])
+
+
+def test_gateway_urls_are_inboundary_for_residency():
+    from scripts.bootstrap_k8s import gateway_url
+
+    from residency import is_inboundary_url
+    assert is_inboundary_url(gateway_url("gamma"))                     # k8s FQDN
+    assert is_inboundary_url("http://llm-gateway.internal:4000/v1")   # compose alias
+    assert is_inboundary_url("http://localhost:9607/v1")              # host-process agent
+    assert not is_inboundary_url("http://llm-gateway:4000/v1")        # bare name = external
+
+
+def test_k8s_gateway_kustomization_wraps_overlay_and_component():
+    import shutil
+    import subprocess
+
+    import yaml
+    from scripts.bootstrap_k8s import gateway_url, render_gateway_kustomization
+    k = yaml.safe_load(render_gateway_kustomization("gamma"))
+    assert k["namespace"] == "agt-div-gamma"
+    kdir = ROOT / "infra" / "generated" / "gamma" / "k8s"
+    for rel in (*k["resources"], *k["components"]):
+        assert (kdir / rel).resolve().is_dir(), rel
+    assert (kdir / k["components"][0]).resolve() == ROOT / "k8s" / "llm-gateway"
+    patch = yaml.safe_load(k["patches"][0]["patch"])
+    assert {op["path"]: op["value"] for op in patch} == {
+        "/data/OPENAI_API_BASE": gateway_url("gamma"),
+        "/data/EMBEDDING_API_BASE": gateway_url("gamma")}
+    comp = yaml.safe_load((ROOT / "k8s" / "llm-gateway" / "kustomization.yaml").read_text(encoding="utf-8"))
+    assert comp["kind"] == "Component"
+    if shutil.which("kustomize") is None:
+        return  # the full render is covered when a kustomize binary is on PATH
+    kdir.mkdir(parents=True, exist_ok=True)
+    (kdir / "kustomization.yaml").write_text(render_gateway_kustomization("gamma"), encoding="utf-8")
+    out = subprocess.run(["kustomize", "build", str(kdir)], capture_output=True, text=True, check=True)
+    objs = {(d["kind"], d["metadata"]["name"]): d for d in yaml.safe_load_all(out.stdout) if d}
+    assert objs[("ConfigMap", "agent-config")]["data"]["OPENAI_API_BASE"] == gateway_url("gamma")
+    assert objs[("Deployment", "llm-gateway")]["metadata"]["namespace"] == "agt-div-gamma"
+    assert objs[("NetworkPolicy", "allow-intra-namespace")]["spec"]["podSelector"] == {
+        "matchExpressions": [{"key": "app", "operator": "NotIn", "values": ["llm-gateway"]}]}

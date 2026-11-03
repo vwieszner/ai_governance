@@ -25,7 +25,7 @@ services:
     ports:
       - "127.0.0.1:4000:4000"   # loopback only; the agent reaches it in-boundary
     volumes:
-      - ./litellm-config.yaml:/app/config.yaml:ro
+      - ../../k8s/llm-gateway/litellm-config.yaml:/app/config.yaml:ro   # single source, shared with the division stack + k8s
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY}
       DATABASE_URL: postgresql://litellm:${GATEWAY_DB_PASSWORD}@gateway-db:5432/litellm

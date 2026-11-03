@@ -1,0 +1,60 @@
+# Per-division LLM gateway COMPONENT (LiteLLM Proxy) — OPT-IN. Proven prototype + rules:
+# examples/llm-gateway/README.md. Adds to a division's namespace:
+#   * deploy/llm-gateway + svc/llm-gateway:4000 — image pinned by DIGEST; its OWN `litellm`
+#     database + unprivileged role in the division's EXISTING Postgres (init container runs
+#     init-db.sh, shared with the Compose stack) — no second Postgres;
+#   * NetworkPolicy: ONLY the agent pod may open :4000 (the base allow-intra-namespace
+#     policy is narrowed to exclude the gateway pod, since policies are additive).
+#
+# Enable it — turnkey:  python scripts/bootstrap_k8s.py --divisions <id> --llm-gateway
+#   (wraps the overlay + this component + the agent URL patch in a generated kustomization
+#   under infra/generated/<id>/k8s/, creates the llm-gateway-secrets Secret, issues the
+#   agent's per-division virtual key — allowlist by residency_mode — and puts it in
+#   agent-secrets as OPENAI_API_KEY/EMBEDDING_API_KEY.)
+#
+# Or by hand, in k8s/overlays/<id>/kustomization.yaml:
+#   components:
+#     - ../../llm-gateway
+#   + a ConfigMap patch pointing the agent at the gateway by its in-boundary FQDN (a bare
+#     `llm-gateway` counts as EXTERNAL to residency=local):
+#       OPENAI_API_BASE / EMBEDDING_API_BASE = http://llm-gateway.agt-div-<id>.svc.cluster.local:4000/v1
+#   + the Secret (values from infra/generated/<id>/secrets.json; never committed):
+#       kubectl -n agt-div-<id> create secret generic llm-gateway-secrets \
+#         --from-literal=LITELLM_MASTER_KEY=sk-... --from-literal=LITELLM_DB_PASSWORD=... \
+#         --from-literal=NVIDIA_API_KEY=... --from-literal=LOCAL_LLM_KEY=none
+#   then mint the agent key with POST /key/generate (master key) and set it as the agent's
+#   OPENAI_API_KEY + EMBEDDING_API_KEY in agent-secrets.
+#
+# Upstreams live in the llm-gateway-env ConfigMap (gateway.yaml): CHAT_PRIMARY_BASE (NIM)
+# and LOCAL_LLM_BASE (your in-cluster vLLM/NIM; defaults to a never-resolving .invalid host
+# so the in-boundary model fails closed instead of LiteLLM's public-OpenAI default).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - gateway.yaml
+  - networkpolicy.yaml
+
+# The SAME LiteLLM config + DB init script the Compose division stack mounts.
+configMapGenerator:
+  - name: llm-gateway-config
+    files:
+      - config.yaml=litellm-config.yaml
+      - init-db.sh
+
+patches:
+  # Policies are additive, so "only the agent may reach the gateway" also requires taking
+  # the gateway pod OUT of the base allow-intra-namespace policy (which admits any pod in
+  # the namespace). NotIn also matches pods without an `app` label, so every other pod
+  # keeps exactly the access it had.
+  - target:
+      kind: NetworkPolicy
+      name: allow-intra-namespace
+    patch: |-
+      - op: replace
+        path: /spec/podSelector
+        value:
+          matchExpressions:
+            - key: app
+              operator: NotIn
+              values: ["llm-gateway"]
