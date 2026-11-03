@@ -17,7 +17,7 @@ What it proves:
   2. residency=local division: the app's unchanged default model name is aliased onto
      the in-boundary model by the KEY, so prompts never reach the external upstream
   3. NIM's asymmetric-embedding fields (input_type, truncate) reach the upstream intact
-  4. per-key rate limit (rpm) is enforced
+  4. per-key rate limit (rpm) and budget (max_budget) are enforced
   5. external outage -> answered by the in-boundary fallback
   6. in-boundary outage -> FAILS for the local division; never falls back to external
 """
@@ -171,6 +171,18 @@ def main() -> int:
                    {"model": EXT, "messages": [{"role": "user", "content": "hi"}]}, limited)[0]
              for _ in range(3)]
     check("per-key rate limit (rpm=2)", codes == [200, 200, 429], f"status codes {codes}")
+
+    # Budget: enforcement is checked by setting the key's recorded spend to its cap (the
+    # admin API), because spend only ACCRUES for models with a configured price — and these
+    # self-hosted/OpenAI-compatible models have none (cost 0.0). See README.
+    budgeted = new_key(models=[EXT], max_budget=1.0, metadata={"division": "budgeted"})
+    msg = {"model": EXT, "messages": [{"role": "user", "content": "hi"}]}
+    under = _http("POST", f"{GATEWAY}/v1/chat/completions", msg, budgeted)[0]
+    _http("POST", f"{GATEWAY}/key/update", {"key": budgeted, "spend": 1.0}, MASTER)
+    over, body = _http("POST", f"{GATEWAY}/v1/chat/completions", msg, budgeted)
+    check("per-key budget: refused once spend reaches max_budget",
+          under == 200 and over != 200 and "Budget has been exceeded" in json.dumps(body),
+          f"under budget -> {under}, at budget -> {over}")
 
     try:
         outage("stub-external", True)

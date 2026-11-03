@@ -32,7 +32,8 @@ It drives the agent's **real** client factories (`agent.nodes._get_llm`,
 through the gateway against two stub upstreams (`stub_upstream.py` standing in for NIM
 and a local vLLM). Result in the dev sandbox (2026-11-03): **10/10**, covering
 per-division keys, the residency alias, NIM `input_type`/`truncate` passthrough, an
-rpm limit (200, 200, 429), external-outage fallback, and no local→external fallback.
+rpm limit (200, 200, 429), budget cut-off, external-outage fallback, and no
+local→external fallback.
 
 For production, point `CHAT_PRIMARY_BASE` at `https://integrate.api.nvidia.com/v1` with
 the real `NVIDIA_API_KEY`, and `LOCAL_LLM_BASE` at your self-hosted vLLM/NIM.
@@ -72,10 +73,23 @@ curl -s localhost:4000/key/generate -H "Authorization: Bearer $LITELLM_MASTER_KE
 
 ## Not covered yet
 
-- AGT policy at the gateway: AGT's `AgentControlLiteLLMGuardrail` hook (in
-  `agent-control-specification[litellm-proxy]`) would need a derived image. It targets
-  the ACS policy model, so it belongs with the PolicyEvaluator → AgentControl migration.
-- Budgets (`max_budget`) are configured as above but not asserted by the proof (spend is
-  written asynchronously); rate limits are.
+- AGT policy at the gateway — **blocked upstream** (checked 2026-11-03). The hook
+  exists in the published `agent-control-specification` 0.3.1b1, but:
+  - it needs an ACS manifest + Rego bundle, and `agt migrate` (agt-policies 5.0.0) does
+    not convert this repo's rule YAMLs (it only flags the `PolicyEvaluator` imports);
+  - the v4→ACS bridge (`governance_to_acs_manifest`) needs AGT's stock Rego library,
+    which no published wheel ships;
+  - AGT `main` has moved to an ACS 0.4 manifest contract that rejects 0.3.x manifests.
+
+  It belongs with the PolicyEvaluator → AgentControl migration, once ACS 0.4 is on PyPI.
+  Never add it via `pip install agent-control-specification[litellm-proxy]`: that extra
+  pulls `litellm` from PyPI. Install `--no-deps` into the pinned image.
+- **Budgets need prices.** `max_budget` is enforced (a key at its cap gets
+  422 "Budget has been exceeded"), but spend only *accrues* for models with a price.
+  These self-hosted / OpenAI-compatible model groups have none, so measured spend
+  stays 0.0 and a budget never trips by itself. Set `input_cost_per_token` /
+  `output_cost_per_token` on each model in `litellm-config.yaml` to your NIM contract
+  or GPU cost; until then, rely on the rpm/tpm limits. The proof checks enforcement
+  by setting a key's recorded spend to its cap.
 - cosign signature verification of the image (the digest was checked against GHCR instead).
 - Real NIM traffic, and the division stack / Kubernetes wiring.
