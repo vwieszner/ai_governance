@@ -19,11 +19,11 @@ discovered peer not in our trust map — falls back to the configured
 discovery broker still federates exactly as before; discovery only *improves*
 target selection, it is never on the critical path for the demo's single peer.
 
-OWNERSHIP NOTE: ``mesh/peer_client.call_peer_agent`` (the transport) reads the
-configured peer from ``settings`` internally and its signature is owned by
-another agent — so this module does NOT change how the bytes are sent. It
-decides WHETHER and TO WHOM to delegate, surfaces the discovered peer for
-observability (FR-3.4), and leaves the signed transport untouched. The data
+ROUTING: this module decides WHETHER and TO WHOM to delegate and surfaces the
+discovered peer for observability (FR-3.4). The node then hands the selected
+DID to the signed transport (``mesh/peer_client.call_peer_agent(target_did=...)``),
+which routes the bytes to THAT peer — resolving its URL and verification key
+from the local ``peer_trust`` anchor, never from the broker entry. The data
 path independently re-verifies the peer DID + re-authorizes, so a rogue broker
 entry can never widen access (control-plane only).
 
@@ -117,12 +117,10 @@ class DelegationTarget:
     candidates: list[dict] = field(default_factory=list)   # control-plane peer views seen
 
     def is_configured_peer(self) -> bool:
-        """True when this target IS the configured peer (the transport's fixed target).
+        """True when this target resolves to the legacy configured peer (PEER_AGENT_URL).
 
-        ``call_peer_agent`` always sends to ``settings.peer_agent_url`` — so a discovered
-        target can be delegated through the existing transport only when it resolves to
-        the configured peer. In the single-peer demo that is always the case; this is the
-        honest gate that prevents pretending we can route to an unconfigured URL."""
+        Informational: the transport now routes to ANY trust-anchored discovered DID
+        (``call_peer_agent(target_did=...)``), so this no longer gates delegation."""
         configured = str(settings.peer_agent_url or "").rstrip("/")
         return bool(configured) and self.agent_url.rstrip("/") == configured
 
@@ -225,12 +223,18 @@ async def resolve_delegation_target(query: str, capability: str | None = None) -
         # peer_trust anchor keyed on the (now trust-verified) DID, NOT from the broker
         # entry. So a rogue can't steer the target's metadata: the broker only says WHICH
         # trusted DID claims the capability; the data-path anchor says WHERE it lives and
-        # WHAT division it is. (The transport already ignores agent_url, but this also
-        # stops the broker-supplied division from reaching the FR-3.4 marker.)
+        # WHAT division it is. (The transport independently re-resolves the URL from the
+        # anchor, but this also stops the broker-supplied division reaching the FR-3.4 marker.)
         did = str(peer.get("agent_did") or "")
         anchor = settings.peer_trust.get(did) or {}
+        anchor_url = str(anchor.get("agent_url") or "").rstrip("/")
+        if not anchor_url:
+            # Trusted DID but no data-path URL in OUR anchor → unroutable; never fall back
+            # to the broker's advertised URL. Try the next candidate / configured peer.
+            log.info("discovery_skip_peer_without_anchor_url", peer_did=did)
+            continue
         target = DelegationTarget(
-            agent_url=str(anchor.get("agent_url") or "").rstrip("/"),
+            agent_url=anchor_url,
             agent_did=did,
             division_id=str(anchor.get("division_id") or ""),
             capability=cap,

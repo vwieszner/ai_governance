@@ -134,9 +134,12 @@ engine, trust gate, and DLP genuinely fail closed.
 3. ✅ **Dynamic discovery + negotiated delegation (FR-3.1/3.2) — DONE (2026-06-17).** The agent now
    discovers a capable peer via the broker, negotiates, and delegates (graceful fallback to the
    configured peer); `registry.find()` is bounded (capability index — closes the NFR-6 skip);
-   MonitorPanel renders discover→delegate events (FR-3.4). **Residual:** the signed transport still
-   routes bytes to the *configured* peer — true multi-peer byte-routing needs the transport to accept
-   a discovered target (single-peer demo confirms+observes but doesn't reroute).
+   MonitorPanel renders discover→delegate events (FR-3.4). ✅ **Multi-peer routing — DONE
+   (2026-11-03):** the signed transport now routes to the *discovered* peer (`call_peer_agent(target_did=)`;
+   `/a2a/tool` likewise) with URL + verification key taken from the local `peer_trust` anchor, never the
+   broker; untrusted DID refused → configured fallback; `aud` = actual target; per-peer breaker
+   (`tests/test_multipeer_routing.py`, 9 tests; live 4-process localhost demo: broker + beta + gamma +
+   rogue — kubernetes→gamma, hr→beta, rogue URL never dialled).
 4. 🟡 **3-division end-to-end test — AUTHORED (2026-06-17), not yet run.**
    `e2e/test_full_federation.py` maps SC-1…SC-12 (14 tests) + skips cleanly; the real assertions
    execute only against ≥3 live stacks (`RUN_E2E=1` + reachability probe).
@@ -144,8 +147,7 @@ engine, trust gate, and DLP genuinely fail closed.
 Smaller gaps — **now closed:** grant expiry ✅, `GET /audit` ✅, runtime kill-switch ✅,
 division-native UI ✅ (FR-2.4), bounded discovery lookups ✅ (NFR-6), CRL revocation ✅ (NFR-3),
 proving-test debt largely ✅. **Remaining residuals:** OCSP (needs a responder — infra), the
-3-division e2e run (needs live stacks), and true multi-peer transport reroute (discovery
-confirms+observes today). Plus pre-existing items: admin user-lifecycle API (FR-2.2), HA stores,
+3-division e2e run (needs live stacks). (Multi-peer transport reroute ✅ closed 2026-11-03.) Plus pre-existing items: admin user-lifecycle API (FR-2.2), HA stores,
 **independent external pen-test** (the red-team below was an internal adversarial pass, not a
 third-party engagement) — see the Security review section.
 
@@ -192,7 +194,7 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
 | **M0** Tenancy + onboarding | FR-1, NFR-2, NFR-8 | ✅ DONE | Physical per-division stacks + manifest-driven onboarding (`--dry-run/--force/--teardown`); `division_id` threaded + signed. Kill-B/cross-store proof exists but skips without live stacks. |
 | **M1** Per-division identity | FR-2 | ✅ DONE | Backend rejects foreign-division tokens (issuer+audience+key, tested); **UI now division-native** — N-division model via `VITE_DIVISIONS`, FR-2.4. Residual: admin user lifecycle is script-driven, no self-service API (FR-2.2). |
 | **M2** Verifiable X-division identity | FR-3.6, FR-3.7 | ✅ DONE | FR-3.7 (authorized→immediate vs needs-approval) works; **FR-3.6 now hardened** — recipient-bound (`aud`=target DID), 300s-expiry, `jti` signed assertion validated far-side (recipient+expiry+signer) then re-authorized (`test_assertion.py`). |
-| **M3** Discovery + negotiation | FR-3.1–3.5 | ✅ DONE | FR-3.3 signed/replay-protected agent identity ✅; **discovery now wired** — discover→negotiate→delegate with graceful fallback, bounded `registry.find()`, observable FR-3.4 markers in MonitorPanel. Residual: signed transport still routes to the configured peer (true multi-peer reroute is a transport follow-up). |
+| **M3** Discovery + negotiation | FR-3.1–3.5 | ✅ DONE | FR-3.3 signed/replay-protected agent identity ✅; **discovery now wired** — discover→negotiate→delegate with graceful fallback, bounded `registry.find()`, observable FR-3.4 markers in MonitorPanel. **Multi-peer routing ✅** — signed transport routes to the discovered peer (trust-anchor URL/key, fail-closed on untrusted DID, `aud`=target, per-peer breaker; `tests/test_multipeer_routing.py`). |
 | **M4** Offline delivery | FR-5, FR-6 | ✅ DONE | FR-5 durable approval + authenticated owner inbox; **FR-6 now done** — durable per-user inbox seeded at park, `GET /inbox` regenerate-at-delivery, cross-division callback delivery, in-app badge (`outcome_store.py`, `test_offline.py`). |
 | **M5** Access lifecycle | FR-7 | ✅ DONE | Revoke (FR-7.2) owner-gated; **expiry (FR-7.1) now wired** — approvals honor `approval_grant_ttl_seconds` via `grant_viewer_until`; re-ask re-enters approval on both revoke and expiry (`test_lifecycle.py`). |
 | **M6** Data residency | NFR-1 | ✅ DONE | Egress guard wired into **both** the answer LLM and the intent LLM; fail-closed. Self-hosted backend is operator-supplied (config-driven), not bundled — acceptable per plan. |
@@ -223,8 +225,13 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
 - ✅ **FR-3.1 / FR-3.2 — Discovery + negotiation — DONE (2026-06-17).** `mesh/discovery.py`
   (discover→negotiate→delegate, lazy self-register, trust gated by `peer_trust` not broker membership)
   wired into `agent/nodes.py` delegation with graceful fallback to the configured peer.
-  **Residual:** the signed transport still routes bytes to the configured peer (true multi-peer
-  reroute is a transport follow-up); discovery confirms+observes the peer today.
+  ✅ **Multi-peer routing (2026-11-03):** the signed transport now sends to the DISCOVERED peer —
+  `call_peer_agent(target_did=)` / `call_peer_tool` resolve the destination URL from the local
+  `peer_trust` anchor (broker-advertised URL ignored; tool URL ≠ anchor → refused), refuse an
+  untrusted DID (fail closed → configured fallback), bind `aud` to the actual target, verify the
+  response against THAT peer's key, and use a per-peer circuit breaker. Legacy PEER_AGENT_* path
+  unchanged. `tests/test_multipeer_routing.py` (9, real Ed25519 + real httpx client over a
+  per-peer MockTransport) + a live localhost run (real discovery broker + 2 peer processes).
 
 - 🟡 **e2e — `e2e/test_full_federation.py` — AUTHORED (2026-06-17), runs only with live stacks.**
   Maps SC-1…SC-12 (14 tests) incl. browser-closed offline delivery + kill-B isolation; collects

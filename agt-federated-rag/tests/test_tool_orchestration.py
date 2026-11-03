@@ -29,6 +29,12 @@ from mesh import peer_client as pc
 _USER = "alice@example.com|deadbeefdeadbeef"
 _PEER_DID = "did:mesh:peer-b"
 _PEER_URL = "http://peer-b"
+# call_peer_tool pins its destination to the local trust anchor for the DID (multi-peer
+# routing invariant), so the send-path tests declare the peer as a trusted anchor.
+_TRUST_MAP = (
+    '{"' + _PEER_DID + '": {"issuer": "http://iss-b", "public_jwk": "{}", '
+    '"agent_url": "' + _PEER_URL + '", "division_id": "division-b"}}'
+)
 
 # A raw-token-free, recipient-bound assertion builder (what solve_with_tools is handed).
 def _build_assertion(audience_did):
@@ -355,7 +361,7 @@ def test_call_peer_tool_payload_has_assertion_no_token(monkeypatch):
                  openfga_model_id="t", neo4j_password="t", agent_client_id="t",
                  agent_client_secret="t", agent_sponsor_email="s@e.com",
                  approval_hmac_secret="0" * 64, cluster_id="cluster-a",
-                 division_id="division-a")
+                 division_id="division-a", peer_trust_map=_TRUST_MAP)
     monkeypatch.setattr(pc, "settings", s)
 
     captured: dict = {}
@@ -431,7 +437,8 @@ def test_call_peer_tool_fails_closed_on_bad_response_signature(monkeypatch):
     s = Settings(_env_file=None, openai_api_key="t", openfga_store_id="t",
                  openfga_model_id="t", neo4j_password="t", agent_client_id="t",
                  agent_client_secret="t", agent_sponsor_email="s@e.com",
-                 approval_hmac_secret="0" * 64, division_id="division-a")
+                 approval_hmac_secret="0" * 64, division_id="division-a",
+                 peer_trust_map=_TRUST_MAP)
     monkeypatch.setattr(pc, "settings", s)
 
     async def _verify_peer(_did): return True, 1.0
