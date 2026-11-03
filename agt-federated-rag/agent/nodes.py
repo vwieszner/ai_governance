@@ -637,6 +637,21 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         )
     pruned_chunks = reconciled
 
+    # Mosaic-effect guard: per-chunk authz is done; now gate the COMBINATION of the
+    # authorized, trusted context before it can reach llm.generate. Only LOCAL_ALLOWED
+    # routes to generation (a pending chunk already routes to approval).
+    if flow == FlowDecision.LOCAL_ALLOWED:
+        guard = await _guard_context_combination(state, auth, allowed, pruned_chunks)
+        if guard is not None:
+            flow = guard["flow"]
+            pending = pending + guard.get("add_pending", [])
+            if flow == FlowDecision.LOCAL_DENIED:
+                # Withhold: nothing reaches the LLM, and the text leaves state (Finding #6).
+                denied = denied + allowed
+                allowed = []
+                pruned_chunks = []
+                status_message = guard["status_message"]
+
     result: dict[str, Any] = {
         "flow": flow,
         "fused_chunks": pruned_chunks,
@@ -649,6 +664,67 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     if status_message is not None:
         result["status_message"] = status_message
     return result
+
+
+# ── Mosaic-effect guard (context accumulation) ────────────────────────────────
+
+_MOSAIC_DENIED_MESSAGE = (
+    "This answer would combine information from sources that policy does not allow to be "
+    "released together, so it was withheld. Ask about one subject at a time, or contact "
+    "the data owners."
+)
+
+
+async def _guard_context_combination(
+    state: AgentState, auth: OpenFGAAuth, allowed: list[str], served: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Evaluate the COMBINATION of authorized served chunks (agent/context_guard.py).
+
+    Returns None to proceed unchanged, or a dict with the new ``flow`` (+ ``add_pending``
+    clearance ids for an escalation, or ``status_message`` for a deny). ESCALATE reuses the
+    existing approval path: the uncleared ``mosaic-<rule>`` clearance objects become
+    pending ids, so start_approval writes the OpenFGA pending tuples and starts the
+    Temporal workflow; once approved (viewer on the clearance) the same combination passes.
+    """
+    from agent import context_guard as cg
+
+    allowed_set = set(allowed)
+    context_chunks = [c for c in served if c.get("chunk_id") in allowed_set]
+    if not context_chunks:
+        return None
+    decision = cg.evaluate(context_chunks, settings.context_aggregation_policy,
+                           workflow_id=str(state.get("task_id") or ""))
+    audit = dict(
+        user_id=state["user_id"],
+        action="context.aggregate",
+        reason=decision.reason,
+        labels=sorted(decision.labels),
+        sensitivity=decision.sensitivity.name.lower(),
+        rules=list(decision.rules_applied),
+        count=len(context_chunks),
+        agt_audit=True,
+    )
+
+    if decision.outcome == cg.Outcome.ALLOW:
+        log.info("context_aggregation_decision", decision="allow", **audit)
+        return None
+
+    if decision.outcome == cg.Outcome.DENY:
+        log.warning("context_aggregation_decision", decision="deny", **audit)
+        return {"flow": FlowDecision.LOCAL_DENIED, "status_message": _MOSAIC_DENIED_MESSAGE}
+
+    # ESCALATE: has this user already been cleared for this combination (approved before,
+    # or an admin group grant)? Clearance is an ordinary OpenFGA viewer check.
+    clearance = await auth.batch_decide(
+        state["user_id"], list(decision.clearance_ids), groups=state.get("user_groups") or [])
+    uncleared = [cid for cid in decision.clearance_ids
+                 if clearance.get(cid) != AuthzDecision.ALLOWED]
+    if not uncleared:
+        log.info("context_aggregation_decision", decision="cleared", **audit)
+        return None
+    log.warning("context_aggregation_decision", decision="escalate",
+                pending=len(uncleared), **audit)
+    return {"flow": FlowDecision.LOCAL_NEEDS_APPROVAL, "add_pending": uncleared}
 
 
 # ── Citation / grounding gate (deterministic, auditable) ──────────────────────

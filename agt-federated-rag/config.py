@@ -323,6 +323,14 @@ class Settings(BaseSettings):
     policy_dir: str = str(Path(__file__).resolve().parent / "agent" / "policies")
     # Whether to run in audit-only mode (log violations but don't block).
     policy_audit_only: bool = False
+    # Mosaic-effect guard (agent/context_guard.py): YAML rules over the COMBINATION of
+    # authorized chunks, evaluated after check_auth's per-chunk authz and before
+    # llm.generate. Default anchored like policy_dir; a relative override resolves to the
+    # package root. Missing/invalid file → fail-closed (answer withheld). Empty string
+    # disables the guard explicitly.
+    context_aggregation_policy: str = str(
+        Path(__file__).resolve().parent / "agent" / "policies" / "aggregation"
+        / "context-aggregation.yaml")
 
     # ── Graph-level kill-switch (AgentMesh govern_action gate) ───────────────
     # Operator emergency off-switch. When true, the graph-level govern_action
