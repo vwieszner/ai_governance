@@ -58,7 +58,7 @@ Qdrant, and Keycloak.
 
 ```
 ui/  (React + Vite, :5173)   split-screen: alice @ Division Alpha · bob @ Division Beta
-        |  Vite proxy: /api/agt-a -> :9000   /api/agt-b -> :9100   /auth/* -> Keycloak
+        |  Vite proxy: /api/agt-alpha -> :9000   /api/agt-beta -> :9100   /auth/<id> -> Keycloak
         v
 Per division (e.g. alpha @ port_base 9000), each a SEPARATE Docker stack:
   agent (:9000)   FastAPI /query (SSE), /a2a/query (DID), /approvals, /tasks/*/result, /metrics
@@ -77,7 +77,7 @@ Divisions: **alpha 9000 · beta 9100 · gamma 9200** (ports derive from `port_ba
 - **Governance:** Microsoft Agent Governance Toolkit — Agent OS (policy engine, MCP gateway,
   circuit breaker) + AgentMesh (DID identity, signing, trust scoring). On public PyPI.
 - **Agent:** LangGraph + LangChain; OpenAI-compatible LLM (NVIDIA NIM default, any endpoint).
-- **Authorization:** OpenFGA (ReBAC). **Identity:** Keycloak / any OIDC IdP; python-jose.
+- **Authorization:** OpenFGA (ReBAC). **Identity:** Keycloak / any OIDC IdP; PyJWT.
 - **Retrieval:** Qdrant (hybrid) + FastEmbed; Neo4j/GraphRAG is a documented inert seam.
 - **Workflow:** Temporal (durable approvals + rotation cron).
 - **Edge/transport:** nginx (route-based mTLS), `cryptography` (CA/cert/CRL).

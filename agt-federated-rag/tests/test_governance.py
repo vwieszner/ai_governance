@@ -70,10 +70,15 @@ def test_output_dlp_allows_clean_answer_and_does_not_overblock():
 _TRUSTED_PEER = {"peer_did_verified": True, "transport_encrypted": True,
                  "peer_trust_score": 0.9, "peer_execution_ring": "TRUSTED",
                  "peer_circuit_state": "CLOSED"}
+# Contexts exactly as the call sites build them for a LOCAL user (agent/nodes.retrieve_local
+# with the default qdrant(10)+neo4j(5) fan-out; tools/mcp.call_mcp_tool for a local tool).
+_LOCAL_RETRIEVE = {"query_length": 20, "qdrant_collection": "knowledge_base",
+                   "requested_chunk_count": 15, "agent_trust_score": 1.0, "user_id": "alice"}
+_LOCAL_MCP = {"server": "pii-scan", "tool": "scan", "tool_category": "compute",
+              "agent_trust_score": 1.0}
 _DECISIONS = [
     # base-policy: allow-listed actions (contexts as sent by the call sites)
-    ("retrieve", "rag.retrieve",
-     {"query_length": 20, "qdrant_collection": "knowledge_base"}, True, "allow-rag-retrieve"),
+    ("retrieve", "rag.retrieve", _LOCAL_RETRIEVE, True, "allow-rag-retrieve"),
     ("authz", "auth.check_permission", {"chunk_count": 5}, True, "allow-auth-check"),
     ("generate", "llm.generate", {"context_char_count": 1000}, True, "allow-llm-generate"),
     ("approval", "approval.start_workflow", {"pending_chunk_count": 2}, True,
@@ -81,7 +86,7 @@ _DECISIONS = [
     ("peer-send", "peer.send_message", _TRUSTED_PEER, True, "allow-peer-send"),
     ("peer-callback", "peer.receive_callback", _TRUSTED_PEER, True,
      "allow-peer-receive-callback"),
-    ("mcp", "mcp.call", {"server": "s", "tool": "t"}, True, "allow-mcp-call"),
+    ("mcp", "mcp.call", _LOCAL_MCP, True, "allow-mcp-call"),
     ("format", "agent.format_response", {}, True, "allow-format-response"),
     # base-policy: deny rules (priority beats the action allow-rule)
     ("trust-0.6-ok", "rag.retrieve", {"agent_trust_score": 0.6}, True, "allow-rag-retrieve"),
@@ -112,6 +117,31 @@ _DECISIONS = [
      False, "block-low-trust-peer"),
     ("peer-untrusted-ring", "peer.send_message",
      {**_TRUSTED_PEER, "peer_execution_ring": "SANDBOX"}, False, "require-trusted-ring"),
+    # Formerly inert rules, with the FULL contexts the call sites now send (local user =
+    # LOCAL_AGENT_TRUST_SCORE 1.0; delegated = the signing peer's registry trust).
+    ("retrieve-delegated-0.6", "rag.retrieve", {**_LOCAL_RETRIEVE, "agent_trust_score": 0.6},
+     True, "allow-rag-retrieve"),
+    ("retrieve-delegated-0.59", "rag.retrieve", {**_LOCAL_RETRIEVE, "agent_trust_score": 0.59},
+     False, "block-low-trust-agents"),
+    ("retrieve-chunks-15", "rag.retrieve", {**_LOCAL_RETRIEVE, "requested_chunk_count": 15},
+     True, "allow-rag-retrieve"),
+    ("retrieve-chunks-51", "rag.retrieve", {**_LOCAL_RETRIEVE, "requested_chunk_count": 51},
+     False, "cap-chunk-retrieval"),
+    ("mcp-read", "mcp.call", {**_LOCAL_MCP, "tool_category": "read"}, True, "allow-mcp-call"),
+    ("mcp-delegated-0.59", "mcp.call", {**_LOCAL_MCP, "agent_trust_score": 0.59}, False,
+     "block-low-trust-agents"),
+    ("mcp-os-command", "mcp.call", {**_LOCAL_MCP, "tool_category": "os_command"}, False,
+     "block-code-execution"),
+    ("mcp-code-eval", "mcp.call", {**_LOCAL_MCP, "tool_category": "code_eval"}, False,
+     "block-code-execution"),
+    ("mcp-file-delete", "mcp.call", {**_LOCAL_MCP, "tool_category": "file_delete"}, False,
+     "block-filesystem-writes"),
+    ("mcp-file-move", "mcp.call", {**_LOCAL_MCP, "tool_category": "file_move"}, False,
+     "block-filesystem-writes"),
+    ("mcp-unclassified", "mcp.call", {**_LOCAL_MCP, "tool_category": "unclassified"}, False,
+     "require-classified-tool"),
+    ("mcp-unknown-category", "mcp.call", {**_LOCAL_MCP, "tool_category": "network_post"},
+     False, "require-classified-tool"),
 ]
 
 
@@ -141,7 +171,8 @@ def test_absent_field_semantics_are_pinned():
 # ── Required governance context (closes the absent-field gap at the app layer) ──
 
 _FULL_CONTEXT = {
-    "rag.retrieve": {"query_length": 20, "qdrant_collection": "knowledge_base"},
+    "rag.retrieve": dict(_LOCAL_RETRIEVE),
+    "mcp.call": dict(_LOCAL_MCP),
     "llm.generate": {"context_char_count": 1000},
     "agent.output_check": {"llm_output": "Our retention policy is 7 years."},
     "peer.send_message": dict(_TRUSTED_PEER),
@@ -200,3 +231,43 @@ def test_required_context_matches_every_call_site():
                 problems.append(f"{rel}:{n.lineno} {action}: missing {sorted(lacking)}")
     assert not problems, problems
     assert set(seen) == set(REQUIRED_CONTEXT), f"no call site found for {set(REQUIRED_CONTEXT) - set(seen)}"
+
+
+# ── Formerly inert deny rules: they now fire through the REAL _enforce ────────────
+# Each row is the context a real call site builds (see the wiring tests in
+# test_inert_rules_wired.py for the call sites themselves). Run through agent.nodes._enforce
+# — REQUIRED_CONTEXT check + the real policy files — not just the bare evaluator.
+_ENFORCE_ROWS = [
+    ("rag.retrieve", _LOCAL_RETRIEVE, None),
+    ("rag.retrieve", {**_LOCAL_RETRIEVE, "agent_trust_score": 0.59},
+     "Agent trust score below minimum threshold"),
+    ("rag.retrieve", {**_LOCAL_RETRIEVE, "requested_chunk_count": 51},
+     "Chunk retrieval cap exceeded"),
+    ("rag.retrieve", {**_LOCAL_RETRIEVE, "requested_chunk_count": 50}, None),
+    ("mcp.call", _LOCAL_MCP, None),
+    ("mcp.call", {**_LOCAL_MCP, "agent_trust_score": 0.59},
+     "Agent trust score below minimum threshold"),
+    ("mcp.call", {**_LOCAL_MCP, "tool_category": "shell_exec"},
+     "Unrestricted code execution not permitted"),
+    ("mcp.call", {**_LOCAL_MCP, "tool_category": "subprocess"},
+     "Unrestricted code execution not permitted"),
+    ("mcp.call", {**_LOCAL_MCP, "tool_category": "file_write"},
+     "Filesystem writes not permitted"),
+    ("mcp.call", {**_LOCAL_MCP, "tool_category": "unclassified"},
+     "not classified as read or compute"),
+]
+
+
+def test_formerly_inert_rules_fire_through_real_enforce():
+    import asyncio
+
+    import pytest
+
+    from agent import nodes
+
+    for action, ctx, denial in _ENFORCE_ROWS:
+        if denial is None:
+            asyncio.run(nodes._enforce(action, dict(ctx)))
+        else:
+            with pytest.raises(PermissionError, match=denial):
+                asyncio.run(nodes._enforce(action, dict(ctx)))

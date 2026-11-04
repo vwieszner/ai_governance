@@ -112,6 +112,11 @@ class AgentState(TypedDict):
     # each tick. Default False — the first /query is unaffected.
     check_only: bool
 
+    # Governance (rag.retrieve → block-low-trust-agents): trust of the agent on whose behalf
+    # this run acts — the signing peer's registry score for /a2a/query, else
+    # agent.nodes.LOCAL_AGENT_TRUST_SCORE. Absent/None → missing governance context → deny.
+    agent_trust_score: float | None
+
     # M4 (FR-6): originating division's callback agent_url + task_id (SSRF-validated) so a
     # cross-division approval can notify the caller; None for local requests.
     originating_agent_url: str | None

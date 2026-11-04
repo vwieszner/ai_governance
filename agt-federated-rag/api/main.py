@@ -44,15 +44,16 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from jose import JWTError
 from sse_starlette.sse import EventSourceResponse
 from temporalio.client import Client as TemporalClient
 
 import agent.graph as agent_graph
 import agent.nodes as agent_nodes
 import mesh.agent_identity as agent_identity
+import tools.mcp as mcp_tools
 from auth.token_validator import (
     AuthServiceUnavailable,
+    JWTError,
     extract_groups,
     issuer_namespace,
     minimal_assertion_claims,
@@ -982,6 +983,7 @@ async def query(
                 task_id=task_id,
                 context_id=context_id,
                 user_groups=user_groups,
+                agent_trust_score=agent_nodes.LOCAL_AGENT_TRUST_SCORE,  # local user, no peer
             )
         )
 
@@ -1251,6 +1253,7 @@ async def task_result(
             context_id="",
             check_only=True,
             user_groups=extract_groups(claims),
+            agent_trust_score=agent_nodes.LOCAL_AGENT_TRUST_SCORE,  # local user, no peer
         )
     except PermissionError as exc:
         log.warning("task_result_governance_denied", task_id=task_id, error=str(exc))
@@ -1308,6 +1311,7 @@ async def _regenerate_outcome(
             context_id="",
             check_only=True,
             user_groups=extract_groups(claims),
+            agent_trust_score=agent_nodes.LOCAL_AGENT_TRUST_SCORE,  # local user, no peer
         )
     except PermissionError:
         return {"status": "denied", "message": "Request denied by governance policy"}
@@ -1589,6 +1593,9 @@ async def a2a_query(request: Request) -> JSONResponse:
             originating_agent_url=orig_agent_url,   # M4: SSRF-validated callback target
             originating_task_id=orig_task_id,
             check_only=check_only,  # approval-poll: re-check without restarting our workflow
+            # Delegated: the retrieval runs on behalf of the SIGNING peer agent, so the
+            # rag.retrieve policy sees ITS registry trust (block-low-trust-agents, < 0.6).
+            agent_trust_score=trust_score,
         )
     except PermissionError as exc:
         log.warning("a2a_query_governance_denied", task_id=task_id, error=str(exc))
@@ -1821,13 +1828,16 @@ async def a2a_tool(request: Request) -> JSONResponse:
     # ── Step 8: GOVERNED EXECUTION — authorize the DELEGATED user, THEN run our tool ──
     # Default-deny policy gate (the SAME engine call_mcp_tool uses), extended with the
     # delegated user_id + source_division so the decision is policy-decidable + audited —
-    # the peer cannot bypass OUR authorization by reaching in over /a2a/tool.
+    # the peer cannot bypass OUR authorization by reaching in over /a2a/tool. The call runs
+    # on behalf of the SIGNING peer agent, so agent_trust_score is ITS registry trust.
     try:
         await agent_nodes._enforce(
             "mcp.call",
             {
                 "server": server,
                 "tool": tool,
+                "tool_category": mcp_tools.tool_category(server, tool),
+                "agent_trust_score": trust_score,
                 "user_id": user_id,
                 "source_division": source_division,
                 "capability": capability,
@@ -1845,7 +1855,7 @@ async def a2a_tool(request: Request) -> JSONResponse:
     # Run OUR governed local tool (which itself re-runs the executor's three gates).
     from tools.local_tools import run_local_tool
     try:
-        result = await run_local_tool(server, tool, arguments)
+        result = await run_local_tool(server, tool, arguments, agent_trust_score=trust_score)
     except Exception as exc:  # noqa: BLE001 — a tool error must NOT leak as a 500
         log.warning("a2a_tool_execution_failed", signer_did=signer_did, user_id=user_id,
                     capability=capability, server=server, tool=tool,

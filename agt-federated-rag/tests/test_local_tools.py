@@ -396,25 +396,25 @@ def test_run_local_tool_executes_through_gates(monkeypatch):
     mcp_tools.reset_cache()
 
     out = asyncio.run(local_tools.run_local_tool(
-        "pii-scan", "scan", {"text": "ping alice@example.com"}))
+        "pii-scan", "scan", {"text": "ping alice@example.com"}, agent_trust_score=1.0))
     assert out["has_pii"] is True
     assert any(f["type"] == "EMAIL" for f in out["findings"])
 
     out = asyncio.run(local_tools.run_local_tool(
-        "compliance-lookup", "lookup", {"topic": "transparency"}))
+        "compliance-lookup", "lookup", {"topic": "transparency"}, agent_trust_score=1.0))
     assert out["matches"]
 
     out = asyncio.run(local_tools.run_local_tool(
-        "risk-score", "assess", {"description": "credit scoring for loan approval"}))
+        "risk-score", "assess", {"description": "credit scoring for loan approval"}, agent_trust_score=1.0))
     assert out["tier"] == "high"
 
     out = asyncio.run(local_tools.run_local_tool(
-        "data-classify", "classify", {"text": "Card 4242424242424242 on file"}))
+        "data-classify", "classify", {"text": "Card 4242424242424242 on file"}, agent_trust_score=1.0))
     assert out["label"] == "Restricted"
 
     out = asyncio.run(local_tools.run_local_tool(
         "fin-check", "screen",
-        {"amount": 50000, "currency": "USD", "counterparty": "Volkov Holdings"}))
+        {"amount": 50000, "currency": "USD", "counterparty": "Volkov Holdings"}, agent_trust_score=1.0))
     assert out["flagged"] is True
     assert out["disclosure_required"] is True
 
@@ -456,7 +456,7 @@ def test_filtered_division_only_registers_its_tool(monkeypatch):
     # And calling the compliance tool it does NOT serve fails closed at the gateway.
     with pytest.raises(mcp_tools.McpToolError):
         asyncio.run(local_tools.run_local_tool(
-            "compliance-lookup", "lookup", {"topic": "transparency"}))
+            "compliance-lookup", "lookup", {"topic": "transparency"}, agent_trust_score=1.0))
 
 
 def test_stale_gateway_is_reset_so_local_tool_does_not_spuriously_fail(monkeypatch):
@@ -484,7 +484,7 @@ def test_stale_gateway_is_reset_so_local_tool_does_not_spuriously_fail(monkeypat
     # 3. run_local_tool calls ensure_local_servers_registered, which must spot the stale
     #    gateway and reset it so the call succeeds rather than raising "not configured".
     out = asyncio.run(local_tools.run_local_tool(
-        "pii-scan", "scan", {"text": "ping alice@example.com"}))
+        "pii-scan", "scan", {"text": "ping alice@example.com"}, agent_trust_score=1.0))
     assert out["has_pii"] is True
     # The gateway was rebuilt and now includes the local servers (jira preserved too).
     assert {"jira", "pii-scan", "compliance-lookup"}.issubset(set(mcp_tools._server_cfg or {}))
@@ -498,7 +498,7 @@ def test_unconfigured_server_fails_closed_via_local_caller(monkeypatch):
     mcp_tools.reset_cache()
     with pytest.raises(mcp_tools.McpToolError):
         asyncio.run(mcp_tools.call_mcp_tool("pii-scan", "scan", {"text": "x"},
-                                            caller=local_tools.local_caller))
+                                            caller=local_tools.local_caller, agent_trust_score=1.0))
 
 
 def test_policy_denial_blocks_local_tool(monkeypatch):
@@ -511,7 +511,7 @@ def test_policy_denial_blocks_local_tool(monkeypatch):
     monkeypatch.setattr(mcp_tools.settings, "mcp_servers", "")
     mcp_tools.reset_cache()
     with pytest.raises(PermissionError):
-        asyncio.run(local_tools.run_local_tool("pii-scan", "scan", {"text": "x"}))
+        asyncio.run(local_tools.run_local_tool("pii-scan", "scan", {"text": "x"}, agent_trust_score=1.0))
 
 
 def test_credential_in_arguments_fails_closed_via_run_local_tool(monkeypatch):
@@ -523,7 +523,7 @@ def test_credential_in_arguments_fails_closed_via_run_local_tool(monkeypatch):
     mcp_tools.reset_cache()
     with pytest.raises(mcp_tools.McpToolError):
         asyncio.run(local_tools.run_local_tool(
-            "pii-scan", "scan", {"text": "x", "token": "SECRET"}))
+            "pii-scan", "scan", {"text": "x", "token": "SECRET"}, agent_trust_score=1.0))
 
 
 def test_unknown_tool_on_local_server_fails_closed(monkeypatch):
@@ -533,7 +533,7 @@ def test_unknown_tool_on_local_server_fails_closed(monkeypatch):
     monkeypatch.setattr(mcp_tools.settings, "mcp_servers", "")
     mcp_tools.reset_cache()
     with pytest.raises(mcp_tools.McpToolError):
-        asyncio.run(local_tools.run_local_tool("pii-scan", "nonexistent", {"text": "x"}))
+        asyncio.run(local_tools.run_local_tool("pii-scan", "nonexistent", {"text": "x"}, agent_trust_score=1.0))
 
 
 def test_tool_value_error_wraps_to_mcptoolerror(monkeypatch):
@@ -544,4 +544,4 @@ def test_tool_value_error_wraps_to_mcptoolerror(monkeypatch):
     monkeypatch.setattr(mcp_tools.settings, "mcp_servers", "")
     mcp_tools.reset_cache()
     with pytest.raises(mcp_tools.McpToolError):
-        asyncio.run(local_tools.run_local_tool("pii-scan", "scan", {"text": "a" * 20_001}))
+        asyncio.run(local_tools.run_local_tool("pii-scan", "scan", {"text": "a" * 20_001}, agent_trust_score=1.0))

@@ -48,10 +48,43 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
     is unreachable; outage clearances are always time-bound.
   - **CI:** UI job on Node 22 (Node 18 broke `npm test` on main since June); supply-chain
     `trivy-action` pinned by SHA to v0.36.0 (0.28.0 vanished in the March 2026 Trivy compromise).
-- **Inert deny rules (found by the call-site inventory; need the value wired, not a flag):**
-  `block-code-execution` + `block-filesystem-writes` (`tool_category`, never sent on
-  `mcp.call`), `block-low-trust-agents` (`agent_trust_score`), `cap-chunk-retrieval`
-  (`requested_chunk_count`). No call site computes these fields today.
+- **Dependency security refresh** (pip-audit on the lock: 214 findings in 24 packages → 1).
+  21 packages bumped to their fixed versions (pillow 13, pypdf 6.21.4, aiohttp 3.14.5,
+  starlette 1.10 + fastapi 0.162, langgraph 1.2.19 for langgraph-sdk 0.4, …), lock regenerated
+  with its header command. **python-jose → PyJWT** (PYSEC-2026-4298, HS256 forgery with a DER
+  public key, no upstream fix); `ecdsa`, `rsa`, `pyasn1` left the tree with it. Behaviour kept
+  (alg allow-list, kid refresh, MED-7, iss/aud/exp, iat = integer only); one deliberate change:
+  a token with NO `aud` is now refused (python-jose skipped it; onboarding adds the audience
+  mapper). `tests/test_token_validator.py` pins all of it plus the HS256-with-public-key forgery.
+  **Remaining:** cryptography 49.0.0, PYSEC-2026-3552 (PKCS#7 decrypt oracle, fixed in 50.0) —
+  AGT core 5.0.0, the latest release, requires `cryptography<50`; no code here or in the tree
+  calls `pkcs7_decrypt_*`. UI dev tooling: vite 7.3, vitest 4.1, plugin-react 5.2 → `npm audit` 0
+  (still Node ≥ 20.19).
+- **Inert deny rules — WIRED** (they never fired: no call site sent their field, and the
+  evaluator treats an absent field as "no match"). All three fields are now computed
+  deterministically, sent at every call site, and listed in `REQUIRED_CONTEXT` (missing →
+  deny; the AST call-site pin covers them):
+  - `tool_category` (`mcp.call`: `tools/mcp.py` executor + `/a2a/tool`) from
+    `tools.mcp.tool_category`: explicit `tool_categories` map on the MCP server config → the
+    in-process local tools are `compute` → conservative name patterns (exec/shell/eval/
+    subprocess/run_command → code execution; write/delete/move/rename + file, rm/mv/mkdir →
+    filesystem) → `unclassified`. **Fail closed:** new rule `require-classified-tool` denies
+    every category except `read`/`compute`, so an external MCP tool nobody classified is
+    refused until an operator declares it.
+  - `agent_trust_score` (`rag.retrieve`, `mcp.call`): delegated actions send the signing
+    peer's registry trust (`/a2a/query` → `run_query` → `retrieve_local`; `/a2a/tool` → both
+    `mcp.call` gates). Local user actions send `LOCAL_AGENT_TRUST_SCORE` = 1.0 (no other
+    agent is acting; NOT the mesh self-trust counter, which starts at 0.5). It is a required
+    argument of `run_query` / `run_local_tool` / `call_mcp_tool` — never a default. With the
+    default `AGENT_TRUST_THRESHOLD` (0.6) the handler gate already 403s first; the policy is
+    the floor if a deployment lowers that threshold.
+  - `requested_chunk_count` (`rag.retrieve`): sum of the active retrievers' `chunk_limit`
+    (Qdrant `qdrant_final_k`, Neo4j `neo4j_top_k`, RaaS `top_k`; default fan-out 15); a
+    retriever with no declared limit → missing → deny.
+  Proof: 12 new decision-matrix rows, the rules firing through the real `_enforce`, and
+  call-site tests (`tests/test_inert_rules_wired.py`, `tests/test_a2a_tool.py`) incl. the real
+  compiled graph; 13 mutations (each wiring removed/neutralised) are each caught. Every local
+  tool and the default retrieval still pass the real policy.
 - **Still open:** live stacks/k8s/real NIM on the host; why GitHub Actions did not run on PR #1.
 
 ### Update log — 2026-11-03 (AGT 5.0, supply chain, LLM gateway)
@@ -329,7 +362,7 @@ Still open: a true third-party pen-test. Probes + write-ups:
 
 ## Test reality
 
-- Full backend suite: **546 passed, 8 skipped** (2026-11-04, all merged work; UI `npm test` 14 passed + build). Before that: **404 passed, 8 skipped** (2026-11-03, on AGT 5.0, Python 3.11 and 3.12 —
+- Full backend suite: **640 passed, 8 skipped** (2026-11-04, after the dependency refresh + inert-rule wiring; UI `npm test` 14 passed + build, `npm audit` 0). Earlier the same day: **546 passed, 8 skipped**. Before that: **404 passed, 8 skipped** (2026-11-03, on AGT 5.0, Python 3.11 and 3.12 —
   incl. the new 27-row policy decision matrix). Earlier: **343 passed, 1 skipped** (as of 2026-06-19, post Wave-7 cross-agent tool
   delegation + its F2 security-review fix; was **252 passed, 2 skipped** at the 2026-06-17 audit,
   itself up from 138/2 at first audit — the growth is this session's retriever feature + gap-fix +

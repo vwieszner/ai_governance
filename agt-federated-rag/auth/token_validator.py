@@ -27,6 +27,15 @@ JWKS cache:
     fails, allowing key rotation without a restart.  An asyncio.Lock guards
     double-checked locking so concurrent requests don't stampede the JWKS
     endpoint on cache miss.
+
+JWT library:
+    PyJWT (``jwt``) — python-jose was removed (PYSEC-2026-4298: HS256 forgery with
+    DER-encoded public keys, no fixed release; it also pulled the unmaintained
+    ``ecdsa``). ``JWTError`` below is an alias of ``jwt.PyJWTError`` so every
+    signature / claim / key failure is ONE exception type for callers (→ 401).
+    HS256-with-public-key confusion is refused three independent ways: the
+    algorithm allow-list (default RS256,ES256), the MED-7 key ``alg`` check, and
+    PyJWK refusing to build an HMAC key from a non-``oct`` JWK.
 """
 from __future__ import annotations
 
@@ -37,13 +46,16 @@ import time
 from typing import Any
 
 import httpx
+import jwt
 import structlog
-from jose import JWTError, jwk, jwt  # type: ignore[import]
-from jose.exceptions import JWKError  # type: ignore[import]
 
 from config import settings
 
 log = structlog.get_logger(__name__)
+
+# One exception type for every token failure (malformed header, unknown kid, key/alg
+# mismatch, bad signature, expired, wrong iss/aud). Callers map it to HTTP 401.
+JWTError = jwt.PyJWTError
 
 # ── JWKS cache ─────────────────────────────────────────────────────────────────
 _JWKS_CACHE: dict[str, Any] | None = None
@@ -128,7 +140,7 @@ def _find_key(
     are accepted for any algorithm in the allow-list.
 
     Returns:
-        A jose JWK key object.
+        The verification key (a ``cryptography`` public-key object) built from the JWK.
 
     Raises:
         JWTError: If no matching key is found or the algorithm is rejected.
@@ -149,11 +161,24 @@ def _find_key(
                 f"JWT algorithm {header_alg!r} is not in the allowed list: {allowed_algs}"
             )
         try:
-            return jwk.construct(key_data, algorithm=header_alg)
-        except JWKError as exc:
+            # algorithm=header_alg forces the key family: PyJWK refuses to build e.g. an
+            # HMAC key from an RSA/EC JWK (kty must be 'oct'), so a public key can never
+            # be repurposed as an HS256 secret.
+            return jwt.PyJWK(key_data, algorithm=header_alg).key
+        except (jwt.PyJWTError, ValueError, TypeError) as exc:
             raise JWTError(f"Failed to construct JWK for kid={kid!r}: {exc}") from exc
 
     raise JWTError(f"No JWKS key found for kid={kid!r}")
+
+
+def _check_iat_is_integer(claims: dict) -> None:
+    """``iat``, when present, must be an integer (RFC 7519 NumericDate)."""
+    if "iat" not in claims:
+        return
+    try:
+        int(claims["iat"])
+    except (ValueError, TypeError, OverflowError):
+        raise jwt.InvalidIssuedAtError("Issued At claim (iat) must be an integer.") from None
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -166,7 +191,7 @@ async def validate_token(token: str) -> dict:
         1. Decode the JWT header (unverified) to extract kid and alg.
         2. Fetch JWKS (from cache or endpoint).
         3. Locate the signing key — MED-7: verify key alg matches header alg.
-        4. Verify signature, issuer, audience, and expiry via python-jose.
+        4. Verify signature, issuer, audience, expiry and iat via PyJWT.
         5. On kid-not-found, eagerly refresh the JWKS cache once and retry
            (supports key rotation without restarting the service).
 
@@ -212,7 +237,10 @@ async def validate_token(token: str) -> dict:
         jwks = await _get_jwks(force_refresh=True)
         key = _find_key(jwks, kid, header_alg)  # let JWTError propagate on second miss
 
-    # Step 4: full verification.
+    # Step 4: full verification. iat semantics are kept exactly as before (python-jose):
+    # if present it must be an integer, but it is NOT compared against the local clock —
+    # PyJWT's own iat check would reject a token issued a second "in the future" by an IdP
+    # whose clock runs slightly ahead (no leeway is used, so exp stays strict).
     try:
         claims: dict = jwt.decode(
             token,
@@ -220,8 +248,10 @@ async def validate_token(token: str) -> dict:
             algorithms=[header_alg],
             audience=settings.agent_client_id,
             issuer=settings.oidc_issuer,
-            options={"verify_exp": True, "verify_iat": True},
+            options={"verify_signature": True, "verify_exp": True, "verify_iat": False,
+                     "verify_aud": True, "verify_iss": True},
         )
+        _check_iat_is_integer(claims)
     except JWTError:
         log.warning("jwt.validation_failed", kid=kid, alg=header_alg)
         raise

@@ -59,6 +59,20 @@ rules:
     action: deny
     message: "Filesystem writes not permitted for the RAG agent"
 
+  # Fail-closed tool classification: an mcp.call whose tool_category is not a known-safe
+  # category is denied. tools.mcp.tool_category resolves explicit config -> in-process
+  # local tool (compute) -> name-pattern fallback -> "unclassified", so a tool nobody
+  # classified is refused here. Below 800 so the specific code-exec / filesystem rules
+  # above remain the deciding (and reported) rule for their categories.
+  - name: require-classified-tool
+    priority: 790
+    condition:
+      field: tool_category
+      operator: not_in
+      value: [read, compute]
+    action: deny
+    message: "MCP tool is not classified as read or compute (fail closed)"
+
   # ── Allow-list of known-safe agent actions (ASI-02 least privilege) ──────
   # Per-request rate limiting is enforced in code (api.main._check_rate_limit),
   # and per-chunk data authorization by OpenFGA — not duplicated here.

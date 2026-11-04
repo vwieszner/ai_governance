@@ -28,9 +28,9 @@ import time
 from types import SimpleNamespace
 
 import httpx
+import jwt
 import pytest
 import structlog
-from jose import jwt
 
 from api import main
 
@@ -395,13 +395,10 @@ def test_non_admin_refused_without_touching_keycloak(env, monkeypatch):
 def _keypair(kid):
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from jose import jwk
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     priv = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                              serialization.NoEncryption()).decode()
-    pub = key.public_key().public_bytes(serialization.Encoding.PEM,
-                                        serialization.PublicFormat.SubjectPublicKeyInfo).decode()
-    j = jwk.construct(pub, "RS256").to_dict()
+    j = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
     j.update({"kid": kid, "alg": "RS256", "use": "sig"})
     return priv, j
 

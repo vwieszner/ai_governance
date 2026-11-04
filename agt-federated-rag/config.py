@@ -277,8 +277,12 @@ class Settings(BaseSettings):
     # ── MCP tool servers (Phase-1 item 11) ───────────────────────────────────
     # JSON list of allowed MCP servers, e.g.
     #   [{"name":"jira","url":"https://mcp.corp/jira","allowed_auth_methods":["oauth2"],
-    #     "require_tls":true,"auth_mode":"oauth_obo"}]
+    #     "require_tls":true,"auth_mode":"oauth_obo","tool_categories":{"search":"read"}}]
     #   (valid allowed_auth_methods: oauth2, bearer, api_key, mtls, none)
+    # tool_categories: per-tool category for the mcp.call policy (tools.mcp.tool_category).
+    #   Only "read" and "compute" are allowed; shell_exec/code_eval/subprocess/os_command and
+    #   file_write/file_delete/file_move are denied, and an UNDECLARED tool falls back to a
+    #   conservative name pattern, else "unclassified" — denied (fail closed).
     # Empty = no MCP servers (the default). The toolkit's McpAuthPolicy gateway enforces
     # the per-server allowlist + required auth method; the policy engine's default-deny
     # blocks any mcp.call to a server/tool not explicitly allowed. The user's RAW token is

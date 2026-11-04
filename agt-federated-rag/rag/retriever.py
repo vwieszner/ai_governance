@@ -54,6 +54,9 @@ class Retriever(Protocol):
     # used. check_auth re-sources served text from a trusted backend so a compromised RaaS
     # cannot poison the content of an authorized chunk.
     trusted: bool
+    # Max chunks one retrieve(query) call (limit=None, as retrieve_local calls it) returns.
+    # Summed across the fan-out into the rag.retrieve policy context (cap-chunk-retrieval).
+    chunk_limit: int
 
     async def setup(self) -> None:
         """One-time initialisation (collection/index/egress check). Idempotent."""
@@ -74,6 +77,12 @@ class _QdrantBackend:
 
     name = "qdrant"
     trusted = True   # store of record: authoritative for served chunk TEXT (A2d)
+
+    @property
+    def chunk_limit(self) -> int:
+        # Chunks returned with text (the fused query's limit). The dense relevance probe
+        # before it reads up to qdrant_top_k chunk_ids only — no payload/text.
+        return settings.qdrant_final_k
 
     def __init__(self) -> None:
         from rag.qdrant_retriever import HybridQdrantRetriever
@@ -98,6 +107,10 @@ class _Neo4jBackend:
 
     name = "neo4j"
     trusted = True   # built-in store of record (inert seam, but in-boundary if populated)
+
+    @property
+    def chunk_limit(self) -> int:
+        return settings.neo4j_top_k
 
     def __init__(self) -> None:
         from rag.neo4j_retriever import GraphRAGRetriever
@@ -136,6 +149,7 @@ class HttpRetriever:
         self._url = endpoint.url.rstrip("/")
         self._api_key = endpoint.api_key
         self._top_k = endpoint.top_k
+        self.chunk_limit = endpoint.top_k
 
     async def setup(self) -> None:
         # SSRF denylist (A2-SSRF): refuse cloud-metadata / link-local / loopback targets
@@ -224,6 +238,24 @@ async def fetch_trusted_text(
 
 
 _BUILTINS: dict[str, type] = {"qdrant": _QdrantBackend, "neo4j": _Neo4jBackend}
+
+
+def requested_chunk_count(retrievers: list[Any]) -> int | None:
+    """Total chunks one query requests across the fan-out — the ``requested_chunk_count``
+    the rag.retrieve policy caps (cap-chunk-retrieval, max 50). Deterministic, from config.
+
+    Returns None (→ missing governance context → DENY in agent.nodes._enforce) if any
+    retriever does not declare a valid non-negative int ``chunk_limit``: an unknown request
+    size must not slip past the cap. An empty fan-out requests 0."""
+    total = 0
+    for r in retrievers:
+        limit = getattr(r, "chunk_limit", None)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+            log.warning("retriever_chunk_limit_undeclared", retriever=getattr(r, "name", "?"),
+                        agt_audit=True)
+            return None
+        total += limit
+    return total
 
 
 def build_retrievers() -> list[Retriever]:
