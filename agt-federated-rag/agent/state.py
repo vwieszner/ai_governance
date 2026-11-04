@@ -84,6 +84,17 @@ class AgentState(TypedDict):
     # ── Cross-cluster peer ────────────────────────────────────────────────────
     peer_task_id: str | None                # task ID on the remote peer cluster
     peer_status: str | None                 # AGT PeerResponse.status string
+    # Mosaic guard on federated answers: the answering peer's verified DID + division and
+    # the label NAMES it reported inside its DID-signed response (None = none reported).
+    # peer_labels_verified is True only when those labels came from a verified response.
+    peer_did: str | None
+    peer_division: str | None
+    peer_data_labels: list[str] | None
+    peer_labels_verified: bool
+
+    # Contributing source names / labels for a mosaic-clearance approval (never content),
+    # set by the guard and shown to the approver by start_approval.
+    approval_sources: list[str]
 
     # M3 loop guard: False for peer-originated queries so check_auth never re-delegates
     # to another peer (no A->B->A loops, no forward-empty-claims 401).

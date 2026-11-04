@@ -311,6 +311,9 @@ export interface PendingApproval {
   requestId: string
   requesterId: string
   query: string
+  // Contributing source names / labels (never content) — e.g. for a mosaic clearance the
+  // local documents and peer divisions whose COMBINATION needs approval.
+  sources: string[]
 }
 
 export async function listPendingApprovals(
@@ -323,11 +326,14 @@ export async function listPendingApprovals(
   if (!res.ok) {
     throw new RagError(`Failed to load approvals (${res.status})`, String(res.status))
   }
-  const data = (await res.json()) as { pending?: Array<Record<string, string>> }
+  const data = (await res.json()) as {
+    pending?: Array<{ request_id: string; requester_id: string; query: string; sources?: unknown }>
+  }
   return (data.pending ?? []).map((p) => ({
     requestId: p.request_id,
     requesterId: p.requester_id,
     query: p.query,
+    sources: Array.isArray(p.sources) ? p.sources.map(String) : [],
   }))
 }
 

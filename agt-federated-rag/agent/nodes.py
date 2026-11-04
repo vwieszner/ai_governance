@@ -640,11 +640,13 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
     # Mosaic-effect guard: per-chunk authz is done; now gate the COMBINATION of the
     # authorized, trusted context before it can reach llm.generate. Only LOCAL_ALLOWED
     # routes to generation (a pending chunk already routes to approval).
+    approval_sources: list[str] = []
     if flow == FlowDecision.LOCAL_ALLOWED:
         guard = await _guard_context_combination(state, auth, allowed, pruned_chunks)
         if guard is not None:
             flow = guard["flow"]
             pending = pending + guard.get("add_pending", [])
+            approval_sources = guard.get("approval_sources", [])
             if flow == FlowDecision.LOCAL_DENIED:
                 # Withhold: nothing reaches the LLM, and the text leaves state (Finding #6).
                 denied = denied + allowed
@@ -660,6 +662,7 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         "allowed_chunk_ids": allowed,
         "pending_chunk_ids": pending,
         "denied_chunk_ids": denied,
+        "approval_sources": approval_sources,
     }
     if status_message is not None:
         result["status_message"] = status_message
@@ -676,24 +679,43 @@ _MOSAIC_DENIED_MESSAGE = (
 
 
 async def _guard_context_combination(
-    state: AgentState, auth: OpenFGAAuth, allowed: list[str], served: list[dict[str, Any]],
+    state: AgentState, auth: OpenFGAAuth | None, allowed: list[str],
+    served: list[dict[str, Any]], *, peer: Any = None,
 ) -> dict[str, Any] | None:
-    """Evaluate the COMBINATION of authorized served chunks (agent/context_guard.py).
+    """Evaluate the COMBINATION of authorized context (agent/context_guard.py).
 
-    Returns None to proceed unchanged, or a dict with the new ``flow`` (+ ``add_pending``
-    clearance ids for an escalation, or ``status_message`` for a deny). ESCALATE reuses the
-    existing approval path: the uncleared ``mosaic-<rule>`` clearance objects become
-    pending ids, so start_approval writes the OpenFGA pending tuples and starts the
-    Temporal workflow; once approved (viewer on the clearance) the same combination passes.
+    The union evaluated is: this query's authorized local chunks + the verified peer
+    contribution (``peer``: a ``context_guard.Contribution``, for a federated answer) + the
+    labels released to this user from OTHER origins within the policy window (ledger).
+
+    Returns None to proceed (the release is then recorded in the ledger), or a dict with the
+    new ``flow`` (+ ``add_pending`` clearance ids and ``approval_sources`` for an escalation,
+    or ``status_message`` for a deny). ESCALATE reuses the existing approval path: the
+    uncleared ``mosaic-<rule>`` clearance objects become pending ids, so start_approval
+    writes the OpenFGA pending tuples and starts the Temporal workflow; once approved
+    (viewer on the clearance) the same combination passes.
     """
     from agent import context_guard as cg
 
     allowed_set = set(allowed)
     context_chunks = [c for c in served if c.get("chunk_id") in allowed_set]
-    if not context_chunks:
+    if not context_chunks and peer is None:
         return None
-    decision = cg.evaluate(context_chunks, settings.context_aggregation_policy,
-                           workflow_id=str(state.get("task_id") or ""))
+    policy = settings.context_aggregation_policy
+    if not policy:
+        return None                      # explicitly disabled (the only way to turn it off)
+    origin = peer.origin if peer is not None else cg.LOCAL_ORIGIN
+    cfg: Any = None
+    contributions: list[Any] = [peer] if peer is not None else []
+    try:
+        cfg = cg.load_config(policy)
+    except cg.ContextAggregationConfigError as exc:
+        decision = cg.GuardDecision(cg.Outcome.DENY, f"config_error: {exc}"[:300])
+    else:
+        contributions += cg.LEDGER.others(state["user_id"], origin, cfg.window_seconds)
+        decision = cg.evaluate_combined(context_chunks, contributions, cfg,
+                                        workflow_id=str(state.get("task_id") or ""),
+                                        local_division=settings.division_id)
     audit = dict(
         user_id=state["user_id"],
         action="context.aggregate",
@@ -702,11 +724,26 @@ async def _guard_context_combination(
         sensitivity=decision.sensitivity.name.lower(),
         rules=list(decision.rules_applied),
         count=len(context_chunks),
+        origin=origin,
+        # Which labels came from peers: label names + peer DID only (never content).
+        peer_labels=[
+            {"peer_did": c.origin,
+             "labels": (sorted(c.effective_labels()) if c.effective_labels() is not None
+                        else "unlabeled")}
+            for c in contributions if c.origin != cg.LOCAL_ORIGIN],
         agt_audit=True,
     )
 
+    def _record_release() -> None:
+        entry = (peer if peer is not None
+                 else cg.local_release(context_chunks, cfg, settings.division_id))
+        if entry is not None:
+            cg.LEDGER.record(state["user_id"], entry)
+
     if decision.outcome == cg.Outcome.ALLOW:
         log.info("context_aggregation_decision", decision="allow", **audit)
+        if cfg is not None:
+            _record_release()
         return None
 
     if decision.outcome == cg.Outcome.DENY:
@@ -715,16 +752,56 @@ async def _guard_context_combination(
 
     # ESCALATE: has this user already been cleared for this combination (approved before,
     # or an admin group grant)? Clearance is an ordinary OpenFGA viewer check.
+    if auth is None:
+        auth = await _get_openfga()
     clearance = await auth.batch_decide(
         state["user_id"], list(decision.clearance_ids), groups=state.get("user_groups") or [])
     uncleared = [cid for cid in decision.clearance_ids
                  if clearance.get(cid) != AuthzDecision.ALLOWED]
     if not uncleared:
         log.info("context_aggregation_decision", decision="cleared", **audit)
+        _record_release()
         return None
     log.warning("context_aggregation_decision", decision="escalate",
-                pending=len(uncleared), **audit)
-    return {"flow": FlowDecision.LOCAL_NEEDS_APPROVAL, "add_pending": uncleared}
+                pending=len(uncleared), sources=list(decision.sources), **audit)
+    return {"flow": FlowDecision.LOCAL_NEEDS_APPROVAL, "add_pending": uncleared,
+            "approval_sources": list(decision.sources)}
+
+
+async def _guard_peer_answer(state: AgentState) -> dict[str, Any] | None:
+    """Mosaic guard for a FEDERATED answer, before it is released to the user.
+
+    Only labels carried in the peer's signature-verified /a2a/query response count
+    (``peer_labels_verified``, set by call_peer_agent from mesh.peer_client); absent,
+    malformed or unverified labels are UNLABELED and follow the policy's
+    ``federation.unlabeled_peer`` fail mode. Returns None to release, else the state update
+    that withholds the peer answer (deny) or routes to start_approval (escalate).
+    """
+    from agent import context_guard as cg
+
+    verified = bool(state.get("peer_labels_verified"))
+    labels = cg.validate_peer_labels(state.get("peer_data_labels")) if verified else None
+    if verified and labels is None:
+        log.warning("peer_labels_invalid_or_absent", peer_did=state.get("peer_did"),
+                    agt_audit=True)
+    contrib = cg.Contribution(
+        origin=str(state.get("peer_did") or "unknown-peer"),
+        division=str(state.get("peer_division") or ""),
+        labels=labels, verified=labels is not None)
+    guard = await _guard_context_combination(
+        state, None, list(state.get("allowed_chunk_ids") or []),
+        list(state.get("fused_chunks") or []), peer=contrib)
+    if guard is None:
+        return None
+    # The peer answer never leaves this agent on a deny / pending clearance.
+    if guard["flow"] == FlowDecision.LOCAL_DENIED:
+        return {"flow": FlowDecision.REMOTE_DENIED, "status_message": guard["status_message"],
+                "answer": None, "peer_answer": None}
+    return {"flow": FlowDecision.LOCAL_NEEDS_APPROVAL,
+            "pending_chunk_ids": list(state.get("pending_chunk_ids") or [])
+            + guard["add_pending"],
+            "approval_sources": guard["approval_sources"],
+            "answer": None, "peer_answer": None}
 
 
 # ── Citation / grounding gate (deterministic, auditable) ──────────────────────
@@ -914,6 +991,18 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
 
     approval_request_id = str(uuid.uuid4())
 
+    # Source names only (never chunk text) — what the APPROVER is shown, and the hint used
+    # in the requester-facing message below. Ordinary pending chunks resolve to their
+    # metadata source; a mosaic clearance (synthetic ``mosaic-<rule>`` id, no metadata)
+    # carries the contributing provenance computed by the guard (local source names +
+    # labels, and peer division/DID + labels) so the approver is never approving blind.
+    sources = sorted({
+        c.get("metadata", {}).get("source", "")
+        for c in state.get("fused_chunks", [])
+        if c.get("chunk_id") in set(chunk_ids)
+    } - {""})
+    sources += [s for s in (state.get("approval_sources") or []) if s not in sources]
+
     # Write pending_approval tuples to OpenFGA
     for chunk_id in chunk_ids:
         await auth.set_pending_approval(user_id, chunk_id)
@@ -954,6 +1043,7 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
                 originating_task_id=state.get("originating_task_id"),
                 # Snapshot timeout at start — deterministic for Temporal replay
                 timeout_seconds=settings.approval_timeout_seconds,
+                sources=sources,
             ),
             id=f"approval-{approval_request_id}",
             task_queue=settings.temporal_task_queue,
@@ -974,15 +1064,11 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
     # /approvals/pending is a fast, consistent point read (not a laggy Temporal
     # visibility scan). Best-effort: a failure here never blocks the approval.
     import approval_index
-    await approval_index.record(approver_id, approval_request_id, user_id, state["query"])
+    await approval_index.record(approver_id, approval_request_id, user_id, state["query"],
+                                sources=sources)
 
     # LLM generates a contextual message. Only source names from metadata are
     # passed — never chunk text — so the security boundary is preserved.
-    sources = sorted({
-        c.get("metadata", {}).get("source", "")
-        for c in state.get("fused_chunks", [])
-        if c.get("chunk_id") in set(chunk_ids)
-    } - {""})
     source_hint = f" (relevant document: {', '.join(sources)})" if sources else ""
     try:
         llm = await _get_llm()
@@ -1172,6 +1258,12 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
         "peer_status": peer_response.status,
         "peer_answer": peer_response.answer,
         "discovery_summary": discovery_summary,
+        # Mosaic guard inputs: label NAMES from the peer's signed envelope (None = the peer
+        # sent none) + whether they came from a signature-verified response.
+        "peer_did": peer_response.peer_did,
+        "peer_division": target.division_id or "",
+        "peer_data_labels": peer_response.data_labels,
+        "peer_labels_verified": peer_response.labels_verified,
     }
 
 
@@ -1199,6 +1291,12 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
     log.info("node_handle_peer_result", peer_status=peer_status)
 
     if peer_status == "completed":
+        # Mosaic guard on the FEDERATED answer: the peer's verified labels + this user's
+        # releases from other origins are evaluated together BEFORE anything is released
+        # (also on the approval-poll path, so a cleared combination is then delivered).
+        withheld = await _guard_peer_answer(state)
+        if withheld is not None:
+            return withheld
         raw_answer = state.get("peer_answer") or ""
         if state.get("check_only"):
             # Approval-outcome poll: the peer already GENERATED a full answer. Deliver it

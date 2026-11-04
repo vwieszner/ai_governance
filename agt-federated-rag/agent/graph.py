@@ -15,6 +15,9 @@ After ``check_auth`` runs, ``_route`` reads the flow field and dispatches:
 ``call_peer_agent`` has its own conditional edge: if the node wrote an error
 into state (e.g. circuit open, DID unverifiable) we short-circuit directly to
 ``format_response`` without passing through ``handle_peer_result``.
+``handle_peer_result`` routes to ``start_approval`` when the mosaic guard needs a
+clearance for the federated answer combined with the user's other releases
+(flow LOCAL_NEEDS_APPROVAL); otherwise to ``format_response``.
 
 Governance gates (what actually enforces policy)
 ------------------------------------------------
@@ -131,6 +134,15 @@ def _route_after_peer(state: AgentState) -> str:
     return "handle_peer_result"
 
 
+def _route_after_peer_result(state: AgentState) -> str:
+    """A federated answer whose COMBINATION with this user's other releases needs a mosaic
+    clearance (handle_peer_result → LOCAL_NEEDS_APPROVAL) goes to the EXISTING approval
+    node; everything else formats as before."""
+    if state.get("flow") == FlowDecision.LOCAL_NEEDS_APPROVAL:
+        return "start_approval"
+    return "format_response"
+
+
 # ── Graph construction ────────────────────────────────────────────────────────
 
 def _build_graph() -> StateGraph:
@@ -153,7 +165,6 @@ def _build_graph() -> StateGraph:
     graph.add_edge("retrieve_local", "check_auth")
     graph.add_edge("generate_answer", "format_response")
     graph.add_edge("start_approval", "format_response")
-    graph.add_edge("handle_peer_result", "format_response")
     graph.add_edge("format_response", END)
 
     # Conditional edges
@@ -172,6 +183,14 @@ def _build_graph() -> StateGraph:
         _route_after_peer,
         {
             "handle_peer_result": "handle_peer_result",
+            "format_response": "format_response",
+        },
+    )
+    graph.add_conditional_edges(
+        "handle_peer_result",
+        _route_after_peer_result,
+        {
+            "start_approval": "start_approval",
             "format_response": "format_response",
         },
     )
@@ -250,6 +269,11 @@ async def run_query(
         "approval_request_id": None,
         "peer_task_id": None,
         "peer_status": None,
+        "peer_did": None,
+        "peer_division": None,
+        "peer_data_labels": None,
+        "peer_labels_verified": False,
+        "approval_sources": [],
         "error": None,
         # M3 loop guard: a peer-originated query (allow_remote=False) must NOT re-delegate
         # to another peer — that would forward empty claims (-> downstream 401) and allow
@@ -307,4 +331,20 @@ async def run_query(
         "approval_request_id": final_state.get("approval_request_id"),
         "peer_task_id": final_state.get("peer_task_id"),
         "task_id": final_state["task_id"],
+        "data_labels": _answer_data_labels(final_state),
     }
+
+
+def _answer_data_labels(final_state: AgentState) -> list[str] | None:
+    """Label NAMES of the local chunks a generated answer was built from (mosaic guard).
+
+    /a2a/query returns these inside its DID-signed response so the REQUESTING division can
+    evaluate the cross-division combination. Only for a locally generated answer
+    (LOCAL_ALLOWED); None when no local context answered or the policy is off/unloadable.
+    """
+    if final_state.get("flow") != FlowDecision.LOCAL_ALLOWED or not final_state.get("answer"):
+        return None
+    from agent import context_guard as cg
+    used = set(final_state.get("allowed_chunk_ids") or [])
+    chunks = [c for c in final_state.get("fused_chunks") or [] if c.get("chunk_id") in used]
+    return cg.chunk_labels(chunks, settings.context_aggregation_policy)
