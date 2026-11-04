@@ -326,7 +326,8 @@ With `--llm-gateway` (or `llm_gateway: true` in `infra/divisions/<id>.yml`) the 
 3. port-forwards the gateway and issues the agent's virtual key with the same code as the
    Compose onboarding (`onboard_division.provision_gateway_key`): residency `external` →
    NIM chat + embeddings + the in-boundary model; anything else → only
-   `local/llama-3.1-8b-instruct`, with the app's model names aliased onto it;
+   `local/llama-3.1-8b-instruct` + `local/nv-embedqa-e5-v5`, with the app's chat model
+   names and its `EMBEDDING_MODEL` aliased onto them;
 4. ingests through the gateway, and puts the virtual key (not the NVIDIA key) in
    `agent-secrets` as `OPENAI_API_KEY` / `EMBEDDING_API_KEY`.
 
@@ -348,8 +349,16 @@ Operator settings and caveats:
 - Set `LOCAL_LLM_BASE` in `llm-gateway-env` to your in-cluster vLLM/NIM. The default
   `http://local-llm.invalid/v1` never resolves, so the in-boundary model fails closed. Never
   leave it empty: LiteLLM would then send the "local" model to the public OpenAI API.
-- A residency=local division has no in-boundary **embedding** model in this config, so its
-  key refuses API-mode embeddings. Add a `local/` embedding model group before enabling one.
+- Set `LOCAL_EMBED_BASE` to your in-cluster embeddings Service (NIM / TEI / vLLM,
+  OpenAI-compatible `/embeddings`) for a residency=local division: its key aliases the
+  app's `EMBEDDING_MODEL` onto `local/nv-embedqa-e5-v5`, so ingest and search stay
+  in-boundary with no agent change. Same `.invalid` fail-closed default; no fallback to
+  NIM. The endpoint must serve `nvidia/nv-embedqa-e5-v5` (or another model with exactly
+  `QDRANT_DENSE_SIZE`=1024 dims, accepting `input_type`/`truncate`); `embed_dense` raises
+  on any other vector size. Keep the same model as any existing collection was ingested
+  with, or re-ingest. `bootstrap_k8s.py` patches both upstreams from the manifest's
+  `llm_gateway_local_base` / `llm_gateway_local_embed_base`; optional keys go in
+  `llm-gateway-secrets` as `LOCAL_LLM_KEY` / `LOCAL_EMBED_KEY`.
 - The gateway pod calls NIM over HTTPS, so on a TLS-intercepting host it needs the CA
   mount described above, the same as the agent.
 

@@ -21,6 +21,12 @@ Optional LLM gateway (manifest `llm_gateway: true`): adds the LiteLLM Proxy serv
 (compose profile `llm-gateway`) to the division stack, mints its master key into
 secrets.json, issues the agent's per-division virtual key (allowlist by residency_mode)
 and points the agent env at the gateway. Off by default — nothing changes without it.
+A residency=local division also gets the in-boundary EMBEDDING model on its key (manifest
+`llm_gateway_local_embed_base`), so API-mode embeddings stay in-boundary too.
+
+Containerized agent (compose profile `containerized`): onboarding also writes
+infra/generated/<id>/.env.<id>.agent — the same values as the host agent env, with the
+infra endpoints rewritten to their in-network compose names/ports.
 """
 from __future__ import annotations
 
@@ -60,10 +66,13 @@ GATEWAY_LOCAL_CHAT = "local/llama-3.1-8b-instruct"            # in-boundary (sel
 GATEWAY_EXTERNAL_CHAT = ("meta/llama-3.3-70b-instruct",       # LLM_MODEL of the deployments
                          "meta/llama-3.1-8b-instruct")        # app default + intent model
 GATEWAY_EXTERNAL_EMBED = ("nvidia/nv-embedqa-e5-v5",)
+GATEWAY_LOCAL_EMBED = "local/nv-embedqa-e5-v5"               # in-boundary embeddings
+GATEWAY_IN_NETWORK_BASE = "http://llm-gateway.internal:4000/v1"  # compose network alias
 NIM_BASE = "https://integrate.api.nvidia.com/v1"
 # Never leave the in-boundary upstream empty (LiteLLM would default it to the public
 # OpenAI API). `.invalid` never resolves (RFC 2606), so the local model fails closed.
 LOCAL_LLM_UNSET = "http://local-llm.invalid/v1"
+LOCAL_EMBED_UNSET = "http://local-embed.invalid/v1"   # same fail-closed default, embeddings
 
 REALM = "rag"  # one realm per division (each division has its OWN Keycloak host)
 # Seed-user (alice/bob) password is per-division random (see make_division_secrets);
@@ -111,8 +120,12 @@ class Manifest:
     # to the provider directly, exactly as before. llm_gateway_local_base = the
     # in-boundary (self-hosted vLLM/NIM) OpenAI-compatible base the gateway's local model
     # forwards to; required for a useful residency_mode=local division.
+    # llm_gateway_local_embed_base = the in-boundary OpenAI-compatible /embeddings base
+    # (self-hosted NIM/TEI/vLLM serving nv-embedqa-e5-v5 at qdrant_dense_size=1024 dims);
+    # required for a residency_mode=local division that embeds via the API (k8s).
     llm_gateway: bool = False
     llm_gateway_local_base: str = ""
+    llm_gateway_local_embed_base: str = ""
 
 
 def _parse_manifest_text(text: str) -> dict:
@@ -186,6 +199,8 @@ def load_manifest(path: str | Path) -> Manifest:
         cross_grants=[g for g in (data.get("cross_grants") or []) if isinstance(g, dict)],
         llm_gateway=llm_gateway,
         llm_gateway_local_base=str(data.get("llm_gateway_local_base", "") or "").strip(),
+        llm_gateway_local_embed_base=str(
+            data.get("llm_gateway_local_embed_base", "") or "").strip(),
     )
 
 
@@ -248,6 +263,9 @@ def render_stack_env(manifest: Manifest, ports: dict[str, int], secretz: dict[st
     """The --env-file passed to `docker compose` for this division's stack template."""
     return (
         f"DIV_ID={manifest.division_id}\n"
+        # Only the `containerized` profile publishes the agent port (else the host agent
+        # owns it); without this the profile would publish it on a random host port.
+        f"DIV_AGENT_PORT={ports['agent']}\n"
         f"DIV_OPENFGA_PORT={ports['openfga']}\n"
         f"DIV_KEYCLOAK_PORT={ports['keycloak']}\n"
         f"DIV_TEMPORAL_PORT={ports['temporal']}\n"
@@ -327,23 +345,77 @@ def render_agent_env(
     )
 
 
+# Containerized agent (compose profile `containerized`): the infra services by their
+# compose DNS name on INTERNAL ports, instead of the host-mapped loopback ports.
+_IN_NETWORK = {
+    "QDRANT_URL": "http://qdrant:6333",
+    "REDIS_URL": "redis://redis:6379/0",
+    "OPENFGA_API_URL": "http://openfga:8080",
+    "TEMPORAL_ADDRESS": "temporal:7233",
+    "OIDC_JWKS_URI": f"http://keycloak:8080/realms/{REALM}/protocol/openid-connect/certs",
+    "OIDC_TOKEN_ENDPOINT": f"http://keycloak:8080/realms/{REALM}/protocol/openid-connect/token",
+    "HOST": "0.0.0.0",
+    "PORT": "8000",
+}
+
+
+def container_agent_env_path(division_id: str) -> Path:
+    """Where the `containerized` profile's agent + worker read their env_file
+    (division-stack.template.yml: ./generated/<id>/.env.<id>.agent, i.e. under the
+    gitignored infra/generated/<id>/)."""
+    return generated_dir(division_id) / f".env.{division_id}.agent"
+
+
+def render_container_agent_env(
+    manifest: Manifest, ports: dict[str, int], secretz: dict[str, str],
+    store_id: str, model_id: str, nvidia_key: str, llm_gateway_key: str | None = None,
+) -> str:
+    """The env_file of the containerized agent/worker: the SAME values as the host agent
+    env (render_agent_env), with the infra endpoints rewritten to in-network names.
+
+    Kept as the host value (template caveat a): OIDC_ISSUER — browser tokens carry the
+    host issuer. AGENT_URL / APPROVAL_UI_BASE_URL stay the host-mapped agent URL. With the
+    LLM gateway the agent talks to it by its `.internal` network alias (in-boundary for
+    residency=local; a bare `llm-gateway` would count as external)."""
+    env = dict(line.split("=", 1) for line in render_agent_env(
+        manifest, ports, secretz, store_id, model_id, nvidia_key,
+        llm_gateway_key=llm_gateway_key).splitlines() if "=" in line)
+    env.update(_IN_NETWORK)
+    if manifest.llm_gateway:
+        env["OPENAI_API_BASE"] = GATEWAY_IN_NETWORK_BASE
+        env["OPENAI_API_KEY"] = llm_gateway_key or ""
+    return "".join(f"{k}={v}\n" for k, v in env.items())
+
+
+def write_container_agent_env(manifest: Manifest, body: str) -> Path:
+    """Write the containerized agent env owner-only; logs the path + key count only."""
+    path = container_agent_env_path(manifest.division_id)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_secret(path, body)
+    n = sum(1 for line in body.splitlines() if "=" in line)
+    log(f"wrote {path.relative_to(ROOT)} (containerized agent env, {n} keys; values not shown)")
+    return path
+
+
 def gateway_key_spec(manifest: Manifest) -> dict:
     """The /key/generate body for this division's agent virtual key.
 
     residency_mode=external: the external chat + embedding models, plus the in-boundary
     model (the gateway falls back external -> local, never the reverse).
     Anything else (residency_mode=local; unknown values fail closed the same way): ONLY
-    the in-boundary model, with the app's unchanged model names ALIASED onto it by the
-    key — so a prompt cannot reach an external upstream whatever model the agent asks
-    for. Never pair this with a local -> external fallback (allowlists don't constrain
-    fallbacks; README rule 1)."""
+    the in-boundary chat + embedding models, with the app's unchanged model names
+    (LLM_MODEL, the intent model, EMBEDDING_MODEL) ALIASED onto them by the key — so
+    neither a prompt nor a chunk/query to embed can reach an external upstream whatever
+    model the agent asks for. Never pair this with a local -> external fallback
+    (allowlists don't constrain fallbacks; README rule 1)."""
     meta = {"division": manifest.division_id, "residency": manifest.residency_mode,
             "issued_by": "onboard_division"}
     if manifest.residency_mode == "external":
         return {"models": [*GATEWAY_EXTERNAL_CHAT, GATEWAY_LOCAL_CHAT, *GATEWAY_EXTERNAL_EMBED],
                 "metadata": meta}
-    return {"models": [GATEWAY_LOCAL_CHAT],
-            "aliases": {m: GATEWAY_LOCAL_CHAT for m in GATEWAY_EXTERNAL_CHAT},
+    return {"models": [GATEWAY_LOCAL_CHAT, GATEWAY_LOCAL_EMBED],
+            "aliases": {**{m: GATEWAY_LOCAL_CHAT for m in GATEWAY_EXTERNAL_CHAT},
+                        **{m: GATEWAY_LOCAL_EMBED for m in GATEWAY_EXTERNAL_EMBED}},
             "metadata": meta}
 
 
@@ -356,6 +428,7 @@ def render_gateway_stack_env(manifest: Manifest, secretz: dict[str, str], nvidia
         f"CHAT_PRIMARY_BASE={NIM_BASE}\n"
         f"NVIDIA_API_KEY={nvidia_key}\n"
         f"LOCAL_LLM_BASE={manifest.llm_gateway_local_base or LOCAL_LLM_UNSET}\n"
+        f"LOCAL_EMBED_BASE={manifest.llm_gateway_local_embed_base or LOCAL_EMBED_UNSET}\n"
     )
 
 
@@ -637,6 +710,9 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
                                  llm_gateway_key=llm_gateway_key)
     env_path = AGT / f".env.{manifest.division_id}"
     _write_secret(env_path, agent_env)                         # holds NVIDIA key + secrets
+    write_container_agent_env(manifest, render_container_agent_env(
+        manifest, ports, secretz, store_id, model_id, nvidia_key,
+        llm_gateway_key=llm_gateway_key))
     _write_secret(gdir / "did.json", json.dumps(did))          # DID + public JWK (kept owner-only for uniformity)
     log(f"wrote {env_path.relative_to(ROOT)} + DID {did['did']}")
 
@@ -809,15 +885,26 @@ def onboard(manifest_path: str | Path, no_neo4j: bool = False, dry_run: bool = F
         gw_port = gateway_port(manifest.port_base)
         gw_plan = {"profile": GATEWAY_PROFILE, "port": gw_port,
                    "agent_base": f"http://localhost:{gw_port}/v1",
-                   "in_network_base": "http://llm-gateway.internal:4000/v1",
+                   "in_network_base": GATEWAY_IN_NETWORK_BASE,
                    "local_llm_base": manifest.llm_gateway_local_base or LOCAL_LLM_UNSET,
+                   "local_embed_base": (manifest.llm_gateway_local_embed_base
+                                        or LOCAL_EMBED_UNSET),
                    "key_spec": gateway_key_spec(manifest)}
     stack_env_path = gdir / f"div-{manifest.division_id}.env"
     _write_secret(stack_env_path, stack_env)   # Postgres/OpenFGA/Keycloak secrets — owner-only
     plan = {"division_id": manifest.division_id, "project": compose_project(manifest.division_id),
             "ports": ports, "stack_env": str(stack_env_path), "generated_dir": str(gdir),
-            "profiles": list(profiles), "llm_gateway": gw_plan}
+            "profiles": list(profiles), "llm_gateway": gw_plan,
+            "container_agent_env": str(container_agent_env_path(manifest.division_id))}
     if dry_run:
+        # Render the containerized agent env too, from what is known without docker: the
+        # persisted store/model ids (empty before the first real run) and the stored
+        # gateway key, if any. A real run rewrites it with the provisioned values.
+        st = _load_state(manifest.division_id)
+        nv = load_root_env(ROOT).get("NVIDIA_API_KEY") or os.environ.get("NVIDIA_API_KEY", "")
+        write_container_agent_env(manifest, render_container_agent_env(
+            manifest, ports, secretz, st.get("store_id", ""), st.get("model_id", ""), nv,
+            llm_gateway_key=secretz.get("llm_gateway_key")))
         log(f"[dry-run] rendered stack env for '{manifest.division_id}' -> {stack_env_path.relative_to(ROOT)}")
         if gw_plan:
             spec = gw_plan["key_spec"]
@@ -826,7 +913,8 @@ def onboard(manifest_path: str | Path, no_neo4j: bool = False, dry_run: bool = F
                 f"agent OPENAI_API_BASE={gw_plan['agent_base']}")
             log(f"[dry-run] llm_gateway: virtual key for residency={manifest.residency_mode}: "
                 f"models={spec['models']} aliases={spec.get('aliases', {})}; "
-                f"local upstream={gw_plan['local_llm_base']}")
+                f"local upstream={gw_plan['local_llm_base']} "
+                f"local embeddings={gw_plan['local_embed_base']}")
         else:
             log("[dry-run] llm_gateway: off (agent talks to the provider directly)")
         return plan

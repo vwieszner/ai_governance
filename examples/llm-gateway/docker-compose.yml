@@ -35,6 +35,9 @@ services:
       NVIDIA_API_KEY: ${NVIDIA_API_KEY:-stub}
       LOCAL_LLM_BASE: ${LOCAL_LLM_BASE:-http://stub-local:8000/v1}
       LOCAL_LLM_KEY: ${LOCAL_LLM_KEY:-stub}
+      # In-boundary embeddings (model group local/nv-embedqa-e5-v5); demo = the local stub.
+      LOCAL_EMBED_BASE: ${LOCAL_EMBED_BASE:-http://stub-local:8000/v1}
+      LOCAL_EMBED_KEY: ${LOCAL_EMBED_KEY:-stub}
     depends_on:
       gateway-db:
         condition: service_healthy
