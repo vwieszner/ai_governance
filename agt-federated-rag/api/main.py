@@ -545,8 +545,8 @@ def _disabled_key(sub: str) -> str:
 
 
 def _not_before_key(sub: str) -> str:
-    # Set on re-enable: tokens with iat < this epoch second are refused. No TTL (it must
-    # outlive every token minted before the re-enable).
+    # Set on re-enable to the DISABLE time: tokens with iat <= it are refused. No TTL (it
+    # must outlive every token minted before the disable).
     return f"agt:token-nbf:{settings.division_id}:{sub}"
 
 
@@ -554,8 +554,8 @@ async def _account_refusal(sub: str, iat: Any) -> str | None:
     """None if the token's subject may proceed; else "disabled" or "stale_token".
 
     One Redis round trip. Fails CLOSED (503) on a store error. A re-enabled account's
-    token is accepted only if its ``iat`` is at/after the re-enable time; a token with no
-    usable ``iat`` is refused for such an account (cannot prove it is fresh).
+    token is accepted only if its ``iat`` is AFTER the disable time; a token with no usable
+    ``iat`` is refused for such an account (cannot prove it is fresh).
     """
     try:
         r = await _get_redis()
@@ -567,7 +567,7 @@ async def _account_refusal(sub: str, iat: Any) -> str | None:
         return "disabled"
     if nbf:
         try:
-            if float(iat) < float(nbf):
+            if float(iat) <= float(nbf):   # nbf = disable second; see _clear_account_disabled
                 return "stale_token"
         except (TypeError, ValueError):
             return "stale_token"
@@ -584,10 +584,17 @@ async def _mark_account_disabled(sub: str) -> None:
 
 
 async def _clear_account_disabled(sub: str) -> None:
-    """Lift the denylist AND invalidate every token minted before now (not-before marker),
-    so a pre-disable token — possibly the stolen one that prompted the disable — stays dead."""
+    """Lift the denylist AND keep every pre-disable token dead (not-before marker), so a
+    token minted before the disable — possibly the stolen one that prompted it — never
+    comes back. The cutoff is the DISABLE time (stored in the denylist entry): no token can
+    be minted between disable and enable (the IdP refuses logins for a disabled account),
+    so ``iat <= disabled_at`` is exactly "minted before the disable" at whole-second iat
+    resolution, while fresh logins after the re-enable work at once. Idempotent: a re-run
+    with no denylist entry leaves the existing marker untouched."""
     r = await _get_redis()
-    await r.set(_not_before_key(sub), str(int(time.time())))
+    disabled_at = await r.get(_disabled_key(sub))
+    if disabled_at is not None:
+        await r.set(_not_before_key(sub), str(disabled_at))
     await r.delete(_disabled_key(sub))
 
 

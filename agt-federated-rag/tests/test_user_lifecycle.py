@@ -760,7 +760,8 @@ def test_enabled_users_new_token_accepted_after_reenable(env, monkeypatch):
 
     resp = asyncio.run(main.admin_enable_user("alice", _req(), authorization=f"Bearer {admin_tok}"))
     assert resp.status_code == 200
-    new_tok = _mint(priv, "alpha-key", ISS_A, AUD_A, uid, "alice@example.com", ["member"])
+    new_tok = _mint(priv, "alpha-key", ISS_A, AUD_A, uid, "alice@example.com", ["member"],
+                     iat_offset=1)   # a real login is only possible after the enable
     _, claims = asyncio.run(main._get_bearer_token(f"Bearer {new_tok}"))
     assert claims["sub"] == uid
 
@@ -814,7 +815,8 @@ def test_pre_disable_token_stays_dead_after_reenable(env, monkeypatch):
         asyncio.run(main._get_bearer_token(f"Bearer {stolen}"))
     assert _status(ei) == 401 and ei.value.detail == "Token predates account re-enable"
 
-    fresh = _mint(priv, "alpha-key", ISS_A, AUD_A, uid, "alice@example.com", ["member"])
+    fresh = _mint(priv, "alpha-key", ISS_A, AUD_A, uid, "alice@example.com", ["member"],
+                  iat_offset=1)   # logins are refused while disabled; fresh = later second
     _, claims = asyncio.run(main._get_bearer_token(f"Bearer {fresh}"))
     assert claims["sub"] == uid
 
@@ -833,7 +835,9 @@ def test_not_before_marker_semantics():
         assert asyncio.run(main._account_refusal("u1", 1000)) is None          # never disabled
         r.kv[main._not_before_key("u1")] = "2000"
         assert asyncio.run(main._account_refusal("u1", 1999)) == "stale_token"
-        assert asyncio.run(main._account_refusal("u1", 2000)) is None
+        # same second as the DISABLE is still pre-disable (the live-found boundary bug)
+        assert asyncio.run(main._account_refusal("u1", 2000)) == "stale_token"
+        assert asyncio.run(main._account_refusal("u1", 2001)) is None
         assert asyncio.run(main._account_refusal("u1", None)) == "stale_token"  # no iat
         r.kv[main._disabled_key("u1")] = "3000"
         assert asyncio.run(main._account_refusal("u1", 9999)) == "disabled"
@@ -841,5 +845,28 @@ def test_not_before_marker_semantics():
         with pytest.raises(main.HTTPException) as ei:
             asyncio.run(main._account_refusal("u1", 9999))
         assert _status(ei) == 503
+    finally:
+        main._get_redis = orig
+
+
+def test_reenable_cutoff_is_disable_time_and_rerun_keeps_it():
+    """The marker is the DISABLE second, so a token minted in the same second as the disable
+    (or as the re-enable, when both happen in one second) stays dead; an idempotent re-run
+    of enable (no denylist entry left) does not move the marker."""
+    r = FakeRedis()
+
+    async def _get_redis():
+        return r
+
+    orig = main._get_redis
+    main._get_redis = _get_redis
+    try:
+        r.kv[main._disabled_key("u2")] = "5000"            # disabled at t=5000
+        asyncio.run(main._clear_account_disabled("u2"))     # re-enabled (any later time)
+        assert r.kv[main._not_before_key("u2")] == "5000"
+        assert asyncio.run(main._account_refusal("u2", 5000)) == "stale_token"
+        assert asyncio.run(main._account_refusal("u2", 5001)) is None
+        asyncio.run(main._clear_account_disabled("u2"))     # idempotent re-run
+        assert r.kv[main._not_before_key("u2")] == "5000"
     finally:
         main._get_redis = orig
