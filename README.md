@@ -58,7 +58,7 @@ Qdrant, and Keycloak.
 
 ```
 ui/  (React + Vite, :5173)   split-screen: alice @ Division Alpha · bob @ Division Beta
-        |  Vite proxy: /api/agt-a -> :9000   /api/agt-b -> :9100   /auth/* -> Keycloak
+        |  Vite proxy: /api/agt-alpha -> :9000   /api/agt-beta -> :9100   /auth/<id> -> Keycloak
         v
 Per division (e.g. alpha @ port_base 9000), each a SEPARATE Docker stack:
   agent (:9000)   FastAPI /query (SSE), /a2a/query (DID), /approvals, /tasks/*/result, /metrics
