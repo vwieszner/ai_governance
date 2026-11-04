@@ -45,7 +45,18 @@ a federated Finance answer are released by DIFFERENT queries. A per-user, time-w
 which origin (``local`` or a peer DID); every release is evaluated on the union of its own
 labels and the labels released from OTHER origins inside ``federation.window_seconds``.
 Same-origin accumulation across queries is deliberately not added here (each origin's own
-per-answer guard is unchanged). The ledger is in-process (per replica).
+per-answer guard is unchanged).
+
+The ledger is SHARED across replicas: :class:`RedisReleaseLedger` keeps it in the division's
+own Redis (``agt:mosaic:<division>:<principal>``; provenance only — origin, division, label
+names, local source names, never chunk text; bounded list; TTL = ``window_seconds``), so an
+HPA cannot split a user's HR and Finance releases across pods where neither sees both. If the
+store is unreachable when the guard needs history, the guard FAILS CLOSED: "no history" is
+never treated as safe — a release carrying any label is escalated
+(:func:`fail_closed_ledger_unavailable`, clearance ``mosaic-ledger-unavailable-<digest>``);
+a rule DENY stays a deny. A failed write is logged loudly and does not break the answer
+path. ``window_seconds: 0`` disables the ledger entirely (no store access). The in-process
+:class:`ReleaseLedger` remains for tests / single-process dev (``mosaic_ledger_backend``).
 
 A peer that omits labels (old envelope, guard off, malformed, or not signature-verified) is
 handled by ``federation.unlabeled_peer``: ``unknown`` (default) contributes the synthetic
@@ -57,6 +68,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import re
 import threading
 import time
@@ -66,6 +78,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
+import structlog
 import yaml
 from agent_os.policies.context_accumulation import accumulate  # type: ignore[import]
 from agent_os.policies.context_aggregation import (  # type: ignore[import]
@@ -89,6 +102,8 @@ LOCAL_ORIGIN = "local"
 UNLABELED_PEER_LABEL = "unlabeled-peer"
 UNLABELED_PEER_CLEARANCE = f"{CLEARANCE_PREFIX}unlabeled-peer"
 _MAX_PEER_LABELS = 32
+
+log = structlog.get_logger(__name__)
 
 
 class ContextAggregationConfigError(ValueError):
@@ -561,11 +576,16 @@ def evaluate_combined(local_chunks: list[dict[str, Any]], contributions: list[Co
     return replace(d, sources=tuple(dict.fromkeys(sources)))
 
 
+class LedgerUnavailableError(RuntimeError):
+    """The shared release ledger could not be read — the guard must fail closed."""
+
+
 class ReleaseLedger:
     """Per-user, time-windowed record of the labels RELEASED to a user, by origin.
 
-    In-process (per replica) and bounded. Only provenance is kept (origin, division,
-    label names, local source names) — never chunk text.
+    IN-PROCESS (per replica) and bounded — for tests / single-process dev only
+    (``mosaic_ledger_backend: memory``); production uses :class:`RedisReleaseLedger`. Only
+    provenance is kept (origin, division, label names, local source names) — never chunk text.
     """
 
     _MAX_PER_USER = 64
@@ -596,9 +616,146 @@ class ReleaseLedger:
                 self._entries.pop(user_id, None)
         return list(dict.fromkeys(c for _, c in rows if c.origin != exclude_origin))
 
+    # Async interface shared with RedisReleaseLedger (what the guard calls).
+    async def aothers(self, user_id: str, exclude_origin: str, window_seconds: int,
+                      now: float | None = None) -> list[Contribution]:
+        return self.others(user_id, exclude_origin, window_seconds, now=now)
+
+    async def arecord(self, user_id: str, contrib: Contribution, window_seconds: int,
+                      now: float | None = None) -> bool:
+        if window_seconds <= 0:
+            return False
+        self.record(user_id, contrib, now=now)
+        return True
+
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
 
 
+class RedisReleaseLedger:
+    """The release ledger in the division's Redis — one view shared by every replica.
+
+    Key ``agt:mosaic:<division_id>:<principal>`` → a list of JSON entries
+    ``{ts, origin, division, labels, sources, verified}`` (provenance only, never chunk
+    text), trimmed to the newest ``_MAX_PER_USER`` and expiring ``window_seconds`` after the
+    last write; reads also filter by timestamp, so an entry never outlives the window.
+
+    Reads RAISE :class:`LedgerUnavailableError` on any store error (the guard fails closed);
+    writes never raise — a failure is logged at ERROR with ``agt_audit`` and reported as
+    ``False`` so the answer path is not broken by a ledger outage.
+    """
+
+    _MAX_PER_USER = 64
+    _MAX_SOURCES = 20
+    KEY_PREFIX = "agt:mosaic"
+
+    def __init__(self, redis_url: str, division_id: str, client: Any = None,
+                 timeout_seconds: float = 2.0) -> None:
+        self._url = redis_url
+        self._division = division_id
+        self._client = client
+        self._timeout = timeout_seconds
+
+    def _redis(self) -> Any:
+        if self._client is None:
+            import redis.asyncio as aioredis   # same lazy pattern as approval_index/outcome_store
+            self._client = aioredis.from_url(
+                self._url, decode_responses=True,
+                socket_connect_timeout=self._timeout, socket_timeout=self._timeout)
+        return self._client
+
+    def key(self, user_id: str) -> str:
+        return f"{self.KEY_PREFIX}:{self._division}:{user_id}"
+
+    async def aothers(self, user_id: str, exclude_origin: str, window_seconds: int,
+                      now: float | None = None) -> list[Contribution]:
+        if window_seconds <= 0:
+            return []                          # ledger disabled: the store is not touched
+        try:
+            raw = await self._redis().lrange(self.key(user_id), 0, -1)
+        except Exception as exc:
+            raise LedgerUnavailableError(f"{type(exc).__name__}: {exc}"[:300]) from exc
+        ts = time.time() if now is None else now
+        out: list[Contribution] = []
+        for item in raw or ():
+            try:
+                row = json.loads(item)
+                if ts - float(row["ts"]) > window_seconds or row["origin"] == exclude_origin:
+                    continue
+                labels = row.get("labels")
+                out.append(Contribution(
+                    origin=str(row["origin"]), division=str(row.get("division") or ""),
+                    labels=None if labels is None else frozenset(map(str, labels)),
+                    sources=tuple(map(str, row.get("sources") or ())),
+                    verified=bool(row.get("verified", True))))
+            except Exception:
+                log.warning("mosaic_ledger_entry_malformed", key=self.key(user_id))
+        return list(dict.fromkeys(out))
+
+    async def arecord(self, user_id: str, contrib: Contribution, window_seconds: int,
+                      now: float | None = None) -> bool:
+        if window_seconds <= 0:
+            return False
+        entry = json.dumps({
+            "ts": time.time() if now is None else now,
+            "origin": contrib.origin, "division": contrib.division,
+            "labels": None if contrib.labels is None else sorted(contrib.labels),
+            "sources": [s[:200] for s in contrib.sources[:self._MAX_SOURCES]],
+            "verified": contrib.verified})
+        key = self.key(user_id)
+        try:
+            pipe = self._redis().pipeline(transaction=True)
+            pipe.rpush(key, entry)
+            pipe.ltrim(key, -self._MAX_PER_USER, -1)
+            pipe.expire(key, window_seconds)
+            await pipe.execute()
+            return True
+        except Exception as exc:
+            log.error("mosaic_ledger_record_failed", key=key, origin=contrib.origin,
+                      labels=sorted(contrib.labels or ()), error=str(exc)[:300],
+                      agt_audit=True)
+            return False
+
+    def clear(self) -> None:
+        """No-op: the shared store is never flushed from a replica (entries self-expire)."""
+
+
 LEDGER = ReleaseLedger()
+_REDIS_LEDGERS: dict[tuple[str, str], RedisReleaseLedger] = {}
+
+
+def active_ledger(backend: str, redis_url: str, division_id: str) -> Any:
+    """The ledger the guard uses: the shared Redis one (default) or the in-process one."""
+    if backend == "memory":
+        return LEDGER
+    k = (redis_url, division_id)
+    if k not in _REDIS_LEDGERS:
+        _REDIS_LEDGERS[k] = RedisReleaseLedger(redis_url, division_id)
+    return _REDIS_LEDGERS[k]
+
+
+def ledger_unavailable_clearance_id(labels: Iterable[str]) -> str:
+    digest = hashlib.sha256("|".join(sorted(labels)).encode()).hexdigest()[:12]
+    return f"{CLEARANCE_PREFIX}ledger-unavailable-{digest}"
+
+
+def fail_closed_ledger_unavailable(d: GuardDecision) -> GuardDecision:
+    """Fail-closed rewrite of a decision made WITHOUT release history (store unreachable).
+
+    "No history" is never treated as safe: a release that carries any label (incl. the
+    synthetic ``unlabeled-peer``) could complete a cross-origin mosaic we can no longer see,
+    so it ESCALATES to the existing approval path, needing a clearance specific to its label
+    set. A DENY stays a deny; a release with no labels adds nothing to any combination and
+    passes unchanged.
+    """
+    if d.outcome == Outcome.DENY or not d.labels:
+        return d
+    note = (f"release history unavailable (ledger store unreachable); this release: "
+            f"{_fmt_labels(d.labels)}")
+    return replace(
+        d, outcome=Outcome.ESCALATE,
+        reason=d.reason if d.outcome == Outcome.ESCALATE else "ledger_unavailable:escalate",
+        clearance_ids=tuple(dict.fromkeys(
+            d.clearance_ids + (ledger_unavailable_clearance_id(d.labels),))),
+        sources=tuple(dict.fromkeys(d.sources + (note,))))

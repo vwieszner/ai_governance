@@ -707,15 +707,28 @@ async def _guard_context_combination(
     origin = peer.origin if peer is not None else cg.LOCAL_ORIGIN
     cfg: Any = None
     contributions: list[Any] = [peer] if peer is not None else []
+    # Shared across replicas (division Redis) by default; window_seconds 0 → never touched.
+    ledger = cg.active_ledger(settings.mosaic_ledger_backend, settings.redis_url,
+                              settings.division_id)
+    ledger_state = "ok"
     try:
         cfg = cg.load_config(policy)
     except cg.ContextAggregationConfigError as exc:
         decision = cg.GuardDecision(cg.Outcome.DENY, f"config_error: {exc}"[:300])
     else:
-        contributions += cg.LEDGER.others(state["user_id"], origin, cfg.window_seconds)
+        try:
+            contributions += await ledger.aothers(state["user_id"], origin,
+                                                  cfg.window_seconds)
+        except cg.LedgerUnavailableError as exc:
+            # FAIL CLOSED: unknown history is not "no history" — escalate labelled releases.
+            ledger_state = "unavailable"
+            log.error("mosaic_ledger_unavailable", user_id=state["user_id"], origin=origin,
+                      error=str(exc), fail_closed="escalate", agt_audit=True)
         decision = cg.evaluate_combined(context_chunks, contributions, cfg,
                                         workflow_id=str(state.get("task_id") or ""),
                                         local_division=settings.division_id)
+        if ledger_state == "unavailable":
+            decision = cg.fail_closed_ledger_unavailable(decision)
     audit = dict(
         user_id=state["user_id"],
         action="context.aggregate",
@@ -725,6 +738,7 @@ async def _guard_context_combination(
         rules=list(decision.rules_applied),
         count=len(context_chunks),
         origin=origin,
+        ledger=ledger_state,
         # Which labels came from peers: label names + peer DID only (never content).
         peer_labels=[
             {"peer_did": c.origin,
@@ -734,16 +748,17 @@ async def _guard_context_combination(
         agt_audit=True,
     )
 
-    def _record_release() -> None:
+    async def _record_release() -> None:
         entry = (peer if peer is not None
                  else cg.local_release(context_chunks, cfg, settings.division_id))
         if entry is not None:
-            cg.LEDGER.record(state["user_id"], entry)
+            # Never raises: a store outage is logged loudly (mosaic_ledger_record_failed).
+            await ledger.arecord(state["user_id"], entry, cfg.window_seconds)
 
     if decision.outcome == cg.Outcome.ALLOW:
         log.info("context_aggregation_decision", decision="allow", **audit)
         if cfg is not None:
-            _record_release()
+            await _record_release()
         return None
 
     if decision.outcome == cg.Outcome.DENY:
@@ -760,7 +775,7 @@ async def _guard_context_combination(
                  if clearance.get(cid) != AuthzDecision.ALLOWED]
     if not uncleared:
         log.info("context_aggregation_decision", decision="cleared", **audit)
-        _record_release()
+        await _record_release()
         return None
     log.warning("context_aggregation_decision", decision="escalate",
                 pending=len(uncleared), sources=list(decision.sources), **audit)
