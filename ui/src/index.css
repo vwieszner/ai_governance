@@ -609,6 +609,7 @@ button { font-family: inherit; font-size: inherit; }
 .approval-item:first-of-type { border-top: none; }
 .approval-item-text { font-size: 12px; color: var(--text-muted); line-height: 1.4; }
 .approval-query { display: block; color: var(--text); margin-top: 2px; }
+.approval-sources { display: block; font-size: 11px; opacity: 0.8; margin-top: 2px; overflow-wrap: anywhere; }
 .approval-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .btn-approve, .btn-deny {
   border: none;

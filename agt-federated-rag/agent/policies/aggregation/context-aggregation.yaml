@@ -58,3 +58,18 @@ rules:
 backstop:
   n_category_threshold: 3
   outcome: escalate
+
+# Federated answers. A peer division returns the LABEL NAMES of the chunks behind its answer
+# inside its DID-signed /a2a/query response; only labels from a signature-verified response
+# count. Every release (local or peer) is evaluated on its own labels + the labels released to
+# the same user from OTHER origins (local / other peers) within `window_seconds` — so local HR
+# then federated Finance (or the reverse) hits the hr-finance rule. 0 = no cross-query memory.
+#   unlabeled_peer — a peer answer WITHOUT verified labels (old envelope, peer guard off,
+#                    malformed, unverified):
+#     unknown  (default) adds the synthetic label `unlabeled-peer` (counts toward rules and
+#              the backstop — never treated as "no labels");
+#     escalate requires the `chunk:mosaic-unlabeled-peer` clearance (approval workflow);
+#     deny     withholds the peer answer.
+federation:
+  unlabeled_peer: unknown
+  window_seconds: 900

@@ -29,13 +29,38 @@ Outcomes (per rule, from config):
 
 Fail-closed: a missing/invalid config yields a DENY decision (never a silent allow).
 An explicitly empty ``context_aggregation_policy`` setting disables the guard.
+
+Federated answers (cross-division mosaic)
+-----------------------------------------
+A peer division's answer arrives as TEXT over the DID-signed /a2a/query channel, so the
+requesting agent cannot label it from chunk metadata. Instead the ANSWERING peer labels the
+chunks it used with this same deterministic classifier (:func:`chunk_labels`) and returns
+the label NAMES inside its signed response envelope (``data_labels``; never chunk text/ids).
+The requesting agent folds those labels — only from a signature-verified response — into
+the same evaluation as a :class:`Contribution`.
+
+Because the graph consults a peer only when local retrieval is empty, a local HR answer and
+a federated Finance answer are released by DIFFERENT queries. A per-user, time-windowed
+:class:`ReleaseLedger` therefore remembers which labels were released to the user and from
+which origin (``local`` or a peer DID); every release is evaluated on the union of its own
+labels and the labels released from OTHER origins inside ``federation.window_seconds``.
+Same-origin accumulation across queries is deliberately not added here (each origin's own
+per-answer guard is unchanged). The ledger is in-process (per replica).
+
+A peer that omits labels (old envelope, guard off, malformed, or not signature-verified) is
+handled by ``federation.unlabeled_peer``: ``unknown`` (default) contributes the synthetic
+label ``unlabeled-peer`` — it is never silently treated as "no labels" and counts toward the
+AGT backstop — ``escalate`` requires the ``mosaic-unlabeled-peer`` clearance, ``deny``
+withholds.
 """
 from __future__ import annotations
 
 import fnmatch
 import hashlib
 import re
-from dataclasses import dataclass, field
+import threading
+import time
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -58,6 +83,12 @@ _PKG_ROOT = Path(__file__).resolve().parents[1]
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 _LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 CLEARANCE_PREFIX = "mosaic-"
+LOCAL_ORIGIN = "local"
+# Synthetic label for a peer contribution whose labels are absent / unverified / malformed
+# (``federation.unlabeled_peer: unknown``). Participates in rules + the backstop like any label.
+UNLABELED_PEER_LABEL = "unlabeled-peer"
+UNLABELED_PEER_CLEARANCE = f"{CLEARANCE_PREFIX}unlabeled-peer"
+_MAX_PEER_LABELS = 32
 
 
 class ContextAggregationConfigError(ValueError):
@@ -92,10 +123,15 @@ class GuardConfig:
     rule_outcomes: dict[str, Outcome]
     n_category_threshold: int
     backstop_outcome: Outcome
+    # Federation: how a peer answer WITHOUT verified labels is treated, and how long a
+    # released answer's labels count toward the user's cross-origin accumulation.
+    unlabeled_peer: str = "unknown"          # unknown | escalate | deny
+    window_seconds: int = 900
 
 
 _TOP_KEYS = {"version", "name", "description", "enabled", "default_classification",
-             "classifiers", "rules", "backstop"}
+             "classifiers", "rules", "backstop", "federation"}
+_UNLABELED_MODES = ("unknown", "escalate", "deny")
 
 
 def _classification(value: Any, where: str) -> DataClassification:
@@ -206,10 +242,22 @@ def parse_config(doc: Any) -> GuardConfig:
             "backstop.n_category_threshold must be 0 (disabled) or an int >= 2")
     backstop_outcome = _outcome(backstop.get("outcome", "escalate"), "backstop.outcome")
 
+    fed = doc.get("federation") or {}
+    if not isinstance(fed, dict) or set(fed) - {"unlabeled_peer", "window_seconds"}:
+        raise ContextAggregationConfigError("federation: invalid mapping")
+    unlabeled = fed.get("unlabeled_peer", "unknown")
+    if unlabeled not in _UNLABELED_MODES:
+        raise ContextAggregationConfigError(
+            f"federation.unlabeled_peer must be one of {', '.join(_UNLABELED_MODES)}")
+    window = fed.get("window_seconds", 900)
+    if not isinstance(window, int) or isinstance(window, bool) or window < 0:
+        raise ContextAggregationConfigError("federation.window_seconds must be an int >= 0")
+
     return GuardConfig(
         enabled=enabled, default_classification=default_cls, classifiers=tuple(classifiers),
         ruleset=AggregationRuleSet(rules=tuple(rules)), rule_outcomes=outcomes,
         n_category_threshold=threshold, backstop_outcome=backstop_outcome,
+        unlabeled_peer=unlabeled, window_seconds=window,
     )
 
 
@@ -297,6 +345,10 @@ class GuardDecision:
     # chunk_ids whose labels participate in a triggering rule / the backstop.
     contributing_chunk_ids: tuple[str, ...] = ()
     envelope_ref: Any = field(default=None, compare=False)
+    # Human-readable provenance of the contributing context (source names + labels for
+    # local chunks; division + DID + labels for peer contributions) — set by
+    # :func:`evaluate_combined` so an approver never approves a combination blind.
+    sources: tuple[str, ...] = ()
 
 
 def backstop_clearance_id(labels: Iterable[str]) -> str:
@@ -363,3 +415,190 @@ def evaluate(chunks: list[dict[str, Any]], policy_path: str,
     except ContextAggregationConfigError as exc:
         return GuardDecision(Outcome.DENY, f"config_error: {exc}"[:300])
     return evaluate_chunks(chunks, cfg, workflow_id)
+
+
+# ── Federation: peer-reported labels + cross-origin release ledger ─────────────
+
+
+def chunk_labels(chunks: list[dict[str, Any]], policy_path: str) -> list[str] | None:
+    """Label NAMES of the chunks an answer was generated from (the ANSWERING peer's side).
+
+    Returned inside the DID-signed /a2a/query response so the requesting division can
+    evaluate the cross-division combination. Labels only — never chunk text or ids.
+    ``None`` (→ the field is omitted, the requester applies its unlabeled-peer fail mode)
+    when the guard is switched off by an empty path or the policy cannot be loaded.
+    """
+    if not policy_path:
+        return None
+    try:
+        cfg = load_config(policy_path)
+    except ContextAggregationConfigError:
+        return None
+    out: set[str] = set()
+    for c in chunks:
+        out |= label_chunk(c.get("metadata") or {}, cfg)[0]
+    return sorted(out)
+
+
+def validate_peer_labels(raw: Any) -> frozenset[str] | None:
+    """Strictly parse a peer-reported ``data_labels`` value; ``None`` = treat as unlabeled.
+
+    Anything other than a bounded list of well-formed label strings (absent field from an
+    old-envelope peer, wrong type, junk entries) is NOT trusted as "no labels".
+    """
+    if not isinstance(raw, list) or len(raw) > _MAX_PEER_LABELS:
+        return None
+    out: set[str] = set()
+    for lab in raw:
+        if not isinstance(lab, str) or not _LABEL_RE.match(lab):
+            return None
+        out.add(lab)
+    return frozenset(out)
+
+
+@dataclass(frozen=True)
+class Contribution:
+    """Context released (or about to be released) to the user that is NOT a local chunk of
+    the current query: a peer answer, or an earlier release recorded in the ledger."""
+
+    origin: str                              # LOCAL_ORIGIN or the peer's verified DID
+    division: str = ""
+    labels: frozenset[str] | None = None     # None = unlabeled (see federation.unlabeled_peer)
+    sources: tuple[str, ...] = ()            # local source names (never for peers)
+    verified: bool = True                    # labels came from a signature-verified response
+
+    def effective_labels(self) -> frozenset[str] | None:
+        return self.labels if self.verified else None
+
+
+def _source_name(md: dict[str, Any]) -> str:
+    raw = str((md or {}).get("source") or "")
+    return re.split(r"[\\/]", raw)[-1] if raw else ""
+
+
+def local_release(chunks: list[dict[str, Any]], cfg: GuardConfig,
+                  division: str = "") -> Contribution | None:
+    """Ledger entry for released LOCAL chunks (labelled chunks only), or None."""
+    labels: set[str] = set()
+    sources: list[str] = []
+    for c in chunks:
+        md = c.get("metadata") or {}
+        labs = label_chunk(md, cfg)[0]
+        if labs:
+            labels |= labs
+            name = _source_name(md)
+            if name and name not in sources:
+                sources.append(name)
+    if not labels:
+        return None
+    return Contribution(origin=LOCAL_ORIGIN, division=division, labels=frozenset(labels),
+                        sources=tuple(sources))
+
+
+def _fmt_labels(labels: Iterable[str]) -> str:
+    return "[" + ", ".join(sorted(labels)) + "]"
+
+
+def evaluate_combined(local_chunks: list[dict[str, Any]], contributions: list[Contribution],
+                      cfg: GuardConfig, workflow_id: str = "",
+                      local_division: str = "") -> GuardDecision:
+    """Evaluate local chunks of this query + peer / earlier-release contributions TOGETHER.
+
+    Each contribution is folded into the same AGT envelope as a synthetic chunk carrying its
+    labels, so the existing rules + backstop decide on the union. An unlabeled contribution
+    follows ``cfg.unlabeled_peer``. A non-ALLOW decision carries ``sources`` (provenance of
+    the contributing context) for the approval request.
+    """
+    if not cfg.enabled:
+        return GuardDecision(Outcome.ALLOW, "guard_disabled")
+    chunks = list(local_chunks)
+    synth: dict[str, Contribution] = {}
+    unlabeled_ids: list[str] = []
+    for i, contrib in enumerate(contributions):
+        cid = f"contrib:{i}"
+        labs = contrib.effective_labels()
+        if labs is None:
+            unlabeled_ids.append(cid)
+            labs = (frozenset({UNLABELED_PEER_LABEL}) if cfg.unlabeled_peer == "unknown"
+                    else frozenset())
+        synth[cid] = replace(contrib, labels=labs, verified=True)
+        chunks.append({"chunk_id": cid, "metadata": {"data_labels": sorted(labs)}})
+
+    d = evaluate_chunks(chunks, cfg, workflow_id)
+    if unlabeled_ids and cfg.unlabeled_peer == "deny" and d.outcome != Outcome.DENY:
+        d = replace(d, outcome=Outcome.DENY, reason="unlabeled_peer:deny", clearance_ids=(),
+                    contributing_chunk_ids=tuple(sorted(set(d.contributing_chunk_ids)
+                                                        | set(unlabeled_ids))))
+    elif unlabeled_ids and cfg.unlabeled_peer == "escalate" and d.outcome != Outcome.DENY:
+        d = replace(
+            d, outcome=Outcome.ESCALATE,
+            reason=d.reason if d.outcome == Outcome.ESCALATE else "unlabeled_peer:escalate",
+            clearance_ids=tuple(dict.fromkeys(d.clearance_ids + (UNLABELED_PEER_CLEARANCE,))),
+            contributing_chunk_ids=tuple(sorted(set(d.contributing_chunk_ids)
+                                                | set(unlabeled_ids))))
+    if d.outcome == Outcome.ALLOW:
+        return d
+
+    ids = set(d.contributing_chunk_ids)
+    sources: list[str] = []
+    here = local_division or LOCAL_ORIGIN
+    for c in local_chunks:
+        if str(c.get("chunk_id")) in ids:
+            md = c.get("metadata") or {}
+            sources.append(f"{here}: {_source_name(md) or c.get('chunk_id')} "
+                           f"{_fmt_labels(label_chunk(md, cfg)[0])}")
+    for cid, contrib in synth.items():
+        if cid not in ids:
+            continue
+        if contrib.origin == LOCAL_ORIGIN:
+            names = ", ".join(contrib.sources) or "earlier answer"
+            sources.append(f"{contrib.division or here} (earlier answer): {names} "
+                           f"{_fmt_labels(contrib.labels or ())}")
+        else:
+            tag = " (unlabeled/unverified)" if cid in unlabeled_ids else ""
+            sources.append(f"peer {contrib.division or 'unknown-division'} ({contrib.origin})"
+                           f"{tag}: {_fmt_labels(contrib.labels or ())}")
+    return replace(d, sources=tuple(dict.fromkeys(sources)))
+
+
+class ReleaseLedger:
+    """Per-user, time-windowed record of the labels RELEASED to a user, by origin.
+
+    In-process (per replica) and bounded. Only provenance is kept (origin, division,
+    label names, local source names) — never chunk text.
+    """
+
+    _MAX_PER_USER = 64
+
+    def __init__(self) -> None:
+        self._entries: dict[str, list[tuple[float, Contribution]]] = {}
+        self._lock = threading.Lock()
+
+    def record(self, user_id: str, contrib: Contribution, now: float | None = None) -> None:
+        ts = time.time() if now is None else now
+        with self._lock:
+            rows = self._entries.setdefault(user_id, [])
+            rows.append((ts, contrib))
+            del rows[:-self._MAX_PER_USER]
+
+    def others(self, user_id: str, exclude_origin: str, window_seconds: int,
+               now: float | None = None) -> list[Contribution]:
+        """Releases to *user_id* from origins other than *exclude_origin* within the window."""
+        if window_seconds <= 0:
+            return []
+        ts = time.time() if now is None else now
+        with self._lock:
+            rows = [(t, c) for t, c in self._entries.get(user_id, [])
+                    if ts - t <= window_seconds]
+            if rows:
+                self._entries[user_id] = rows
+            else:
+                self._entries.pop(user_id, None)
+        return list(dict.fromkeys(c for _, c in rows if c.origin != exclude_origin))
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+LEDGER = ReleaseLedger()

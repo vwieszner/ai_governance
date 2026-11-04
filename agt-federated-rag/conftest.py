@@ -49,6 +49,18 @@ if not _ENV_FILE.exists():
         os.environ.setdefault(_field.upper(), _val)
 
 
+@pytest.fixture(autouse=True)
+def _reset_mosaic_release_ledger():
+    """The mosaic guard's per-user release ledger is process-global; isolate every test."""
+    mod = sys.modules.get("agent.context_guard")
+    if mod is not None:
+        mod.LEDGER.clear()
+    yield
+    mod = sys.modules.get("agent.context_guard")
+    if mod is not None:
+        mod.LEDGER.clear()
+
+
 @pytest.fixture
 def make_settings():
     """Return a factory that builds a hermetic Settings (no env file, no infra).

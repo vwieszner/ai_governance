@@ -1392,8 +1392,9 @@ async def a2a_query(request: Request) -> JSONResponse:
 
     Response: a DID-SIGNED JSON object (sign_outbound_message) so the caller can
     verify it came from this cluster's private key. Shape:
-        {status, answer, task_id, approval_request_id, _agentmesh}
-    where status ∈ {"completed", "input_required", "failed"}.
+        {status, answer, task_id, approval_request_id, [data_labels], _agentmesh}
+    where status ∈ {"completed", "input_required", "failed"}; ``data_labels`` (label
+    names of the chunks behind a completed answer, for the requester's mosaic guard).
     """
     # Kill-switch (FR-4.3): halt the WHOLE division's governed path, not just the user
     # /query surface — refuse inbound cross-division requests before any work. Consults
@@ -1559,7 +1560,18 @@ async def a2a_query(request: Request) -> JSONResponse:
             "task_id": task_id,
         }
 
-    # ── Map the pipeline outcome to a peer-protocol status ───────────────────
+    response_payload = _a2a_query_response_payload(result, task_id)
+    peer_status = response_payload["status"]
+
+    # Sign the response so the caller can verify it came from this cluster.
+    signed_response = await agent_identity.sign_outbound_message(response_payload)
+    log.info("a2a_query_responding", task_id=task_id, status=peer_status,
+             data_labels=response_payload.get("data_labels"))
+    return JSONResponse(content=signed_response)
+
+
+def _a2a_query_response_payload(result: dict[str, Any], task_id: str) -> dict[str, Any]:
+    """Map the governed pipeline outcome to the (to-be-signed) /a2a/query response body."""
     # approval_request_id is checked FIRST: format_response overwrites a None
     # answer with the status_message, so the pending-approval case (flow B/D on
     # this cluster) returns a non-empty answer — keying on answer-presence would
@@ -1584,11 +1596,15 @@ async def a2a_query(request: Request) -> JSONResponse:
         "task_id": result.get("task_id", task_id),
         "approval_request_id": approval_request_id,
     }
-
-    # Sign the response so the caller can verify it came from this cluster.
-    signed_response = await agent_identity.sign_outbound_message(response_payload)
-    log.info("a2a_query_responding", task_id=task_id, status=peer_status)
-    return JSONResponse(content=signed_response)
+    # Mosaic guard (cross-division): the LABEL NAMES of the chunks this answer was built
+    # from, inside the SIGNED envelope, so the requesting division can evaluate the
+    # combination with what it released to the user locally. Labels only — no chunk text
+    # or ids. Omitted when unknown (policy off/unloadable); the requester then applies its
+    # unlabeled-peer fail mode (never "no labels").
+    labels = result.get("data_labels")
+    if peer_status == "completed" and isinstance(labels, list):
+        response_payload["data_labels"] = labels
+    return response_payload
 
 
 # ── POST /a2a/tool ─────────────────────────────────────────────────────────────
@@ -2167,7 +2183,8 @@ async def list_pending_approvals(
     is eventually-consistent + O(open requests) — it lagged/stalled the inbox; the index
     removes that dependency. Temporal remains the source of truth for the decision itself.)
 
-    Returns ``{"pending": [{"request_id", "requester_id", "query"}]}``.
+    Returns ``{"pending": [{"request_id", "requester_id", "query", "sources"}]}`` —
+    ``sources`` = contributing source names / labels (never content).
     """
     _, claims = await _get_bearer_token(authorization)
     try:
@@ -2183,7 +2200,8 @@ async def list_pending_approvals(
     items = await approval_index.list_for(caller)
     pending = [{"request_id": it.get("request_id", ""),
                 "requester_id": it.get("requester_id", ""),
-                "query": it.get("query", "")} for it in items]
+                "query": it.get("query", ""),
+                "sources": it.get("sources", [])} for it in items]
     return JSONResponse(content={"pending": pending}, status_code=200)
 
 

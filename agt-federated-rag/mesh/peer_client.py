@@ -116,6 +116,11 @@ class PeerResponse:
     task_id: str
     peer_did: str
     trust_score: float
+    # Mosaic guard: label NAMES of the chunks behind the peer's answer, read from the
+    # SIGNED response envelope (None = the peer sent none, e.g. an old-envelope peer).
+    data_labels: list[str] | None = None
+    # True only when data_labels came from a response whose signature verified as peer_did.
+    labels_verified: bool = False
 
 
 @dataclass
@@ -376,12 +381,17 @@ async def call_peer_agent(
     )
 
     log.info("peer_call_success", peer_did=peer_did, status=response.get("status"))
+    # _deliver_signed_payload raised unless the response signature verified with signer ==
+    # peer_did, so a data_labels field read here is covered by that signature.
+    raw_labels = response.get("data_labels")
     return PeerResponse(
         status=str(response.get("status", "unknown")),
         answer=response.get("answer"),
         task_id=str(response.get("task_id", "")),
         peer_did=peer_did,
         trust_score=float(response.get("_trust_score", 0.0)),
+        data_labels=list(raw_labels) if isinstance(raw_labels, list) else None,
+        labels_verified=isinstance(raw_labels, list),
     )
 
 

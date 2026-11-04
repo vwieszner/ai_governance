@@ -37,12 +37,18 @@ def _key(approver: str) -> str:
     return f"approvals:pending:{settings.division_id}:{approver}"
 
 
-async def record(approver: str, request_id: str, requester_id: str, query: str) -> None:
-    """Add a pending request to the approver's inbox set (called from start_approval)."""
+async def record(approver: str, request_id: str, requester_id: str, query: str,
+                 sources: list[str] | None = None) -> None:
+    """Add a pending request to the approver's inbox set (called from start_approval).
+
+    ``sources`` are the contributing source NAMES / labels (never content) the approver is
+    shown — for a mosaic clearance, the local documents and peer divisions + labels whose
+    combination needs approval. Bounded so a pathological list can't bloat the index."""
     try:
         r = await _get_redis()
         payload = json.dumps({"request_id": request_id, "requester_id": requester_id,
-                              "query": query[:500]})
+                              "query": query[:500],
+                              "sources": [str(s)[:300] for s in (sources or [])[:20]]})
         await r.hset(_key(approver), request_id, payload)
         # bound the lifetime so an abandoned entry can't linger forever
         await r.expire(_key(approver), settings.approval_timeout_seconds + 3600)

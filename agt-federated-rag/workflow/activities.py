@@ -42,7 +42,7 @@ from __future__ import annotations
 import hashlib
 import hmac as hmac_lib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -77,6 +77,8 @@ class NotifyApproverInput:
     approver_slack_id: str | None
     approver_email: str | None
     # callback_url is generated inside the activity with HMAC signing, never passed in
+    # Contributing source names / labels (never content) — see ApprovalInput.sources.
+    sources: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -223,6 +225,8 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
 
     chunk_preview = ", ".join(inp.chunk_ids[:5])
     extra = f" (+{len(inp.chunk_ids) - 5} more)" if len(inp.chunk_ids) > 5 else ""
+    sources_line = (f"\nContributing sources: {'; '.join(inp.sources[:10])}"
+                    if inp.sources else "")
 
     blocks = [
         {
@@ -233,6 +237,7 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
                     f"*Access request from user `{inp.user_id}`*\n"
                     f"Query: _{display_query}_\n"
                     f"Chunks requested: `{chunk_preview}`{extra}"
+                    f"{sources_line}"
                 ),
             },
         },
