@@ -39,8 +39,20 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
 - **Fixed — agent could not start with `require_mtls` + CRL/OCSP** (pre-existing): truststore's
   `ssl.SSLContext` rebind made uvicorn reject the genuine serving context (TypeError). Proven
   live: `api.main.run()` with mTLS + CRL starts, cert → 200, no cert → refused.
-- **Still open:** the absent-field policy gap and the `localhost` SSRF question (decisions);
-  live stacks/k8s/real NIM on the host.
+- **Closed later the same day:**
+  - **Absent-field gap:** `agent/nodes._enforce` now refuses an action whose `REQUIRED_CONTEXT`
+    is missing (fail closed); an AST test pins that every call site sends those fields.
+  - **SSRF `localhost`:** loopback is refused by name as well as IP (`rag/egress_guard.py`);
+    the agent reaches the LLM gateway as `llm-gateway.internal`.
+  - **Mosaic ledger shared across replicas:** Redis-backed, fails closed (escalate) when Redis
+    is unreachable; outage clearances are always time-bound.
+  - **CI:** UI job on Node 22 (Node 18 broke `npm test` on main since June); supply-chain
+    `trivy-action` pinned by SHA to v0.36.0 (0.28.0 vanished in the March 2026 Trivy compromise).
+- **Inert deny rules (found by the call-site inventory; need the value wired, not a flag):**
+  `block-code-execution` + `block-filesystem-writes` (`tool_category`, never sent on
+  `mcp.call`), `block-low-trust-agents` (`agent_trust_score`), `cap-chunk-retrieval`
+  (`requested_chunk_count`). No call site computes these fields today.
+- **Still open:** live stacks/k8s/real NIM on the host; why GitHub Actions did not run on PR #1.
 
 ### Update log — 2026-11-03 (AGT 5.0, supply chain, LLM gateway)
 - **AGT 3.7 → 5.0.** The six per-component packages became `agent-governance-toolkit-core` +
@@ -59,11 +71,9 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
   `prove_gateway.py` 11/11 live, now a blocking CI job. Wired into the division deployments as
   an opt-in (Compose manifest `llm_gateway: true`; k8s `bootstrap_k8s.py --llm-gateway`). Gateway
   part proven live on a rendered division stack against stubs; no full cluster run yet.
-- **Open, needs a decision:**
-  - Absent-field gap: a deny rule whose field is missing does not fire (e.g. `peer.send_message`
-    with no `peer_*` fields is allowed). Latent: every call site sends them. Pinned by
-    `test_absent_field_semantics_are_pinned`.
-  - The embedding SSRF guard refuses `127.0.0.1` but not `localhost`.
+- **Open, needs a decision:** (both resolved 2026-11-04 — see the entry above)
+  - ~~Absent-field gap~~ — required governance context enforced in `_enforce`.
+  - ~~SSRF guard refuses `127.0.0.1` but not `localhost`~~ — loopback refused by name too.
 - **Blocked upstream:** the AgentControl migration and AGT policy at the gateway wait on ACS 0.4
   reaching PyPI (`agt migrate` does not convert this repo's rule YAMLs).
 - **Not re-verified in this pass:** live division stacks, `prove_live.py`, k8s, the UI.
@@ -319,7 +329,7 @@ Still open: a true third-party pen-test. Probes + write-ups:
 
 ## Test reality
 
-- Full backend suite: **531 passed, 8 skipped** (2026-11-04, all merged work; UI `npm test` 14 passed + build). Before that: **404 passed, 8 skipped** (2026-11-03, on AGT 5.0, Python 3.11 and 3.12 —
+- Full backend suite: **546 passed, 8 skipped** (2026-11-04, all merged work; UI `npm test` 14 passed + build). Before that: **404 passed, 8 skipped** (2026-11-03, on AGT 5.0, Python 3.11 and 3.12 —
   incl. the new 27-row policy decision matrix). Earlier: **343 passed, 1 skipped** (as of 2026-06-19, post Wave-7 cross-agent tool
   delegation + its F2 security-review fix; was **252 passed, 2 skipped** at the 2026-06-17 audit,
   itself up from 138/2 at first audit — the growth is this session's retriever feature + gap-fix +
