@@ -3023,7 +3023,21 @@ def run() -> None:
         log.info("serving_mtls", cert=settings.tls_cert_file, client_cert="required",
                  crl_revocation="enforced" if crl else "none", crl_file=crl or None,
                  ocsp_mode=ocsp_mode_for(settings))
-    uvicorn.run(
+    uvicorn.Server(_uvicorn_config(ssl_kwargs)).run()
+
+
+def _uvicorn_config(ssl_kwargs: dict) -> "uvicorn.Config":
+    """The uvicorn Config ``run()`` serves, LOADED when mTLS is on.
+
+    This module calls ``truststore.inject_into_ssl()`` at import, which rebinds the
+    ``ssl.SSLContext`` global. Our hardened CRL/OCSP serving context is (deliberately) a
+    GENUINE stdlib context, so uvicorn's ``isinstance(ctx, ssl.SSLContext)`` check in
+    ``Config.load`` rejected it with a TypeError — the agent could not start with
+    ``require_mtls`` + a CRL or OCSP. Load the config with the genuine class in effect
+    (``_genuine_ssl`` re-injects truststore on exit, so outbound HTTPS still uses the OS
+    trust store); ``Server.run`` skips ``load()`` for an already-loaded config.
+    """
+    config = uvicorn.Config(
         "api.main:app",
         host=settings.host,
         port=settings.port,
@@ -3031,6 +3045,11 @@ def run() -> None:
         reload=False,
         **ssl_kwargs,
     )
+    if ssl_kwargs:
+        from transport.mtls import _genuine_ssl
+        with _genuine_ssl():
+            config.load()
+    return config
 
 
 if __name__ == "__main__":

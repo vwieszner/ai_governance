@@ -271,3 +271,40 @@ def test_mtls_holds_under_truststore_injection(pki):
         assert _handshake_ok(sctx, good) is True
     finally:
         truststore.extract_from_ssl()
+
+
+def test_agent_server_config_loads_with_crl_under_truststore(tmp_path, monkeypatch):
+    """Regression: api.main injects truststore at import, which rebinds ssl.SSLContext; the
+    genuine CRL-checking serving context then failed uvicorn's isinstance check in
+    Config.load (TypeError) — the agent could not START with require_mtls + a CRL/OCSP.
+    run() now builds the config via _uvicorn_config, which must load cleanly AND leave
+    truststore injected for the rest of the process (outbound HTTPS)."""
+    import truststore
+
+    from api import main  # noqa: F401  (the production module; it injects at import)
+
+    was_injected = ssl.SSLContext is truststore.SSLContext
+    truststore.inject_into_ssl()   # the production state, regardless of test order
+    try:
+        _check_agent_server_config(tmp_path, monkeypatch, main, truststore)
+    finally:
+        if not was_injected:
+            truststore.extract_from_ssl()
+
+
+def _check_agent_server_config(tmp_path, monkeypatch, main, truststore):
+    assert ssl.SSLContext is truststore.SSLContext  # the precondition that triggered the bug
+    certs = mtls.issue_federation_certs(tmp_path, ["alpha"])
+    crt, key = certs["alpha"]
+    monkeypatch.setattr(main.settings, "require_mtls", True, raising=False)
+    monkeypatch.setattr(main.settings, "tls_cert_file", crt, raising=False)
+    monkeypatch.setattr(main.settings, "tls_key_file", key, raising=False)
+    monkeypatch.setattr(main.settings, "tls_ca_file", certs["_ca"], raising=False)
+    monkeypatch.setattr(mtls, "CRL_FILE", certs["_crl"])   # TLS_CRL_FILE (not a settings field)
+
+    kw = mtls.tls_serving_kwargs(main.settings)
+    assert "ssl_context_factory" in kw            # the CRL path, the one that used to fail
+    config = main._uvicorn_config(kw)
+    assert config.loaded
+    assert config.ssl is not None and config.ssl.verify_mode == ssl.CERT_REQUIRED
+    assert ssl.SSLContext is truststore.SSLContext  # truststore restored after loading
