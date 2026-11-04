@@ -73,8 +73,13 @@ collection was ingested with, or re-ingest. NIM's `input_type` / `truncate` are 
    the boundary is enforced by its key (rule 1, plus the allowlist), not by the URL.
 3. **Address the gateway by an in-boundary DNS name**, e.g. `litellm.<ns>.svc.cluster.local`
    on Kubernetes or a `.internal` alias in Compose:
-   - a literal loopback IP (`http://127.0.0.1:4000`) is refused by the embedding SSRF guard;
+   - loopback is refused by the embedding SSRF guard, by IP **and by name**
+     (`http://127.0.0.1:4000`, `http://localhost:4000`, `*.localhost`);
    - a bare Compose service name (`http://litellm:4000`) counts as *external* in residency=local.
+   - A host-run agent's *chat* may use `localhost` (residency treats it as in-boundary), but
+     with `EMBEDDING_PROVIDER=api` through the gateway, map a name — `127.0.0.1
+     llm-gateway.internal` in the hosts file — and set `EMBEDDING_API_BASE` to it. The proof
+     (`prove_gateway.py`, `APP_GATEWAY_URL`) and CI do exactly this.
 4. **Image pinned by digest; never `pip install litellm`.** The 2026 PyPI compromise
    (1.82.7/1.82.8) shipped through pip. The pinned Docker Hub index digest
    (`v1.106.6`) is byte-identical to the official `ghcr.io/berriai/litellm:v1.106.6`

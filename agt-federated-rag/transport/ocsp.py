@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import ipaddress
 import os
 import secrets
 import ssl
@@ -71,7 +70,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.x509 import ocsp
 from cryptography.x509.oid import AuthorityInformationAccessOID, ExtendedKeyUsageOID
 
-from rag.egress_guard import is_egress_unsafe_host
+from rag.egress_guard import is_egress_unsafe_host, is_loopback_host
 
 log = structlog.get_logger(__name__)
 
@@ -134,11 +133,7 @@ def responder_url_unsafe(url: str) -> str:
     if p.scheme not in ("http", "https"):
         return f"scheme {p.scheme!r} not allowed"
     host = (p.hostname or "").lower()
-    is_loopback = host == "localhost"
-    try:
-        is_loopback = is_loopback or ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        pass
+    is_loopback = is_loopback_host(host)   # same definition the egress denylist uses
     if not is_loopback and is_egress_unsafe_host(url):
         return f"host {host!r} is on the egress denylist (metadata/link-local)"
     return ""

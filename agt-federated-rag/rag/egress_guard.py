@@ -21,6 +21,25 @@ METADATA_HOSTNAMES = {
 }
 
 
+# Loopback by NAME. The literal-IP check below already refuses 127.0.0.0/8 and ::1; without
+# this, `http://localhost:...` reached the same loopback target the IP form is refused for
+# (an inconsistency — the policy is "loopback is never a valid egress target", not "the
+# string 127.0.0.1 is"). RFC 6761 reserves `localhost` and every `*.localhost` name for
+# loopback; the others are the common /etc/hosts aliases.
+LOOPBACK_HOSTNAMES = {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}
+
+
+def is_loopback_host(host: str) -> bool:
+    """True if ``host`` (a URL hostname, any case) names loopback — by name or literal IP."""
+    h = (host or "").lower().rstrip(".")
+    if h in LOOPBACK_HOSTNAMES or h.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
 def is_egress_unsafe_host(url: str) -> bool:
     """True if ``url`` points at a cloud-metadata / link-local / loopback target that a
     RaaS endpoint must never be allowed to reach (SSRF denylist)."""
@@ -29,6 +48,8 @@ def is_egress_unsafe_host(url: str) -> bool:
         return True   # unparseable host → refuse (fail-closed)
     if host in METADATA_HOSTNAMES:
         return True
+    if is_loopback_host(host):
+        return True   # loopback by name (localhost, *.localhost, …) — same as 127.0.0.1
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:

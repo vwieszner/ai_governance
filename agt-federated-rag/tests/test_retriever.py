@@ -218,6 +218,10 @@ async def test_http_retriever_refuses_linklocal_and_loopback_and_gcp_metadata(mo
     for url in (
         "http://[fe80::1]/x",                       # IPv6 link-local
         "http://127.0.0.1:9000/retrieve",           # loopback
+        "http://localhost:9000/retrieve",           # loopback by NAME (was a bypass)
+        "http://LocalHost.:9000/retrieve",          # case + trailing-dot variant
+        "http://api.localhost/retrieve",            # RFC 6761 *.localhost
+        "http://[::1]:9000/retrieve",               # IPv6 loopback
         "http://metadata.google.internal/x",        # GCP metadata hostname
     ):
         with pytest.raises(RuntimeError):
@@ -322,3 +326,17 @@ async def test_check_auth_serves_trusted_text_not_raas_poisoned_text(monkeypatch
     assert EXTERNAL_ONLY not in served
     # Per-chunk authz is unchanged — both ids stay in the authz decision (access not widened/narrowed).
     assert AUTHZ in result["allowed_chunk_ids"]
+
+
+def test_egress_guard_loopback_by_name_but_not_lookalikes():
+    """Loopback is refused by NAME as well as by IP; names that merely contain 'localhost'
+    are NOT loopback (no over-blocking), and in-boundary service names still pass."""
+    from rag.egress_guard import is_egress_unsafe_host, is_loopback_host
+
+    for url in ("http://localhost:1/x", "http://localhost.localdomain/x",
+                "http://ip6-localhost/x", "http://a.b.localhost/x", "http://127.9.9.9/x"):
+        assert is_egress_unsafe_host(url), url
+    for url in ("http://localhost-proxy.svc.cluster.local/x", "http://notlocalhost.example/x",
+                "http://llm-gateway.internal:4000/v1", "http://10.0.0.5:8080/x"):
+        assert not is_egress_unsafe_host(url), url
+    assert is_loopback_host("LOCALHOST") and not is_loopback_host("localhostess")

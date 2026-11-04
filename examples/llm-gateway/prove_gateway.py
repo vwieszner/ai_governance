@@ -35,7 +35,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 AGENT_DIR = HERE.parents[1] / "agt-federated-rag"
-GATEWAY = os.environ.get("GATEWAY_URL", "http://localhost:4000")
+GATEWAY = os.environ.get("GATEWAY_URL", "http://localhost:4000")   # admin + direct probes
+# What the AGENT is pointed at. Must be an in-boundary DNS NAME, as in a real deployment: the
+# agent's embedding SSRF guard refuses loopback (127.0.0.1 AND localhost), and residency treats
+# a bare single-label name as external. Locally: add `127.0.0.1 llm-gateway.internal` to
+# /etc/hosts (CI does this); in the division stack it is the gateway's network alias.
+APP_GATEWAY = os.environ.get("APP_GATEWAY_URL", "http://llm-gateway.internal:4000")
 EXTERNAL_STUB = "http://localhost:4101"
 COMPOSE = shlex.split(os.environ.get("GW_COMPOSE",
                                      f"docker compose -f {HERE / 'docker-compose.yml'}"))
@@ -88,7 +93,7 @@ def new_key(**spec) -> str:
 
 def app(mode: str, key: str, residency: str = "external") -> dict:
     env = {**os.environ, "RAG_ENV_FILE": "__none__",
-           "OPENAI_API_BASE": f"{GATEWAY}/v1", "OPENAI_API_KEY": key,
+           "OPENAI_API_BASE": f"{APP_GATEWAY}/v1", "OPENAI_API_KEY": key,
            "RESIDENCY_MODE": residency, "EMBEDDING_PROVIDER": "api", "LLM_MAX_RETRIES": "0",
            # Settings fields that are REQUIRED at import but unused on this code path.
            "NEO4J_PASSWORD": "x", "OPENFGA_STORE_ID": "x", "OPENFGA_MODEL_ID": "x",
@@ -134,6 +139,12 @@ def main() -> int:
         print(f"gateway {GATEWAY}: {_http('GET', f'{GATEWAY}/health/liveliness')}")
     except urllib.error.URLError as exc:
         print(f"gateway {GATEWAY} is not reachable ({exc.reason}); start it first (see README)")
+        return 2
+    try:
+        _http("GET", f"{APP_GATEWAY}/health/liveliness")
+    except urllib.error.URLError as exc:
+        print(f"agent-side gateway name {APP_GATEWAY} does not resolve/reach ({exc.reason}); "
+              "map it, e.g. `127.0.0.1 llm-gateway.internal` in /etc/hosts (see README)")
         return 2
     outage("stub-external", False)   # start from a known-healthy state
     outage("stub-local", False)

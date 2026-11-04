@@ -121,6 +121,11 @@ jobs:
           echo "LITELLM_MASTER_KEY=$k" >> "$GITHUB_ENV"
           echo "GATEWAY_DB_PASSWORD=$p" >> "$GITHUB_ENV"
 
+      - name: Map the in-boundary gateway name (agent side)
+        # The agent must reach the gateway by an in-boundary DNS name: its embedding SSRF guard
+        # refuses loopback (127.0.0.1 and localhost). In the division stack this is a network alias.
+        run: echo "127.0.0.1 llm-gateway.internal" | sudo tee -a /etc/hosts
+
       - name: Start the gateway stack
         run: |
           docker compose up -d
