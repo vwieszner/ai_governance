@@ -7,6 +7,7 @@ name = "agt-federated-rag"
 version = "0.1.0"
 description = "Fully governed federated cross-cluster RAG using Microsoft Agent Governance Toolkit, LangGraph, OpenFGA, and Temporal"
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = [
     # ── Microsoft Agent Governance Toolkit ───────────────────────────────────
     # AGT 4.0 consolidated the per-component distributions; import names are unchanged.
