@@ -428,3 +428,130 @@ def test_valid_result_still_succeeds_after_fix(monkeypatch):
     assert body["status"] == "completed"
     assert body["result"]["has_pii"] is True
     assert captured["status"] == "completed"
+
+
+# ── block-low-trust-agents is WIRED: delegated actions carry the SIGNING PEER's trust ──
+# These use the REAL agent.nodes._enforce + real policies (a spy records each context and
+# its outcome, it never decides). The handler's own registry gate is set to 0.5 here, so
+# a 0.55 peer passes it and the POLICY rule (< 0.6) is what refuses — proving the policy
+# floor holds even if a deployment lowers AGENT_TRUST_THRESHOLD.
+
+def _spy_real_enforce(monkeypatch):
+    real = main.agent_nodes._enforce
+    seen: list = []
+
+    async def spy(action, ctx):
+        try:
+            await real(action, ctx)
+        except PermissionError as exc:
+            seen.append((action, dict(ctx), str(exc)))
+            raise
+        seen.append((action, dict(ctx), None))
+    monkeypatch.setattr(main.agent_nodes, "_enforce", spy)
+    return seen
+
+
+def _setup_real_policy(monkeypatch, trust):
+    monkeypatch.setattr(main.settings, "agent_kill_switch_engaged", False)
+    monkeypatch.setattr(main.settings, "division_id", "alpha")
+    monkeypatch.delenv("AGT_LOCAL_TOOLS", raising=False)
+    _patch_redis(monkeypatch)
+    _pass_signature_and_trust(monkeypatch, trust=trust)   # handler gate: threshold 0.5
+    _pass_assertion(monkeypatch)
+    return _capture_signed_response(monkeypatch), _spy_real_enforce(monkeypatch)
+
+
+def test_a2a_tool_low_trust_peer_denied_by_policy(monkeypatch):
+    captured, seen = _setup_real_policy(monkeypatch, trust=0.55)
+    ran: list = []
+    from tools import local_tools
+    real_caller = local_tools.local_caller
+
+    async def tracking_caller(cfg, tool, args):
+        ran.append(tool)
+        return await real_caller(cfg, tool, args)
+    monkeypatch.setattr("tools.local_tools.local_caller", tracking_caller)
+
+    body = json.loads(bytes(_run(_tool_body()).body).decode())
+    assert body["status"] == "failed" and body["result"] is None
+    assert "_agentmesh" in body and captured["status"] == "failed"
+    action, ctx, denial = seen[0]
+    assert action == "mcp.call" and ctx["agent_trust_score"] == 0.55
+    assert ctx["tool_category"] == "compute"
+    assert "Agent trust score below minimum threshold" in denial
+    assert ran == []                                     # the tool never executed
+
+
+def test_a2a_tool_trusted_peer_runs_with_peer_trust_in_both_gates(monkeypatch):
+    _captured, seen = _setup_real_policy(monkeypatch, trust=0.8)
+    body = json.loads(bytes(_run(_tool_body()).body).decode())
+    assert body["status"] == "completed" and body["result"]["has_pii"] is True
+    mcp_calls = [(c, d) for a, c, d in seen if a == "mcp.call"]
+    # Outer (handler, delegated user) AND inner (executor) gate: both see the PEER's trust.
+    assert len(mcp_calls) == 2
+    for ctx, denial in mcp_calls:
+        assert denial is None
+        assert ctx["agent_trust_score"] == 0.8 and ctx["tool_category"] == "compute"
+
+
+def _a2a_query_body():
+    body = _tool_body()
+    for k in ("capability", "arguments"):
+        body.pop(k)
+    body["query"] = "What was Q4 revenue?"
+    return body
+
+
+def _wire_a2a_query_graph(monkeypatch):
+    """Real run_query + compiled graph; only infra is stubbed: the kill-switch mesh gate
+    (allow), the retriever fan-out (one 10-chunk fake) and check_auth's OpenFGA (sentinel)."""
+    from types import SimpleNamespace
+
+    from agent import graph
+
+    async def no_rl(*a, **k):
+        return None
+    monkeypatch.setattr(main, "_check_rate_limit", no_rl)
+
+    async def allow_graph(action, ctx):
+        return SimpleNamespace(allowed=True, decision="allow")
+    monkeypatch.setattr(graph, "govern_action", allow_graph)
+
+    class _R:
+        name, trusted, chunk_limit = "qdrant", True, 10
+
+        async def retrieve(self, query, allowed_chunk_ids=None, limit=None):
+            return [{"chunk_id": "c1", "text": "t", "metadata": {}, "score": 1.0}]
+
+    async def retrievers():
+        return [_R()]
+    monkeypatch.setattr(main.agent_nodes, "_get_retrievers", retrievers)
+
+    async def openfga():
+        raise RuntimeError("reached check_auth")
+    monkeypatch.setattr(main.agent_nodes, "_get_openfga", openfga)
+
+
+def _a2a_query(body):
+    return asyncio.run(main.a2a_query(_req(body)))
+
+
+def test_a2a_query_low_trust_peer_retrieval_denied_by_policy(monkeypatch):
+    captured, seen = _setup_real_policy(monkeypatch, trust=0.55)
+    _wire_a2a_query_graph(monkeypatch)
+    _a2a_query(_a2a_query_body())
+    retrieve = [(c, d) for a, c, d in seen if a == "rag.retrieve"]
+    assert len(retrieve) == 1
+    ctx, denial = retrieve[0]
+    assert ctx["agent_trust_score"] == 0.55 and ctx["requested_chunk_count"] == 10
+    assert "Agent trust score below minimum threshold" in denial
+    assert captured["status"] == "failed" and not captured.get("answer")
+
+
+def test_a2a_query_trusted_peer_retrieval_allowed(monkeypatch):
+    _captured, seen = _setup_real_policy(monkeypatch, trust=0.8)
+    _wire_a2a_query_graph(monkeypatch)
+    _a2a_query(_a2a_query_body())
+    retrieve = [(c, d) for a, c, d in seen if a == "rag.retrieve"]
+    assert retrieve == [(retrieve[0][0], None)]          # allowed by the real policy
+    assert retrieve[0][0]["agent_trust_score"] == 0.8

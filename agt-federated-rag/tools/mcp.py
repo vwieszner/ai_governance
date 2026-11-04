@@ -4,8 +4,11 @@ One executor node for ALL MCP tools — individual tools/servers are CONFIG
 (``settings.mcp_servers``) + a policy decision, never new nodes. Every call passes three
 gates before the request leaves the process:
 
-  1. policy engine  — `_enforce("mcp.call", {server, tool})`; default-deny means an action
-     not allow-listed (or a context a deny rule matches) is refused.
+  1. policy engine  — `_enforce("mcp.call", {server, tool, tool_category, agent_trust_score})`;
+     default-deny means an action not allow-listed (or a context a deny rule matches) is
+     refused. ``tool_category`` (see TOOL CATEGORIES below) feeds block-code-execution,
+     block-filesystem-writes and require-classified-tool; ``agent_trust_score`` (the agent
+     on whose behalf the call runs) feeds block-low-trust-agents.
   2. MCP gateway    — the toolkit's `McpAuthPolicy` (per-server allowlist + required auth
      method + TLS). An UNCONFIGURED server is rejected (fail-closed).
   3. (caller) OpenFGA — results are treated like retrieval: the caller maps them to
@@ -41,10 +44,28 @@ boundary structurally: ``call_mcp_tool`` has no user-token parameter, so the exe
 forward one, and it guards the outbound ``arguments`` against an accidentally-threaded
 credential (see ``_assert_no_user_credential``). Token acquisition lives in the injected
 ``caller`` precisely so the no-forward invariant is provable at THIS layer.
+
+TOOL CATEGORIES (deterministic, rule-based — never an LLM). ``tool_category(server, tool)``
+resolves, in order:
+  1. EXPLICIT — the server's ``tool_categories`` map in ``settings.mcp_servers``, e.g.
+     ``{"name": "jira", ..., "tool_categories": {"search": "read"}}``. The operator's
+     declaration is authoritative (it can classify ``execute_query`` as ``read``). A value
+     outside KNOWN_CATEGORIES resolves to ``unclassified``.
+  2. LOCAL — an in-process governed tool (tools.local_tools.TOOLS, pure compute, no network
+     or filesystem) is ``compute``.
+  3. NAME PATTERN — a conservative fallback over the tool name's tokens: exec / shell /
+     run_command / eval / subprocess-like names → a code-execution category; write / delete /
+     move / rename + file-like names (or rm / mv / unlink / mkdir) → a filesystem category.
+  4. otherwise ``unclassified``.
+FAIL-CLOSED: only ``read`` and ``compute`` are allowed by policy (require-classified-tool
+denies every other value, incl. ``unclassified``), so a tool nobody classified — e.g. a newly
+added external MCP server without ``tool_categories`` — is refused until an operator
+declares what it does. The pattern fallback can only ever ADD a deny, never allow.
 """
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Awaitable, Callable
 
 import structlog
@@ -91,6 +112,98 @@ class McpToolError(Exception):
     pass
 
 
+# ── Tool categories (see module docstring) ───────────────────────────────────
+CODE_EXECUTION_CATEGORIES = frozenset({"shell_exec", "code_eval", "subprocess", "os_command"})
+FILESYSTEM_WRITE_CATEGORIES = frozenset({"file_write", "file_delete", "file_move"})
+SAFE_CATEGORIES = frozenset({"read", "compute"})       # the only ones policy allows
+UNCLASSIFIED = "unclassified"
+KNOWN_CATEGORIES = CODE_EXECUTION_CATEGORIES | FILESYSTEM_WRITE_CATEGORIES | SAFE_CATEGORIES
+
+_SHELL_TOKENS = frozenset({"shell", "bash", "sh", "zsh", "powershell", "pwsh", "cmd",
+                           "terminal"})
+_CODE_TOKENS = frozenset({"code", "python", "script", "js", "javascript", "repl"})
+_RUN_TOKENS = frozenset({"run", "exec", "execute", "eval", "evaluate", "interpret"})
+_FILE_TOKENS = frozenset({"file", "files", "fs", "filesystem", "dir", "directory", "folder",
+                          "path"})
+_FS_ACTIONS = (
+    ("file_delete", frozenset({"delete", "remove", "rm", "unlink", "rmdir", "erase", "purge"})),
+    ("file_move", frozenset({"move", "mv", "rename"})),
+    ("file_write", frozenset({"write", "save", "create", "append", "overwrite", "put",
+                              "upload", "mkdir", "touch", "edit"})),
+)
+_FS_STANDALONE = {"rm": "file_delete", "rmdir": "file_delete", "unlink": "file_delete",
+                  "mv": "file_move", "mkdir": "file_write", "touch": "file_write"}
+
+
+def _name_tokens(tool: str) -> list[str]:
+    split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", tool)
+    return [t for t in re.split(r"[^a-z0-9]+", split_camel.lower()) if t]
+
+
+def infer_category_from_name(tool: str) -> str | None:
+    """Conservative name-pattern classification (step 3). Returns a DANGEROUS category or
+    None — it never infers a safe one. Over-matching is intended (``execute_query`` →
+    os_command); an operator who knows better declares the tool explicitly."""
+    tokens = _name_tokens(tool)
+    tset = set(tokens)
+    compact = "".join(tokens)
+    if "subprocess" in compact or "popen" in compact or tset & {"spawn", "fork"}:
+        return "subprocess"
+    if tset & _SHELL_TOKENS or any(x in compact for x in ("shell", "bash", "powershell")):
+        return "shell_exec"
+    if "eval" in compact or (tset & _CODE_TOKENS and tset & _RUN_TOKENS):
+        return "code_eval"
+    if "exec" in compact or any(x in compact for x in ("runcommand", "runcmd", "syscall")) or (
+            "run" in tset and tset & {"command", "program", "binary"}) or "system" in tset:
+        return "os_command"
+    for category, actions in _FS_ACTIONS:
+        if tset & actions and (tset & _FILE_TOKENS or any(
+                a + f in compact or f + a in compact
+                for a in actions for f in ("file", "dir", "folder"))):
+            return category
+    for tok in tokens:
+        if tok in _FS_STANDALONE:
+            return _FS_STANDALONE[tok]
+    for category, actions in _FS_ACTIONS:   # e.g. "writefile" with no separator
+        if any(a + f in compact for a in actions for f in ("file", "dir", "folder")):
+            return category
+    return None
+
+
+def _configured_server(server: str) -> dict | None:
+    raw = (settings.mcp_servers or "").strip()
+    if not raw:
+        return None
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    for s in entries if isinstance(entries, list) else []:
+        if isinstance(s, dict) and s.get("name") == server:
+            return s
+    return None
+
+
+def tool_category(server: str, tool: str) -> str:
+    """The ``tool_category`` policy field for an mcp.call (module docstring: TOOL
+    CATEGORIES). Always returns a string; ``unclassified`` is denied by policy."""
+    sc = _configured_server(server)
+    declared = (sc or {}).get("tool_categories")
+    if isinstance(declared, dict) and tool in declared:
+        value = declared[tool]
+        if value in KNOWN_CATEGORIES:
+            return str(value)
+        log.warning("mcp_tool_category_invalid", server=server, tool=tool, agt_audit=True)
+        return UNCLASSIFIED
+    # In-process governed tool: only when the server is not configured as something remote.
+    if sc is None or not sc.get("url"):
+        from tools.local_tools import TOOLS
+        entry = TOOLS.get(server)
+        if entry is not None and tool != "capability" and callable(entry.get(tool)):
+            return "compute"
+    return infer_category_from_name(tool) or UNCLASSIFIED
+
+
 # Argument keys that would smuggle a raw user credential into the outbound call. The executor
 # never threads a user token (it has no such parameter), but a buggy caller could put one in
 # the tool ARGUMENTS — this catches that fail-closed so the no-forward invariant (§4.2) holds
@@ -121,11 +234,16 @@ async def call_mcp_tool(
     tool: str,
     arguments: dict | None = None,
     *,
+    agent_trust_score: float,
     caller: Callable[[dict, str, dict], Awaitable[Any]] | None = None,
 ) -> Any:
     """Invoke an MCP tool through the governance gates. Raises McpToolError / PermissionError
     on any gate failure (fail-closed). ``caller(server_cfg, tool, arguments)`` performs the
-    actual transport; without it the function validates + refuses (no silent no-op)."""
+    actual transport; without it the function validates + refuses (no silent no-op).
+
+    ``agent_trust_score`` is REQUIRED (no default): the trust of the agent on whose behalf
+    the call runs — the signing peer's registry score for a delegated /a2a/tool call,
+    ``agent.nodes.LOCAL_AGENT_TRUST_SCORE`` for a local user's call."""
     from agent.nodes import _enforce  # local import: avoids a heavy import cycle at module load
 
     args = arguments or {}
@@ -133,7 +251,12 @@ async def call_mcp_tool(
     # auth is the caller's job (OBO exchange / service credential), never tool arguments.
     _assert_no_user_credential(args)
     # Gate 1: policy engine (default-deny).
-    await _enforce("mcp.call", {"server": server, "tool": tool})
+    await _enforce("mcp.call", {
+        "server": server,
+        "tool": tool,
+        "tool_category": tool_category(server, tool),
+        "agent_trust_score": agent_trust_score,
+    })
 
     # Gate 2: MCP gateway — server must be configured + its auth method allowed.
     gateway, cfg = _load_servers()

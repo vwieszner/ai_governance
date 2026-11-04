@@ -171,17 +171,39 @@ async def _get_evaluator() -> PolicyEvaluator:
 # field is sent by EVERY current call site of its action (pinned by
 # tests/test_governance.py::test_required_context_matches_every_call_site), so this changes no
 # real flow; it makes a future omission FAIL CLOSED instead of failing open.
+#
+# The fields that used to be inert (deny rules no call site fed) are now wired:
+#   - agent_trust_score (rag.retrieve, mcp.call → block-low-trust-agents, < 0.6): the trust
+#     of the agent ON WHOSE BEHALF the action runs. Delegated actions (/a2a/query → the
+#     peer's retrieval, /a2a/tool → the peer's tool call) send the signing peer's registry
+#     trust score (verify_peer_identity). Local user-initiated actions send
+#     LOCAL_AGENT_TRUST_SCORE (1.0): no other agent is acting, this process IS the policy
+#     enforcement point. It is NOT the mesh self-trust counter (starts at 0.5, a reputation
+#     signal — using it would deny every local action). The value is a required argument of
+#     run_query / run_local_tool / call_mcp_tool, never a default, so a delegated path cannot
+#     silently inherit the local value.
+#   - requested_chunk_count (rag.retrieve → cap-chunk-retrieval, > 50): the sum of the
+#     chunk limits of the ACTIVE retrievers (rag.retriever.requested_chunk_count); a
+#     retriever that does not declare its limit makes the count None → missing → deny.
+#   - tool_category (mcp.call → block-code-execution / block-filesystem-writes /
+#     require-classified-tool): tools.mcp.tool_category — explicit per-tool category from
+#     the MCP server config, in-process local tools are "compute", else a conservative
+#     name-pattern fallback; anything still unknown is "unclassified" and DENIED.
 # Deliberately NOT listed (see PROJECT_STATUS): peer.receive_callback (the post-verification
-# node passes no peer_* fields; the API layer enforces them with full context), and fields no
-# call site computes today — tool_category (mcp.call), agent_trust_score,
-# requested_chunk_count — whose deny rules are therefore inert until those values are wired.
+# node passes no peer_* fields; the API layer enforces them with full context).
 REQUIRED_CONTEXT: dict[str, tuple[str, ...]] = {
-    "rag.retrieve": ("query_length", "qdrant_collection"),
+    "rag.retrieve": ("query_length", "qdrant_collection", "requested_chunk_count",
+                     "agent_trust_score"),
+    "mcp.call": ("server", "tool", "tool_category", "agent_trust_score"),
     "llm.generate": ("context_char_count",),
     "agent.output_check": ("llm_output",),
     "peer.send_message": ("peer_did_verified", "transport_encrypted", "peer_trust_score",
                           "peer_execution_ring", "peer_circuit_state"),
 }
+
+# agent_trust_score for actions a LOCAL, token-authenticated user initiates on THIS agent
+# (no other agent is acting). See the REQUIRED_CONTEXT note above.
+LOCAL_AGENT_TRUST_SCORE = 1.0
 
 
 async def _enforce(action: str, context: dict[str, Any]) -> None:
@@ -376,15 +398,27 @@ async def retrieve_local(state: AgentState) -> dict[str, Any]:
 
     AGT policy enforced: ``rag.retrieve``
     Context fields passed to the evaluator:
-        query_length        — data-access-policy rejects queries >4096 chars
-        qdrant_collection   — data-access-policy blocks untrusted collections
-        user_id             — base-policy trust-score gate uses this
+        query_length          — data-access-policy rejects empty / >4096-char queries
+        qdrant_collection     — data-access-policy blocks untrusted collections
+        requested_chunk_count — data-access-policy caps chunks per query (> 50 denied):
+                                the sum of the active retrievers' chunk limits
+        agent_trust_score     — base-policy block-low-trust-agents (< 0.6): the peer's
+                                registry trust for a delegated /a2a/query, else
+                                LOCAL_AGENT_TRUST_SCORE (threaded via run_query)
+        user_id               — audit
     """
+    from rag.retriever import requested_chunk_count
+
+    # The active fan-out is resolved first so the policy sees the real chunk count. Building
+    # it touches no user data (one-time backend probes, cached for the process).
+    retrievers = await _get_retrievers()
     await _enforce(
         "rag.retrieve",
         {
             "query_length": len(state["query"]),
             "qdrant_collection": settings.qdrant_collection,
+            "requested_chunk_count": requested_chunk_count(retrievers),
+            "agent_trust_score": state.get("agent_trust_score"),
             "user_id": state["user_id"],
         },
     )
@@ -397,7 +431,6 @@ async def retrieve_local(state: AgentState) -> dict[str, Any]:
     # authorization is decided next in check_auth via OpenFGA. Passing an empty
     # list here would build a MatchAny(any=[]) filter that matches zero points,
     # silently returning no results (the cause of the empty-answer bug).
-    retrievers = await _get_retrievers()
 
     async def _retrieve_isolated(r: Any) -> list[dict[str, Any]]:
         """Fan-out with GRACEFUL DEGRADATION: a retriever whose backend is slow or
@@ -1656,7 +1689,9 @@ async def solve_with_tools(
                 tool = str(cfg["tools"][0])
                 break
         try:
-            result = await run_local_tool(local_server, tool, arguments)
+            # User-initiated /solve on THIS agent: no other agent is acting.
+            result = await run_local_tool(local_server, tool, arguments,
+                                          agent_trust_score=LOCAL_AGENT_TRUST_SCORE)
         except Exception as exc:  # noqa: BLE001 — a local tool error degrades, never crashes
             log.warning("solve_with_tools_local_failed", user_id=user_id, capability=capability,
                         error=str(exc), agt_audit=True)

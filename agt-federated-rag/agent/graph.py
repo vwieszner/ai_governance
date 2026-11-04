@@ -229,6 +229,8 @@ async def run_query(
     originating_task_id: str | None = None,
     check_only: bool = False,
     user_groups: list[str] | None = None,
+    *,
+    agent_trust_score: float,
 ) -> dict[str, Any]:
     """Run the governed agent graph for a single query.
 
@@ -244,6 +246,10 @@ async def run_query(
                      (no onward forwarding) passes None. Stored ONLY in the ContextVar.
         task_id:     A2A / ANP task identifier; a UUID4 is generated if empty.
         context_id:  Conversation / session identifier.
+        agent_trust_score: REQUIRED. Trust of the agent on whose behalf the graph runs —
+                     the signing peer's registry score for /a2a/query, or
+                     agent.nodes.LOCAL_AGENT_TRUST_SCORE for a local user's query. Fed
+                     into rag.retrieve (block-low-trust-agents); no default on purpose.
 
     Returns:
         Dict with at minimum ``answer`` (str) and ``status_message`` (str).
@@ -287,6 +293,8 @@ async def run_query(
         "check_only": check_only,
         # Phase-1 group grants: user's IdP groups for contextual group#member checks.
         "user_groups": user_groups or [],
+        # Governance: trust of the agent on whose behalf this runs (rag.retrieve policy).
+        "agent_trust_score": agent_trust_score,
     }
 
     log.info("agent_graph_invoked", user_id=user_id, task_id=initial_state["task_id"])

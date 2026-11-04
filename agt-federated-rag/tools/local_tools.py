@@ -763,14 +763,19 @@ def ensure_local_servers_registered() -> None:
             mcp_tools.reset_cache()
 
 
-async def run_local_tool(server: str, tool: str, arguments: dict) -> Any:
+async def run_local_tool(server: str, tool: str, arguments: dict, *,
+                         agent_trust_score: float) -> Any:
     """Run a LOCAL governed tool end-to-end through ALL governance gates and execute it.
 
     Delegates to ``tools.mcp.call_mcp_tool`` with ``local_caller`` as the transport, so the
     policy default-deny, the McpAuthPolicy gateway, and the §4.2 no-credential boundary all
     apply before the tool runs. This is the function the agent (and the /a2a/tool endpoint)
-    calls to actually execute a tool. Ensures the enabled local servers are registered first."""
+    calls to actually execute a tool. Ensures the enabled local servers are registered first.
+
+    ``agent_trust_score`` (required) is passed through to the mcp.call policy context: the
+    signing peer's trust for /a2a/tool, LOCAL_AGENT_TRUST_SCORE for a local /solve."""
     from tools.mcp import call_mcp_tool
 
     ensure_local_servers_registered()
-    return await call_mcp_tool(server, tool, arguments, caller=local_caller)
+    return await call_mcp_tool(server, tool, arguments, agent_trust_score=agent_trust_score,
+                               caller=local_caller)

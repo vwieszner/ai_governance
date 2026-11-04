@@ -24,7 +24,7 @@ def test_unconfigured_server_is_rejected_fail_closed(monkeypatch):
     monkeypatch.setattr(mcp_tools.settings, "mcp_servers", "")  # none configured
     mcp_tools.reset_cache()
     with pytest.raises(mcp_tools.McpToolError):
-        asyncio.run(mcp_tools.call_mcp_tool("jira", "search", {"q": "x"}))
+        asyncio.run(mcp_tools.call_mcp_tool("jira", "search", {"q": "x"}, agent_trust_score=1.0))
 
 
 def test_policy_denial_blocks_before_gateway(monkeypatch):
@@ -35,7 +35,7 @@ def test_policy_denial_blocks_before_gateway(monkeypatch):
                         '[{"name":"jira","url":"https://mcp/jira","allowed_auth_methods":["oauth2"]}]')
     mcp_tools.reset_cache()
     with pytest.raises(PermissionError):
-        asyncio.run(mcp_tools.call_mcp_tool("jira", "search", {"q": "x"}))
+        asyncio.run(mcp_tools.call_mcp_tool("jira", "search", {"q": "x"}, agent_trust_score=1.0))
 
 
 def test_configured_server_passes_through_to_transport(monkeypatch):
@@ -50,7 +50,7 @@ def test_configured_server_passes_through_to_transport(monkeypatch):
         seen["cfg"], seen["tool"], seen["args"] = server_cfg, tool, args
         return {"issues": []}
 
-    out = asyncio.run(mcp_tools.call_mcp_tool("jira", "search", {"q": "bug"}, caller=transport))
+    out = asyncio.run(mcp_tools.call_mcp_tool("jira", "search", {"q": "bug"}, caller=transport, agent_trust_score=1.0))
     assert out == {"issues": []}
     assert seen["tool"] == "search" and seen["args"] == {"q": "bug"}
     # transport receives only server config + tool + args — no token/credential is threaded in
@@ -63,7 +63,7 @@ def test_no_transport_is_governed_but_not_executed(monkeypatch):
                         '[{"name":"jira","url":"https://mcp/jira","allowed_auth_methods":["oauth2"]}]')
     mcp_tools.reset_cache()
     with pytest.raises(mcp_tools.McpToolError):       # validates OK, refuses to silently no-op
-        asyncio.run(mcp_tools.call_mcp_tool("jira", "search"))
+        asyncio.run(mcp_tools.call_mcp_tool("jira", "search", agent_trust_score=1.0))
 
 
 def test_credential_in_arguments_is_refused_fail_closed(monkeypatch):
@@ -84,7 +84,7 @@ def test_credential_in_arguments_is_refused_fail_closed(monkeypatch):
     for leaky in ({"q": "x", "access_token": "SECRET"}, {"Authorization": "Bearer x"},
                   {"user_token": "jwt"}):
         with pytest.raises(mcp_tools.McpToolError):
-            asyncio.run(mcp_tools.call_mcp_tool("jira", "search", leaky, caller=transport))
+            asyncio.run(mcp_tools.call_mcp_tool("jira", "search", leaky, caller=transport, agent_trust_score=1.0))
     assert called["n"] == 0                            # transport never ran (fail-closed)
 
 
@@ -100,5 +100,5 @@ def test_clean_arguments_still_pass_through(monkeypatch):
         return {"ok": True}
 
     out = asyncio.run(mcp_tools.call_mcp_tool("jira", "search", {"q": "bug", "limit": 10},
-                                              caller=transport))
+                                              caller=transport, agent_trust_score=1.0))
     assert out == {"ok": True}

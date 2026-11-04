@@ -141,7 +141,7 @@ _CASES = [
         "server": "pii-scan",
         "args": {"text": _PII_TEXT},
         "raw": lambda: local_tools.pii_scan({"text": _PII_TEXT}),
-        "governed": lambda: local_tools.run_local_tool("pii-scan", "scan", {"text": _PII_TEXT}),
+        "governed": lambda: local_tools.run_local_tool("pii-scan", "scan", {"text": _PII_TEXT}, agent_trust_score=1.0),
     },
 ]
 
