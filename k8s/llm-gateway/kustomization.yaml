@@ -21,13 +21,16 @@
 #   + the Secret (values from infra/generated/<id>/secrets.json; never committed):
 #       kubectl -n agt-div-<id> create secret generic llm-gateway-secrets \
 #         --from-literal=LITELLM_MASTER_KEY=sk-... --from-literal=LITELLM_DB_PASSWORD=... \
-#         --from-literal=NVIDIA_API_KEY=... --from-literal=LOCAL_LLM_KEY=none
+#         --from-literal=NVIDIA_API_KEY=... --from-literal=LOCAL_LLM_KEY=none \
+#         --from-literal=LOCAL_EMBED_KEY=none
 #   then mint the agent key with POST /key/generate (master key) and set it as the agent's
 #   OPENAI_API_KEY + EMBEDDING_API_KEY in agent-secrets.
 #
-# Upstreams live in the llm-gateway-env ConfigMap (gateway.yaml): CHAT_PRIMARY_BASE (NIM)
-# and LOCAL_LLM_BASE (your in-cluster vLLM/NIM; defaults to a never-resolving .invalid host
-# so the in-boundary model fails closed instead of LiteLLM's public-OpenAI default).
+# Upstreams live in the llm-gateway-env ConfigMap (gateway.yaml): CHAT_PRIMARY_BASE (NIM),
+# LOCAL_LLM_BASE (your in-cluster vLLM/NIM) and LOCAL_EMBED_BASE (your in-cluster 1024-dim
+# embeddings service; what a residency=local key aliases EMBEDDING_MODEL onto). Both default
+# to a never-resolving .invalid host, so the in-boundary models fail closed instead of
+# LiteLLM's public-OpenAI default.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 

@@ -14,6 +14,7 @@
 # LOCAL_LLM_BASE must never be empty: LiteLLM would then default the in-boundary model to
 # the public OpenAI API. The division deployments default it to http://local-llm.invalid/v1
 # (never resolves -> fails closed) until an operator sets a real in-boundary endpoint.
+# The same holds for LOCAL_EMBED_BASE (default http://local-embed.invalid/v1).
 model_list:
   # External (hosted NIM) chat — the LLM_MODEL the division deployments set
   # (onboard_division.render_agent_env, k8s/base/configmap.yaml).
@@ -40,10 +41,23 @@ model_list:
       model: openai/nvidia/nv-embedqa-e5-v5
       api_base: os.environ/CHAT_PRIMARY_BASE
       api_key: os.environ/NVIDIA_API_KEY
+  # In-boundary (self-hosted) embeddings — the only embedding model a residency=local
+  # division may use (its key aliases the app's EMBEDDING_MODEL onto it). LOCAL_EMBED_BASE =
+  # a self-hosted OpenAI-compatible /embeddings endpoint (NIM / TEI / vLLM) serving the SAME
+  # model id, so vectors stay comparable with an external-ingested collection.
+  # REQUIREMENT: it must return qdrant_dense_size (1024) dims; rag.embeddings.embed_dense
+  # raises on any other size instead of writing a mis-sized vector. NIM's input_type /
+  # truncate are forwarded (drop_params: false). NO fallback to the external model.
+  - model_name: local/nv-embedqa-e5-v5
+    litellm_params:
+      model: openai/nvidia/nv-embedqa-e5-v5
+      api_base: os.environ/LOCAL_EMBED_BASE
+      api_key: os.environ/LOCAL_EMBED_KEY
 
 router_settings:
   # NIM free tier throttles / cold-starts: on failure, retry once, then fall back to the
-  # in-boundary model. Fallback only goes external -> local, never local -> external.
+  # in-boundary model. Fallback only goes external -> local, never local -> external
+  # (that includes embeddings: local/nv-embedqa-e5-v5 has no fallback at all).
   num_retries: 1
   timeout: 120
   fallbacks:

@@ -3,7 +3,8 @@
 # http://llm-gateway.<namespace>.svc.cluster.local:4000/v1 (residency rule 3).
 #
 # Upstream endpoints (non-secret). Production: CHAT_PRIMARY_BASE = NVIDIA NIM; LOCAL_LLM_BASE
-# = your in-cluster vLLM/NIM Service (patch it per overlay). Never leave LOCAL_LLM_BASE
+# = your in-cluster vLLM/NIM Service, LOCAL_EMBED_BASE = your in-cluster embeddings Service
+# (patch them per overlay, or set them in the division manifest for bootstrap_k8s.py). Never leave LOCAL_LLM_BASE
 # empty: LiteLLM would send the "local" model to the public OpenAI API. The .invalid
 # default never resolves, so the in-boundary model fails closed until it is set.
 # NOTE (TLS interception hosts, k8s/README.md): the pod's egress to NIM needs the same CA
@@ -18,6 +19,11 @@ metadata:
 data:
   CHAT_PRIMARY_BASE: "https://integrate.api.nvidia.com/v1"
   LOCAL_LLM_BASE: "http://local-llm.invalid/v1"
+  # In-boundary embeddings (self-hosted NIM/TEI/vLLM /embeddings, must emit 1024 dims) —
+  # what a residency=local division's key aliases EMBEDDING_MODEL onto. Same fail-closed
+  # default. bootstrap_k8s.py patches both from the manifest's llm_gateway_local_base /
+  # llm_gateway_local_embed_base.
+  LOCAL_EMBED_BASE: "http://local-embed.invalid/v1"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -96,6 +102,9 @@ spec:
             - name: LOCAL_LLM_KEY
               valueFrom:
                 secretKeyRef: {name: llm-gateway-secrets, key: LOCAL_LLM_KEY, optional: true}
+            - name: LOCAL_EMBED_KEY
+              valueFrom:
+                secretKeyRef: {name: llm-gateway-secrets, key: LOCAL_EMBED_KEY, optional: true}
           volumeMounts:
             - name: config
               mountPath: /app/config.yaml

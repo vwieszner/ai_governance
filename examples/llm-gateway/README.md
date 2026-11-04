@@ -48,19 +48,26 @@ Create keys with the master key (admin only, never given to an agent):
 curl -s localhost:4000/key/generate -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' -d '{"models":["meta/llama-3.1-8b-instruct","local/llama-3.1-8b-instruct","nvidia/nv-embedqa-e5-v5"],"rpm_limit":60,"max_budget":50,"metadata":{"division":"alpha"}}'
 ```
 
-A **residency=local** division gets only the in-boundary model, plus an alias so the
-app's unchanged default model name lands on it:
+A **residency=local** division gets only the in-boundary models (chat + embeddings), plus
+aliases so the app's unchanged model names land on them:
 
 ```bash
-curl -s localhost:4000/key/generate -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' -d '{"models":["local/llama-3.1-8b-instruct"],"aliases":{"meta/llama-3.1-8b-instruct":"local/llama-3.1-8b-instruct"},"metadata":{"division":"sigma","residency":"local"}}'
+curl -s localhost:4000/key/generate -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' -d '{"models":["local/llama-3.1-8b-instruct","local/nv-embedqa-e5-v5"],"aliases":{"meta/llama-3.1-8b-instruct":"local/llama-3.1-8b-instruct","nvidia/nv-embedqa-e5-v5":"local/nv-embedqa-e5-v5"},"metadata":{"division":"sigma","residency":"local"}}'
 ```
+
+`local/nv-embedqa-e5-v5` forwards to `LOCAL_EMBED_BASE`: a self-hosted OpenAI-compatible
+`/embeddings` endpoint (NIM / TEI / vLLM). It must return exactly `qdrant_dense_size`
+(1024) dims. `rag.embeddings.embed_dense` raises on any other size, so it never writes a
+mis-sized vector. Serve the same model (`nvidia/nv-embedqa-e5-v5`) that any existing
+collection was ingested with, or re-ingest. NIM's `input_type` / `truncate` are forwarded.
 
 ## Rules (each one found by running this)
 
 1. **Never configure a fallback from an in-boundary model to an external one.** A key's
    model allowlist does *not* constrain fallbacks. With `local → meta` added to
    `fallbacks`, the local-only division's prompt was answered by the external upstream.
-   The last proof scenario catches exactly this.
+   The last proof scenario catches exactly this. The same goes for embeddings:
+   `local/nv-embedqa-e5-v5` has no fallback at all (pinned by `tests/test_onboarding.py`).
 2. **The agent's residency guard only sees the gateway URL.** `assert_inference_allowed`
    accepts any in-boundary gateway, wherever that gateway forwards. For a local division
    the boundary is enforced by its key (rule 1, plus the allowlist), not by the URL.
@@ -76,7 +83,10 @@ curl -s localhost:4000/key/generate -H "Authorization: Bearer $LITELLM_MASTER_KE
 ## Division deployments (opt-in)
 
 **Compose.** Add `llm_gateway: true` to `infra/divisions/<id>.yml`. For a
-residency=local division, also add `llm_gateway_local_base: http://<your vLLM/NIM>/v1`.
+residency=local division, also add `llm_gateway_local_base: http://<your vLLM/NIM>/v1`,
+and, if it embeds through the API (`EMBEDDING_PROVIDER=api`, the k8s default),
+`llm_gateway_local_embed_base: http://<your embeddings server>/v1`. Unset, both default to
+a never-resolving `.invalid` host, so they fail closed.
 Then run `scripts/onboard_division.py` as usual (`--dry-run` prints the plan).
 Onboarding then:
 - enables the `llm-gateway` profile of `infra/division-stack.template.yml`. That adds the
@@ -84,10 +94,16 @@ Onboarding then:
 - gives the gateway its own `litellm` database and role in the division's existing Postgres;
 - mints the master key into `infra/generated/<id>/secrets.json`;
 - issues the agent's virtual key: residency `external` gets NIM + embeddings + the local
-  model; anything else gets only the local model, with the app's model names aliased onto
-  it. The key is reused on re-run, and revoked and re-issued if the residency changes;
+  model; anything else gets only the local chat and embedding models, with the app's model
+  names aliased onto them. The key is reused on re-run, and revoked and re-issued if its
+  allowlist changes (residency switch, or a pre-embeddings local key);
 - writes `OPENAI_API_BASE=http://localhost:<port_base+7>/v1` and that key into the agent
-  env.
+  env;
+- also writes `infra/generated/<id>/.env.<id>.agent` (gitignored, owner-only), which the
+  `containerized` compose profile's agent and worker read. It has the same values, but
+  reaches the infra by compose name (`qdrant:6333`, `openfga:8080`, `keycloak:8080` for
+  JWKS, ...) and the gateway by `http://llm-gateway.internal:4000/v1`. `--dry-run` writes
+  it too, with the persisted store/model ids.
 
 **Kubernetes.** `python scripts/bootstrap_k8s.py --divisions <id> --llm-gateway` uses the
 `k8s/llm-gateway` component. See k8s/README.md, "Optional: per-division LLM gateway".
@@ -129,9 +145,20 @@ Without the flag, nothing changes: no gateway services, and the agent talks to N
     and an NVIDIA key);
   - a `bootstrap_k8s --llm-gateway` run on a cluster;
   - NetworkPolicy enforcement (needs an enforcing CNI);
-  - the containerized agent profile (`.env.<id>.agent` is not generated yet).
-- **No in-boundary embedding model.** A residency=local division's key refuses API-mode
-  embeddings. Compose divisions embed locally with FastEmbed by default, so they are not
-  affected; a k8s local division is.
+  - a running containerized agent. Onboarding now generates `.env.<id>.agent`, and
+    `docker compose config --profile containerized` resolves the agent against it. The
+    profile's relative paths (env_file, build context, edge mounts) were also off by one
+    directory, and are fixed. Not yet checked: the agent image actually serving there. Known
+    gaps: the DID identity file is not mounted, and Keycloak tokens fetched in-network carry
+    the `keycloak:8080` issuer.
+- **In-boundary embeddings, what was proven (2026-11-04).** The gateway ran with the stub
+  upstreams on sandbox ports. A residency=local key came from `onboard_division.gateway_key_spec`
+  and was issued with `ensure_gateway_key`. The agent's real `embed_dense` then ran with
+  `EMBEDDING_PROVIDER=api` and the unchanged `EMBEDDING_MODEL`. It returned 2×1024 vectors,
+  answered by the **local** stub (`input_type=query`, `truncate=END` forwarded). The
+  external stub received nothing. The key got 403 for `openai/nvidia/nv-embedqa-e5-v5` and
+  for `text-embedding-3-small`, and the old chat-only local key got 403 for embeddings.
+  With the local upstream serving 768 dims, `embed_dense` raised its dimension-mismatch
+  error and there was no fallback. Not covered: a real self-hosted embeddings server.
 - The gateway container trusts only its own CA store. On a TLS-intercepting host (Norton),
   its calls to NIM need the host CA bundle, like the k8s pods do.
