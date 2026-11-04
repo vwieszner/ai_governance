@@ -48,6 +48,18 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
     is unreachable; outage clearances are always time-bound.
   - **CI:** UI job on Node 22 (Node 18 broke `npm test` on main since June); supply-chain
     `trivy-action` pinned by SHA to v0.36.0 (0.28.0 vanished in the March 2026 Trivy compromise).
+- **Dependency security refresh** (pip-audit on the lock: 214 findings in 24 packages → 1).
+  21 packages bumped to their fixed versions (pillow 13, pypdf 6.21.4, aiohttp 3.14.5,
+  starlette 1.10 + fastapi 0.162, langgraph 1.2.19 for langgraph-sdk 0.4, …), lock regenerated
+  with its header command. **python-jose → PyJWT** (PYSEC-2026-4298, HS256 forgery with a DER
+  public key, no upstream fix); `ecdsa`, `rsa`, `pyasn1` left the tree with it. Behaviour kept
+  (alg allow-list, kid refresh, MED-7, iss/aud/exp, iat = integer only); one deliberate change:
+  a token with NO `aud` is now refused (python-jose skipped it; onboarding adds the audience
+  mapper). `tests/test_token_validator.py` pins all of it plus the HS256-with-public-key forgery.
+  **Remaining:** cryptography 49.0.0, PYSEC-2026-3552 (PKCS#7 decrypt oracle, fixed in 50.0) —
+  AGT core 5.0.0, the latest release, requires `cryptography<50`; no code here or in the tree
+  calls `pkcs7_decrypt_*`. UI dev tooling: vite 7.3, vitest 4.1, plugin-react 5.2 → `npm audit` 0
+  (still Node ≥ 20.19).
 - **Inert deny rules (found by the call-site inventory; need the value wired, not a flag):**
   `block-code-execution` + `block-filesystem-writes` (`tool_category`, never sent on
   `mcp.call`), `block-low-trust-agents` (`agent_trust_score`), `cap-chunk-retrieval`

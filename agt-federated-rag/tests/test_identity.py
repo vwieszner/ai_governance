@@ -16,25 +16,22 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from jose import JWTError, jwt
+import jwt
+
+from auth.token_validator import JWTError
 
 
 def _keypair_and_jwks(kid: str = "div-key-1"):
     """Throwaway RSA keypair -> (private PEM, public-JWKS dict for the validator)."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from jose import jwk
-
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     priv_pem = key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
     ).decode()
-    pub_pem = key.public_key().public_bytes(
-        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode()
-    jwk_dict = jwk.construct(pub_pem, "RS256").to_dict()
+    jwk_dict = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
     jwk_dict.update({"kid": kid, "alg": "RS256", "use": "sig"})
     return priv_pem, {"keys": [jwk_dict]}
 

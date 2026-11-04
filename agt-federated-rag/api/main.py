@@ -44,7 +44,6 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from jose import JWTError
 from sse_starlette.sse import EventSourceResponse
 from temporalio.client import Client as TemporalClient
 
@@ -53,6 +52,7 @@ import agent.nodes as agent_nodes
 import mesh.agent_identity as agent_identity
 from auth.token_validator import (
     AuthServiceUnavailable,
+    JWTError,
     extract_groups,
     issuer_namespace,
     minimal_assertion_claims,
