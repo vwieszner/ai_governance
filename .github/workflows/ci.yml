@@ -75,7 +75,9 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          # The UI's locked test deps (jsdom chain) require Node >= 20.19; Node 18 is EOL
+          # and made `npm test` fail on every push since June. 22 = the verified version.
+          node-version: "22"
           cache: npm
           cache-dependency-path: ui/package-lock.json
 

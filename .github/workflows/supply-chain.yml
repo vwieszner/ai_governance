@@ -73,7 +73,7 @@ jobs:
 
       # ── 3. Vulnerability scan (Trivy): OS packages + Python deps ──────────────
       - name: Trivy scan (SARIF)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (immutable release; SHA-pinned per GHSA-69fq-xp46-6x23)
         with:
           image-ref: ${{ env.IMAGE }}:ci
           format: sarif
@@ -86,7 +86,7 @@ jobs:
           sarif_file: trivy.sarif
 
       - name: Trivy gate (fail on CRITICAL/HIGH)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (immutable release; SHA-pinned per GHSA-69fq-xp46-6x23)
         with:
           image-ref: ${{ env.IMAGE }}:ci
           format: table
