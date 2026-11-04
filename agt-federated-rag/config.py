@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -331,6 +332,11 @@ class Settings(BaseSettings):
     context_aggregation_policy: str = str(
         Path(__file__).resolve().parent / "agent" / "policies" / "aggregation"
         / "context-aggregation.yaml")
+    # Where the mosaic guard's per-user release ledger lives. "redis" (default) = this
+    # division's Redis (redis_url), shared by every replica, so an HPA can't split a
+    # user's HR and Finance releases across pods; unreachable → the guard fails closed
+    # (escalates). "memory" = in-process per replica — tests / single-process dev only.
+    mosaic_ledger_backend: Literal["redis", "memory"] = "redis"
 
     # ── Graph-level kill-switch (AgentMesh govern_action gate) ───────────────
     # Operator emergency off-switch. When true, the graph-level govern_action

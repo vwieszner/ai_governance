@@ -18,8 +18,10 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
   (`agent/policies/aggregation/`). HR + Finance escalates into the existing approval workflow
   (clearance object `mosaic-<rule>`); deny withholds; fails closed if the policy is missing.
   **Covers federated answers:** peers return the label names of the chunks they used inside the
-  signed `/a2a/query` response; a per-user release ledger (15-min window, in memory per replica)
-  checks each release against what came from other origins. Unlabeled/unverified peer answers
+  signed `/a2a/query` response; a per-user release ledger (15-min window, in the division's
+  Redis — shared by every replica, so an HPA can't split HR and Finance across pods; TTL = window;
+  Redis unreachable → labelled releases escalate, never "no history") checks each release
+  against what came from other origins. Unlabeled/unverified peer answers
   count as an `unlabeled-peer` label. Approval requests now name the contributing sources.
 - **FR-2.2 user lifecycle — DONE:** `POST /admin/users`, `PUT …/roles`, `POST …/disable`,
   `POST …/enable` (division-admin only, cross-division isolated, audited). Disable cascades
@@ -38,7 +40,7 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
   `ssl.SSLContext` rebind made uvicorn reject the genuine serving context (TypeError). Proven
   live: `api.main.run()` with mTLS + CRL starts, cert → 200, no cert → refused.
 - **Still open:** the absent-field policy gap and the `localhost` SSRF question (decisions);
-  the ledger is per replica (multi-replica needs Redis); live stacks/k8s/real NIM on the host.
+  live stacks/k8s/real NIM on the host.
 
 ### Update log — 2026-11-03 (AGT 5.0, supply chain, LLM gateway)
 - **AGT 3.7 → 5.0.** The six per-component packages became `agent-governance-toolkit-core` +
