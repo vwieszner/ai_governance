@@ -519,9 +519,16 @@ async def _get_bearer_token(authorization: str | None) -> tuple[str, dict[str, A
     # FR-2.2: a division admin's disable takes effect on the NEXT request, not at token
     # expiry — JWTs are validated locally, so Keycloak's session revocation alone would leave
     # an already-issued access token usable until it lapses.
-    if await _account_disabled(str(sub)):
+    refusal = await _account_refusal(str(sub), claims.get("iat"))
+    if refusal == "disabled":
         log.warning("disabled_account_refused", subject=str(sub), agt_audit=True)
         raise HTTPException(status_code=401, detail="Account disabled",
+                            headers={"WWW-Authenticate": "Bearer"})
+    if refusal == "stale_token":
+        # Re-enabled account: a token minted BEFORE the re-enable (possibly the very token
+        # whose theft caused the disable) must not come back to life.
+        log.warning("pre_reenable_token_refused", subject=str(sub), agt_audit=True)
+        raise HTTPException(status_code=401, detail="Token predates account re-enable",
                             headers={"WWW-Authenticate": "Bearer"})
 
     return token, claims
@@ -537,13 +544,38 @@ def _disabled_key(sub: str) -> str:
     return f"agt:disabled:{settings.division_id}:{sub}"
 
 
-async def _account_disabled(sub: str) -> bool:
+def _not_before_key(sub: str) -> str:
+    # Set on re-enable: tokens with iat < this epoch second are refused. No TTL (it must
+    # outlive every token minted before the re-enable).
+    return f"agt:token-nbf:{settings.division_id}:{sub}"
+
+
+async def _account_refusal(sub: str, iat: Any) -> str | None:
+    """None if the token's subject may proceed; else "disabled" or "stale_token".
+
+    One Redis round trip. Fails CLOSED (503) on a store error. A re-enabled account's
+    token is accepted only if its ``iat`` is at/after the re-enable time; a token with no
+    usable ``iat`` is refused for such an account (cannot prove it is fresh).
+    """
     try:
         r = await _get_redis()
-        return bool(await r.get(_disabled_key(sub)))
+        disabled, nbf = await r.mget(_disabled_key(sub), _not_before_key(sub))
     except Exception as exc:
         log.error("disabled_check_failed_failing_closed", error=str(exc))
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    if disabled:
+        return "disabled"
+    if nbf:
+        try:
+            if float(iat) < float(nbf):
+                return "stale_token"
+        except (TypeError, ValueError):
+            return "stale_token"
+    return None
+
+
+async def _account_disabled(sub: str) -> bool:
+    return await _account_refusal(sub, None) == "disabled"
 
 
 async def _mark_account_disabled(sub: str) -> None:
@@ -552,7 +584,10 @@ async def _mark_account_disabled(sub: str) -> None:
 
 
 async def _clear_account_disabled(sub: str) -> None:
+    """Lift the denylist AND invalidate every token minted before now (not-before marker),
+    so a pre-disable token — possibly the stolen one that prompted the disable — stays dead."""
     r = await _get_redis()
+    await r.set(_not_before_key(sub), str(int(time.time())))
     await r.delete(_disabled_key(sub))
 
 

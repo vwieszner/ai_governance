@@ -185,6 +185,10 @@ class FakeRedis:
         self._chk()
         self.kv[k] = v
 
+    async def mget(self, *ks):
+        self._chk()
+        return [self.kv.get(k) for k in ks]
+
     async def incr(self, k):
         self.kv[k] = int(self.kv.get(k, 0)) + 1
         return self.kv[k]
@@ -402,9 +406,10 @@ def _keypair(kid):
     return priv, j
 
 
-def _mint(priv, kid, iss, aud, sub, email, roles):
+def _mint(priv, kid, iss, aud, sub, email, roles, iat_offset=0):
     now = int(time.time())
-    return jwt.encode({"sub": sub, "iss": iss, "aud": aud, "iat": now, "exp": now + 600,
+    return jwt.encode({"sub": sub, "iss": iss, "aud": aud, "iat": now + iat_offset,
+                       "exp": now + 600,
                        "email": email, "email_verified": True,
                        "realm_access": {"roles": roles}},
                       priv, algorithm="RS256", headers={"kid": kid})
@@ -789,3 +794,52 @@ def test_onboarding_uses_shared_keycloak_helpers():
     assert set(kc.roles) >= {"member", "data-owner", "division-admin"}
     assert kc.mappings["kc-alice"] >= {"member"}
     assert kc.client_role_grants["sa-user"] == ["manage-users", "view-users", "query-users"]
+
+
+def test_pre_disable_token_stays_dead_after_reenable(env, monkeypatch):
+    """Re-enable must NOT resurrect a token minted before it (e.g. the stolen token that
+    prompted the disable): enable writes a not-before marker; older tokens -> 401."""
+    priv, j = _keypair("alpha-key")
+    _jwks(monkeypatch, j)
+    uid = env.kc.add_user("alice", "alice@example.com", roles=("member",))
+    admin_tok = _mint(priv, "alpha-key", ISS_A, AUD_A, "kc-bob", "bob@example.com",
+                      ["data-owner", "division-admin"])
+    stolen = _mint(priv, "alpha-key", ISS_A, AUD_A, uid, "alice@example.com", ["member"],
+                   iat_offset=-120)   # minted well before the disable/enable
+    asyncio.run(main.admin_disable_user("alice", _req(), authorization=f"Bearer {admin_tok}"))
+    resp = asyncio.run(main.admin_enable_user("alice", _req(), authorization=f"Bearer {admin_tok}"))
+    assert resp.status_code == 200
+
+    with pytest.raises(main.HTTPException) as ei:
+        asyncio.run(main._get_bearer_token(f"Bearer {stolen}"))
+    assert _status(ei) == 401 and ei.value.detail == "Token predates account re-enable"
+
+    fresh = _mint(priv, "alpha-key", ISS_A, AUD_A, uid, "alice@example.com", ["member"])
+    _, claims = asyncio.run(main._get_bearer_token(f"Bearer {fresh}"))
+    assert claims["sub"] == uid
+
+
+def test_not_before_marker_semantics():
+    """Unit-level: no iat on a re-enabled account fails closed; never-disabled users are
+    unaffected; the store being down still fails closed (503)."""
+    r = FakeRedis()
+
+    async def _get_redis():
+        return r
+
+    orig = main._get_redis
+    main._get_redis = _get_redis
+    try:
+        assert asyncio.run(main._account_refusal("u1", 1000)) is None          # never disabled
+        r.kv[main._not_before_key("u1")] = "2000"
+        assert asyncio.run(main._account_refusal("u1", 1999)) == "stale_token"
+        assert asyncio.run(main._account_refusal("u1", 2000)) is None
+        assert asyncio.run(main._account_refusal("u1", None)) == "stale_token"  # no iat
+        r.kv[main._disabled_key("u1")] = "3000"
+        assert asyncio.run(main._account_refusal("u1", 9999)) == "disabled"
+        r.down = True
+        with pytest.raises(main.HTTPException) as ei:
+            asyncio.run(main._account_refusal("u1", 9999))
+        assert _status(ei) == 503
+    finally:
+        main._get_redis = orig
