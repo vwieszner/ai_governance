@@ -10,7 +10,10 @@ Pins:
     requests the user made auto-denied in Temporal + withdrawn from approvers' inboxes,
     requests awaiting the user left pending, outcome inbox purged;
   * every action lands in the tamper-evident audit chain (verified);
-  * fail-closed edges: denylist store down → 503; partial cascade → 502 + step report.
+  * fail-closed edges: denylist store down → 503; partial cascade → 502 + step report;
+  * re-enable: Keycloak enabled, denylist cleared (a NEW token works), OpenFGA role mirror
+    rebuilt from the CURRENT Keycloak roles while the viewer/editor/pending grants the
+    disable deleted stay gone; idempotent; partial → 502; same admin gate + audit.
 
 Hermetic: Keycloak is an in-memory fake behind an ``httpx.MockTransport`` (so the real
 auth.keycloak_admin HTTP calls run); OpenFGA is the REAL ``OpenFGAAuth`` over a fake SDK
@@ -376,6 +379,7 @@ def test_non_admin_refused_without_touching_keycloak(env, monkeypatch):
         lambda: main.admin_set_user_roles("carol", _req({"roles": ["division-admin"]}),
                                           authorization="Bearer tok"),
         lambda: main.admin_disable_user("carol", _req(), authorization="Bearer tok"),
+        lambda: main.admin_enable_user("carol", _req(), authorization="Bearer tok"),
     ):
         with pytest.raises(main.HTTPException) as ei:
             asyncio.run(call())
@@ -430,6 +434,7 @@ def test_foreign_division_admin_token_refused(env, monkeypatch):
         lambda: main.admin_set_user_roles("carol", _req({"roles": []}),
                                           authorization=f"Bearer {beta_admin}"),
         lambda: main.admin_disable_user("carol", _req(), authorization=f"Bearer {beta_admin}"),
+        lambda: main.admin_enable_user("carol", _req(), authorization=f"Bearer {beta_admin}"),
     ):
         with pytest.raises(main.HTTPException) as ei:
             asyncio.run(call())
@@ -635,6 +640,134 @@ def test_roles_refused_for_disabled_user(env, monkeypatch):
         asyncio.run(main.admin_set_user_roles("erin", _req({"roles": ["division-admin"]}),
                                               authorization="Bearer tok"))
     assert _status(ei) == 409
+    assert env.fga._client.tuples == set()
+
+
+# ── re-enable ──────────────────────────────────────────────────────────────────
+
+def _alice_tuples(env, alice):
+    return {x for x in env.fga._client.tuples if x[0] == f"user:{alice}"}
+
+
+def test_enable_restores_roles_from_keycloak_not_old_grants(env, monkeypatch):
+    _as(monkeypatch, ADMIN)
+    uid, alice, bob, _ = _seed_alice(env)
+    assert asyncio.run(main.admin_disable_user("alice", _req(temporal=FakeTemporal()),
+                                               authorization="Bearer tok")).status_code == 200
+    # While disabled, an admin drops data-owner in Keycloak: the CURRENT roles win on enable.
+    env.kc.mappings[uid].discard("data-owner")
+
+    resp = asyncio.run(main.admin_enable_user("alice", _req(), authorization="Bearer tok"))
+    assert resp.status_code == 200
+    body = json.loads(resp.body)
+    assert body["complete"] is True and body["enabled"] is True and body["was_enabled"] is False
+    assert body["roles"] == ["member"]
+    assert body["cascade"] == {"keycloak": "ok", "openfga": {"roles_restored": ["member"]},
+                               "denylist": "ok"}
+    assert env.kc.users[uid]["enabled"] is True
+    assert f"agt:disabled:alpha:{uid}" not in env.redis.kv
+    # role mirror == current Keycloak roles; viewer/editor/pending grants NOT resurrected;
+    # owner tuple (retained by the disable) still there.
+    assert _alice_tuples(env, alice) == {
+        (f"user:{alice}", "member", "group:role-member"),
+        (f"user:{alice}", "owner", "chunk:c9"),
+    }
+    [entry] = _audit(env, "admin_user_enabled")
+    assert entry["data"]["user_id"] == alice and entry["data"]["subject"] == bob
+    assert entry["data"]["action"] == "enable" and entry["data"]["roles"] == ["member"]
+    assert entry["data"]["cascade"]["denylist"] == "ok"
+
+
+def test_enable_is_idempotent(env, monkeypatch):
+    _as(monkeypatch, ADMIN)
+    uid, alice, _, _ = _seed_alice(env)
+    asyncio.run(main.admin_disable_user("alice", _req(), authorization="Bearer tok"))
+    first = asyncio.run(main.admin_enable_user("alice", _req(), authorization="Bearer tok"))
+    tuples_after_first = _alice_tuples(env, alice)
+    again = asyncio.run(main.admin_enable_user("alice", _req(), authorization="Bearer tok"))
+    assert first.status_code == again.status_code == 200
+    b = json.loads(again.body)
+    assert b["complete"] is True and b["was_enabled"] is True
+    assert b["roles"] == ["data-owner", "member"]
+    assert _alice_tuples(env, alice) == tuples_after_first == {
+        (f"user:{alice}", "member", "group:role-member"),
+        (f"user:{alice}", "member", "group:role-data-owner"),
+        (f"user:{alice}", "owner", "chunk:c9"),
+    }
+    assert env.kc.users[uid]["enabled"] is True
+    assert len(_audit(env, "admin_user_enabled")) == 2
+
+
+def test_enable_partial_failure_502_and_rerun_completes(env, monkeypatch):
+    _as(monkeypatch, ADMIN)
+    uid, alice, _, _ = _seed_alice(env)
+    asyncio.run(main.admin_disable_user("alice", _req(), authorization="Bearer tok"))
+    env.fga._client.fail = True
+    resp = asyncio.run(main.admin_enable_user("alice", _req(), authorization="Bearer tok"))
+    assert resp.status_code == 502
+    b = json.loads(resp.body)
+    assert b["complete"] is False and b["cascade"]["openfga"].startswith("failed")
+    assert b["cascade"]["keycloak"] == "ok" and b["cascade"]["denylist"] == "ok"
+    assert _audit(env, "admin_user_enable_incomplete")
+    env.fga._client.fail = False
+    resp = asyncio.run(main.admin_enable_user("alice", _req(), authorization="Bearer tok"))
+    assert resp.status_code == 200
+    assert (f"user:{alice}", "member", "group:role-data-owner") in env.fga._client.tuples
+
+
+def test_enable_keycloak_failure_keeps_denylist(env, monkeypatch):
+    """If the IdP step fails, the denylist is NOT cleared (no re-admit of old tokens for an
+    account Keycloak still holds disabled) and the role mirror is not touched → 502."""
+    _as(monkeypatch, ADMIN)
+    uid, alice, _, _ = _seed_alice(env)
+    asyncio.run(main.admin_disable_user("alice", _req(), authorization="Bearer tok"))
+    real = env.kc.handler
+
+    def flaky(req):
+        if req.method == "PUT" and req.url.path.endswith(f"/users/{uid}"):
+            return httpx.Response(500)
+        return real(req)
+    monkeypatch.setattr(main, "_kc_http_client",
+                        lambda: httpx.AsyncClient(transport=httpx.MockTransport(flaky)))
+    resp = asyncio.run(main.admin_enable_user("alice", _req(), authorization="Bearer tok"))
+    assert resp.status_code == 502
+    c = json.loads(resp.body)["cascade"]
+    assert c["keycloak"].startswith("failed")
+    assert c["openfga"] == c["denylist"] == "skipped:keycloak_failed"
+    assert env.redis.kv.get(f"agt:disabled:alpha:{uid}")
+    assert env.kc.users[uid]["enabled"] is False
+    assert _alice_tuples(env, alice) == {(f"user:{alice}", "owner", "chunk:c9")}
+
+
+def test_enabled_users_new_token_accepted_after_reenable(env, monkeypatch):
+    """End-to-end through the real token path: refused while disabled, a NEW token minted
+    after the re-enable is accepted on the next request."""
+    priv, j = _keypair("alpha-key")
+    _jwks(monkeypatch, j)
+    uid = env.kc.add_user("alice", "alice@example.com", roles=("member",))
+    admin_tok = _mint(priv, "alpha-key", ISS_A, AUD_A, "kc-bob", "bob@example.com",
+                      ["data-owner", "division-admin"])
+    old_tok = _mint(priv, "alpha-key", ISS_A, AUD_A, uid, "alice@example.com", ["member"])
+    asyncio.run(main.admin_disable_user("alice", _req(), authorization=f"Bearer {admin_tok}"))
+    with pytest.raises(main.HTTPException) as ei:
+        asyncio.run(main._get_bearer_token(f"Bearer {old_tok}"))
+    assert _status(ei) == 401 and ei.value.detail == "Account disabled"
+
+    resp = asyncio.run(main.admin_enable_user("alice", _req(), authorization=f"Bearer {admin_tok}"))
+    assert resp.status_code == 200
+    new_tok = _mint(priv, "alpha-key", ISS_A, AUD_A, uid, "alice@example.com", ["member"])
+    _, claims = asyncio.run(main._get_bearer_token(f"Bearer {new_tok}"))
+    assert claims["sub"] == uid
+
+
+def test_enable_self_conflict_and_unknown_404(env, monkeypatch):
+    _as(monkeypatch, ADMIN)
+    with pytest.raises(main.HTTPException) as ei:
+        asyncio.run(main.admin_enable_user("bob", _req(), authorization="Bearer tok"))
+    assert _status(ei) == 409
+    with pytest.raises(main.HTTPException) as ei:
+        asyncio.run(main.admin_enable_user("ghost", _req(), authorization="Bearer tok"))
+    assert _status(ei) == 404
     assert env.fga._client.tuples == set()
 
 

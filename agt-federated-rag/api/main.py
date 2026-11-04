@@ -551,6 +551,11 @@ async def _mark_account_disabled(sub: str) -> None:
     await r.set(_disabled_key(sub), str(int(time.time())))
 
 
+async def _clear_account_disabled(sub: str) -> None:
+    r = await _get_redis()
+    await r.delete(_disabled_key(sub))
+
+
 # ── Division-admin gate (FR-2.2 role: division admin) ──────────────────────────
 
 # The realm-role convention used across this product (see onboarding + tests/test_identity):
@@ -2528,7 +2533,8 @@ async def admin_kill_switch(
 
 
 # ── Division-admin user lifecycle (FR-2.2) ────────────────────────────────────
-# POST /admin/users, PUT /admin/users/{username}/roles, POST /admin/users/{username}/disable.
+# POST /admin/users, PUT /admin/users/{username}/roles, POST /admin/users/{username}/disable,
+# POST /admin/users/{username}/enable.
 #
 # Scope = THIS division only, by construction (NFR-2): the caller must present a token
 # validated against THIS division's issuer + audience + JWKS (_require_admin) — a foreign
@@ -2836,6 +2842,94 @@ async def admin_disable_user(
     return JSONResponse(status_code=200 if ok else 502, content={
         "division_id": settings.division_id, "username": username, "principal": target,
         "enabled": False, "complete": ok, "cascade": steps})
+
+
+@app.post("/admin/users/{username}/enable")
+async def admin_enable_user(
+    username: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """FR-2.2: re-enable a previously disabled user in THIS division (inverse of /disable).
+
+    Steps (each reported; idempotent — re-run to finish a partial):
+      1. keycloak — user enabled (sessions were revoked by the disable; the user logs in
+                    afresh). The user's CURRENT division realm roles are read back;
+      2. openfga  — role-group memberships rebuilt from those Keycloak roles (Keycloak is the
+                    single source of truth; division roles the user no longer holds are
+                    removed). Chunk ``viewer`` / ``editor`` / ``pending_approval`` tuples the
+                    disable deleted are deliberately NOT restored, and approval requests it
+                    auto-denied are not revived: re-enabling restores the ROLE, not past
+                    grants — any data access must be re-requested through the approval flow.
+                    ``owner`` tuples were retained by the disable and are untouched;
+      3. denylist — the agent stops refusing the user's tokens. Cleared LAST and only once
+                    Keycloak reports the user enabled, so a failed IdP step never re-admits
+                    tokens for an account the IdP still holds disabled.
+    200 when every step succeeded, 502 with the per-step report otherwise. Admin-only;
+    audited. 409 if an admin targets themselves (mirrors /disable's self-guard)."""
+    caller, _ = await _require_admin(authorization)
+    await _check_rate_limit(caller)
+    _validate_username(username)
+
+    from auth import keycloak_admin as ka
+    steps: dict[str, Any] = {}
+    roles: list[str] | None = None
+    try:
+        async with _kc_admin() as (c, kc, realm, h):
+            u = await ka.find_user(c, kc, realm, h, username)
+            if not u:
+                raise HTTPException(status_code=404, detail="User not found in this division")
+            target = _user_principal(username, str(u.get("email", "")))
+            if target == caller:
+                raise HTTPException(status_code=409, detail="An admin cannot enable themselves")
+            was_enabled = bool(u.get("enabled", True))
+            # 1. Keycloak: enable + read the authoritative division roles.
+            try:
+                await ka.set_enabled(c, kc, realm, h, u["id"], True)
+                roles = sorted(set(await ka.get_realm_roles(c, kc, realm, h, u["id"]))
+                               & set(ka.DIVISION_ROLES))
+                steps["keycloak"] = "ok"
+            except Exception as exc:
+                steps["keycloak"] = f"failed:{type(exc).__name__}"
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _idp_unavailable("enable", exc)
+
+    # 2. OpenFGA: converge the role mirror to the CURRENT Keycloak roles (never past grants).
+    if roles is None:
+        steps["openfga"] = "skipped:keycloak_failed"
+    else:
+        try:
+            fga = await agent_nodes._get_openfga()
+            for role in roles:
+                await fga.add_role_membership(target, role)
+            for role in sorted(set(ka.DIVISION_ROLES) - set(roles)):
+                await fga.remove_role_membership(target, role)
+            steps["openfga"] = {"roles_restored": roles}
+        except Exception as exc:
+            steps["openfga"] = f"failed:{type(exc).__name__}"
+
+    # 3. Denylist: re-admit tokens only once the IdP agrees the account is enabled.
+    if steps["keycloak"] != "ok":
+        steps["denylist"] = "skipped:keycloak_failed"
+    else:
+        try:
+            await _clear_account_disabled(u["id"])
+            steps["denylist"] = "ok"
+        except Exception as exc:
+            steps["denylist"] = f"failed:{type(exc).__name__}"
+
+    ok = not any(isinstance(v, str) and v.startswith(("failed", "skipped"))
+                 for v in steps.values())
+    emit = log.info if ok else log.warning
+    emit("admin_user_enabled" if ok else "admin_user_enable_incomplete",
+         user_id=target, subject=caller, action="enable", cascade=steps, roles=roles,
+         division_id=settings.division_id, agt_audit=True)
+    return JSONResponse(status_code=200 if ok else 502, content={
+        "division_id": settings.division_id, "username": username, "principal": target,
+        "enabled": steps["keycloak"] == "ok", "was_enabled": was_enabled, "complete": ok,
+        "roles": roles, "cascade": steps})
 
 
 # ── Exception handlers ────────────────────────────────────────────────────────
