@@ -165,13 +165,40 @@ async def _get_evaluator() -> PolicyEvaluator:
     return _evaluator
 
 
+# Governance context each action MUST carry. The AGT PolicyEvaluator treats a deny rule whose
+# field is ABSENT as "no match", so the action's allow rule would win — a call site that
+# forgot e.g. peer_did_verified would silently skip require-peer-did-verified. Every listed
+# field is sent by EVERY current call site of its action (pinned by
+# tests/test_governance.py::test_required_context_matches_every_call_site), so this changes no
+# real flow; it makes a future omission FAIL CLOSED instead of failing open.
+# Deliberately NOT listed (see PROJECT_STATUS): peer.receive_callback (the post-verification
+# node passes no peer_* fields; the API layer enforces them with full context), and fields no
+# call site computes today — tool_category (mcp.call), agent_trust_score,
+# requested_chunk_count — whose deny rules are therefore inert until those values are wired.
+REQUIRED_CONTEXT: dict[str, tuple[str, ...]] = {
+    "rag.retrieve": ("query_length", "qdrant_collection"),
+    "llm.generate": ("context_char_count",),
+    "agent.output_check": ("llm_output",),
+    "peer.send_message": ("peer_did_verified", "transport_encrypted", "peer_trust_score",
+                          "peer_execution_ring", "peer_circuit_state"),
+}
+
+
 async def _enforce(action: str, context: dict[str, Any]) -> None:
     """Raise PermissionError if the AGT policy engine denies the action.
 
     This is the primary governance gate.  Every node calls this before doing
     any work.  The evaluator runs all YAML policies in settings.policy_dir in
-    priority order; the highest-priority matching rule wins.
+    priority order; the highest-priority matching rule wins. Context fields an
+    action's deny rules depend on (REQUIRED_CONTEXT) must be present — a missing
+    one is a deny, never a silent pass.
     """
+    missing = [f for f in REQUIRED_CONTEXT.get(action, ()) if context.get(f) is None]
+    if missing:
+        log.warning("agt_policy_denied", action=action, reason="missing_governance_context",
+                    missing=missing, agt_audit=True)
+        raise PermissionError(
+            f"Policy denied action '{action}': missing governance context {missing}")
     evaluator = await _get_evaluator()
     result = evaluator.evaluate({"action": action, **context})
     if not result.allowed:

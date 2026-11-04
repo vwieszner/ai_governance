@@ -125,15 +125,78 @@ def test_policy_decision_matrix():
 
 
 def test_absent_field_semantics_are_pinned():
-    # KNOWN SEMANTIC GAP, pinned on purpose: under the current engine a deny rule
-    # whose field is ABSENT from the context does not match, so the action's allow
-    # rule wins. E.g. peer.send_message with no peer_* fields at all is ALLOWED.
-    # Every real call site sends these fields (see the matrix above), so this is
-    # latent, not exploitable today. AGT's ACS migration changes `ne`/`not_in` on an
-    # absent field to fail CLOSED — when this test fails after migration, that is the
-    # expected (safer) change: update the pins deliberately.
+    # ENGINE semantics, pinned on purpose: in the PolicyEvaluator a deny rule whose field
+    # is ABSENT does not match, so the action's allow rule wins. The app no longer relies
+    # on this: agent.nodes._enforce refuses an action whose REQUIRED_CONTEXT is missing
+    # (test_enforce_denies_missing_required_context below). AGT's ACS migration changes
+    # `ne`/`not_in` on an absent field to fail CLOSED at the engine too — when this test
+    # fails after migration, that is the expected (safer) change: update it deliberately.
     ev = _evaluator()
     assert _allowed(ev, "peer.send_message")
     assert _allowed(ev, "peer.send_message", peer_did_verified=True,
                     transport_encrypted=True, peer_trust_score=0.9)  # ring absent
     assert _allowed(ev, "rag.retrieve", query_length=10)  # collection absent
+
+
+# ── Required governance context (closes the absent-field gap at the app layer) ──
+
+_FULL_CONTEXT = {
+    "rag.retrieve": {"query_length": 20, "qdrant_collection": "knowledge_base"},
+    "llm.generate": {"context_char_count": 1000},
+    "agent.output_check": {"llm_output": "Our retention policy is 7 years."},
+    "peer.send_message": dict(_TRUSTED_PEER),
+}
+
+
+def test_enforce_denies_missing_required_context():
+    """Through the REAL _enforce + real policies: a complete context is allowed; dropping ANY
+    required field is a deny (previously the allow rule won when the field was absent)."""
+    import asyncio
+
+    import pytest
+
+    from agent import nodes
+
+    assert set(_FULL_CONTEXT) == set(nodes.REQUIRED_CONTEXT)
+    for action, ctx in _FULL_CONTEXT.items():
+        asyncio.run(nodes._enforce(action, dict(ctx)))            # allowed
+        for field in nodes.REQUIRED_CONTEXT[action]:
+            partial = {k: v for k, v in ctx.items() if k != field}
+            with pytest.raises(PermissionError, match="missing governance context"):
+                asyncio.run(nodes._enforce(action, partial))
+            with pytest.raises(PermissionError, match="missing governance context"):
+                asyncio.run(nodes._enforce(action, {**ctx, field: None}))
+
+
+def test_required_context_matches_every_call_site():
+    """Every _enforce/enforce call for an action in REQUIRED_CONTEXT must pass a LITERAL dict
+    containing all its required fields — so the runtime check never fires on a real flow,
+    and a future call site that forgets a field fails here, in CI."""
+    import ast
+
+    from agent.nodes import REQUIRED_CONTEXT
+
+    root = Path(__file__).resolve().parents[1]
+    files = ["agent/nodes.py", "agent/specialists.py", "api/main.py", "tools/mcp.py"]
+    seen: dict[str, int] = {}
+    problems = []
+    for rel in files:
+        for n in ast.walk(ast.parse((root / rel).read_text(encoding="utf-8"))):
+            if not isinstance(n, ast.Call):
+                continue
+            name = n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+            if name not in ("_enforce", "enforce") or len(n.args) < 2:
+                continue
+            if not isinstance(n.args[0], ast.Constant) or n.args[0].value not in REQUIRED_CONTEXT:
+                continue
+            action = n.args[0].value
+            seen[action] = seen.get(action, 0) + 1
+            if not isinstance(n.args[1], ast.Dict):
+                problems.append(f"{rel}:{n.lineno} {action}: context is not a literal dict")
+                continue
+            keys = {k.value for k in n.args[1].keys if isinstance(k, ast.Constant)}
+            lacking = set(REQUIRED_CONTEXT[action]) - keys
+            if lacking:
+                problems.append(f"{rel}:{n.lineno} {action}: missing {sorted(lacking)}")
+    assert not problems, problems
+    assert set(seen) == set(REQUIRED_CONTEXT), f"no call site found for {set(REQUIRED_CONTEXT) - set(seen)}"
