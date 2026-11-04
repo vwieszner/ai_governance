@@ -12,6 +12,34 @@ comments, or prior handoff notes. Full backend suite (current): **252 passed, 2 
 (254 collected)**. The skips are live-infra integration tests (cross-store isolation,
 admin-lifecycle) plus one honest abstention (discovery lookup is not bounded — see NFR-6).
 
+### Update log — 2026-11-04 (governance gaps closed, one startup bug fixed)
+- **Mosaic-effect guard** (`agent/context_guard.py`, AGT 5.0 context accumulation): evaluates the
+  *combination* of what a user receives against deterministic YAML rules
+  (`agent/policies/aggregation/`). HR + Finance escalates into the existing approval workflow
+  (clearance object `mosaic-<rule>`); deny withholds; fails closed if the policy is missing.
+  **Covers federated answers:** peers return the label names of the chunks they used inside the
+  signed `/a2a/query` response; a per-user release ledger (15-min window, in memory per replica)
+  checks each release against what came from other origins. Unlabeled/unverified peer answers
+  count as an `unlabeled-peer` label. Approval requests now name the contributing sources.
+- **FR-2.2 user lifecycle — DONE:** `POST /admin/users`, `PUT …/roles`, `POST …/disable`,
+  `POST …/enable` (division-admin only, cross-division isolated, audited). Disable cascades
+  (Redis denylist → Keycloak disable + logout → OpenFGA grants removed, owner kept → own approval
+  requests withdrawn → inbox purged). Re-enable restores role memberships from Keycloak but not
+  the removed grants, and **never revives a pre-disable token** (`iat <= disable time` refused —
+  the same-second boundary was found by a live Keycloak run and fixed). Existing divisions must
+  re-run onboarding (the agent's service account gets user-management roles in its own realm).
+- **FR-3 multi-peer routing — DONE:** discovered delegation goes to the selected peer; the
+  destination URL and key come only from the local `peer_trust_map`, never from the broker.
+- **NFR-3 OCSP — DONE, non-blocking** (see M7 below).
+- **LLM gateway:** residency=local divisions get an in-boundary embedding model
+  (`local/nv-embedqa-e5-v5`, no external fallback); onboarding now writes the containerized
+  agent's `.env.<id>.agent` (gitignored) and the template's container paths were fixed.
+- **Fixed — agent could not start with `require_mtls` + CRL/OCSP** (pre-existing): truststore's
+  `ssl.SSLContext` rebind made uvicorn reject the genuine serving context (TypeError). Proven
+  live: `api.main.run()` with mTLS + CRL starts, cert → 200, no cert → refused.
+- **Still open:** the absent-field policy gap and the `localhost` SSRF question (decisions);
+  the ledger is per replica (multi-replica needs Redis); live stacks/k8s/real NIM on the host.
+
 ### Update log — 2026-11-03 (AGT 5.0, supply chain, LLM gateway)
 - **AGT 3.7 → 5.0.** The six per-component packages became `agent-governance-toolkit-core` +
   `-cli` 5.0.0 (import names unchanged; they now emit `DeprecationWarning`). Capped `<6.0`:
@@ -261,8 +289,10 @@ Still open: a true third-party pen-test. Probes + write-ups:
   REVOKED always refused. Issuer: `issue_division_certs.py --ocsp-url`. Hermetic `tests/test_ocsp.py`
   (30) + **live proof** `examples/mtls-ocsp/prove_ocsp_live.py` (real `openssl ocsp` responder +
   uvicorn via `tls_serving_kwargs`: good accepted, revoked/unknown refused, hard vs soft on outage).
-  Caveats: a cache miss blocks the event loop for ≤`TLS_OCSP_TIMEOUT` (3s); server-side stapling
-  still needs a TLS front-end; the **nginx-edge** mode needs `ssl_crl`/`ssl_ocsp` wired separately.
+  **Non-blocking since 2026-11-04:** the handshake only reads the cache; a miss is decided by an
+  async connection gate (`gated_http_protocol`) that holds the connection's bytes until the answer
+  (single-flight per serial, background refresh before nextUpdate), so a slow responder delays only
+  that peer, never the server. Caveats: server-side stapling still needs a TLS front-end; the **nginx-edge** mode needs `ssl_crl`/`ssl_ocsp` wired separately.
 - ✅ **NFR-6 — Bounded lookups — DONE (2026-06-17).** Inbox is O(1); `discovery/registry.py::find()`
   now uses a capability→DIDs index (point read, not O(N) scan); `test_discovery_wiring.py` proves the
   lookup touches only matching entries regardless of registry size.
@@ -287,7 +317,7 @@ Still open: a true third-party pen-test. Probes + write-ups:
 
 ## Test reality
 
-- Full backend suite: **404 passed, 8 skipped** (2026-11-03, on AGT 5.0, Python 3.11 and 3.12 —
+- Full backend suite: **531 passed, 8 skipped** (2026-11-04, all merged work; UI `npm test` 14 passed + build). Before that: **404 passed, 8 skipped** (2026-11-03, on AGT 5.0, Python 3.11 and 3.12 —
   incl. the new 27-row policy decision matrix). Earlier: **343 passed, 1 skipped** (as of 2026-06-19, post Wave-7 cross-agent tool
   delegation + its F2 security-review fix; was **252 passed, 2 skipped** at the 2026-06-17 audit,
   itself up from 138/2 at first audit — the growth is this session's retriever feature + gap-fix +
