@@ -235,7 +235,7 @@ def load_crl_bundle(ca_path: str, crl_path: str) -> str:
 def server_context(cert_path: str, key_path: str, ca_path: str,
                    crl_path: str | None = None,
                    ocsp_staple_file: str | None = None,
-                   ocsp_checker=None) -> ssl.SSLContext:
+                   ocsp_checker=None, ocsp_defer: bool = False) -> ssl.SSLContext:
     """Server SSL context that REQUIRES a client certificate signed by our CA (mTLS).
     (check_hostname is a client-side setting; not applicable on a server context.)
 
@@ -259,7 +259,10 @@ def server_context(cert_path: str, key_path: str, ca_path: str,
     OCSP CHECKING (enforced, NFR-3): ``ocsp_checker`` (a ``transport.ocsp.OCSPChecker``) queries
     the peer cert's OCSP responder right after OpenSSL verifies the chain, inside the handshake
     object, and aborts the connection on REVOKED (or any non-GOOD in hard mode) — see
-    transport/ocsp.py for why it is post-verify rather than an OpenSSL callback."""
+    transport/ocsp.py for why it is post-verify rather than an OpenSSL callback. With
+    ``ocsp_defer=True`` the handshake decides from the OCSP cache only (no I/O on the event loop)
+    and a miss is decided by ``ocsp.gated_http_protocol`` — use it ONLY with that gate (which
+    ``tls_serving_kwargs`` always installs alongside)."""
     if ocsp_staple_file:
         # Fail loud on a configured-but-missing staple, mirroring load_crl_bundle: a
         # misconfigured stapling path must not be silently ignored.
@@ -282,7 +285,7 @@ def server_context(cert_path: str, key_path: str, ca_path: str,
             ctx.load_verify_locations(ca_path)
         if ocsp_checker is not None and ocsp_checker.mode != "off":
             from transport.ocsp import install_on_context
-            install_on_context(ctx, ocsp_checker)
+            install_on_context(ctx, ocsp_checker, defer_misses=ocsp_defer)
     return ctx
 
 
@@ -343,7 +346,8 @@ def tls_serving_kwargs(s) -> dict:
         )
     crl = crl_path_for(s)
     staple = ocsp_staple_file_for(s)
-    from transport.ocsp import checker_from_env, ocsp_mode_for, ocsp_responder_override_for
+    from transport.ocsp import (checker_from_env, gated_http_protocol, ocsp_mode_for,
+                                ocsp_responder_override_for)
     ocsp_mode = ocsp_mode_for(s)            # raises on a typo'd mode (fail loud)
     checker = (checker_from_env(ca, ocsp_mode, ocsp_responder_override_for(s))
                if ocsp_mode != "off" else None)
@@ -354,11 +358,18 @@ def tls_serving_kwargs(s) -> dict:
         # republished CRL on a reload. ``staple`` is the OCSP-stapling readiness hook (validated
         # by server_context; enforcement still needs a TLS front-end — see its docstring).
         # ``checker`` (TLS_OCSP_MODE=soft|hard) adds the post-verify OCSP gate; it is created
-        # once here so its per-serial cache survives a rebind.
+        # once here so its per-serial cache survives a rebind. The handshake only consults the
+        # OCSP cache (ocsp_defer); a miss is decided asynchronously by the gated HTTP protocol
+        # before any request byte is parsed, so a slow responder never stalls the event loop
+        # (transport/ocsp.py design note). Returned TOGETHER: never the deferring context alone.
         def _factory(_config, _default):
             return server_context(cert, key, ca, crl_path=crl or None,
-                                  ocsp_staple_file=staple or None, ocsp_checker=checker)
-        return {"ssl_context_factory": _factory}
+                                  ocsp_staple_file=staple or None, ocsp_checker=checker,
+                                  ocsp_defer=checker is not None)
+        kw: dict = {"ssl_context_factory": _factory}
+        if checker is not None:
+            kw["http"] = gated_http_protocol(checker)
+        return kw
     return {
         "ssl_certfile": cert,
         "ssl_keyfile": key,

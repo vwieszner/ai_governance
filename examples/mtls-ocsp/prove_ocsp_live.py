@@ -12,10 +12,15 @@ What it does (all key material goes to a fresh temp dir — never the repo):
      (transport.mtls.tls_serving_kwargs → ssl_context_factory → server_context + the OCSP
      handshake hook), one server in hard mode and one in soft mode; the (empty) CRL is also
      loaded so the proof shows OCSP catching a revocation the CRL doesn't list yet.
-  4. Makes real mTLS requests with each client cert and asserts accept/refuse, then kills the
-     responder to show hard (fail-closed) vs soft (fail-open + warn) and the per-serial cache.
+  4. Makes real mTLS requests with each client cert and asserts accept/refuse.
+  5. Slow responder: a relay that delays every OCSP answer by 2s sits in front of the same
+     ``openssl ocsp``; a third (hard) server uses it. While one peer's uncached OCSP check is
+     waiting on the slow responder, a concurrent request from an already-cached peer must
+     complete promptly (the check runs off the event loop), and a slow REVOKED peer is refused.
+  6. Kills the responder to show hard (fail-closed) vs soft (fail-open + warn) and the cache.
 
-Ports: responder 20480, hard server 20443, soft server 20444 (host ports 20000-20999).
+Ports: responder 20480, slow relay 20481, hard 20443, soft 20444, hard-via-slow 20445
+(host ports 20000-20999).
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,7 +45,9 @@ from cryptography import x509  # noqa: E402
 from transport import mtls  # noqa: E402
 
 OCSP_PORT, HARD_PORT, SOFT_PORT = 20480, 20443, 20444
+SLOW_PORT, SLOW_SERVER_PORT, SLOW_DELAY = 20481, 20445, 2.0
 OCSP_URL = f"http://127.0.0.1:{OCSP_PORT}"
+SLOW_URL = f"http://127.0.0.1:{SLOW_PORT}"
 FAILS: list[str] = []
 
 
@@ -72,16 +80,35 @@ async def _app(scope, receive, send):
 
 
 class _Settings:
-    def __init__(self, out, mode):
+    def __init__(self, out, mode, responder_url=""):
         self.require_mtls = True
         self.tls_cert_file, self.tls_key_file = out["alpha"]
         self.tls_ca_file = out["_ca"]
         self.tls_crl_file = out["_crl"]          # empty CRL: CRL gate on, nobody listed
         self.tls_ocsp_mode = mode                 # responder URL comes from each cert's AIA
+        self.tls_ocsp_responder_url = responder_url   # ...unless overridden (slow relay)
 
 
-def _serve(out, mode, port):
-    kwargs = mtls.tls_serving_kwargs(_Settings(out, mode))
+class _SlowRelay(BaseHTTPRequestHandler):
+    """Forwards each OCSP POST to the real `openssl ocsp` after sleeping SLOW_DELAY seconds."""
+
+    def do_POST(self):  # noqa: N802
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        time.sleep(SLOW_DELAY)
+        r = httpx.post(OCSP_URL, content=body, timeout=10, trust_env=False,
+                       headers={"Content-Type": "application/ocsp-request"})
+        self.send_response(r.status_code)
+        self.send_header("Content-Type", "application/ocsp-response")
+        self.send_header("Content-Length", str(len(r.content)))
+        self.end_headers()
+        self.wfile.write(r.content)
+
+    def log_message(self, *_a):
+        pass
+
+
+def _serve(out, mode, port, responder_url=""):
+    kwargs = mtls.tls_serving_kwargs(_Settings(out, mode, responder_url))
     assert "ssl_context_factory" in kwargs
     server = uvicorn.Server(uvicorn.Config(_app, host="127.0.0.1", port=port,
                                            log_level="warning", **kwargs))
@@ -90,9 +117,11 @@ def _serve(out, mode, port):
     return server
 
 
-def _call(out, port, div, expect_ok: bool, label: str) -> None:
+def _call(out, port, div, expect_ok: bool, label: str,
+          max_s: float | None = None, min_s: float | None = None) -> None:
     crt, key = out[div]
     ctx = mtls.client_context(out["_ca"], crt, key)
+    t0 = time.monotonic()
     try:
         with httpx.Client(verify=ctx, trust_env=False, timeout=10) as c:
             r = c.get(f"https://localhost:{port}/")
@@ -101,10 +130,13 @@ def _call(out, port, div, expect_ok: bool, label: str) -> None:
     except Exception as exc:  # noqa: BLE001
         got = f"REFUSED ({type(exc).__name__}: {str(exc)[:70]})"
         ok = False
-    verdict = "PASS" if ok == expect_ok else "FAIL"
+    took = time.monotonic() - t0
+    in_time = (max_s is None or took <= max_s) and (min_s is None or took >= min_s)
+    verdict = "PASS" if ok == expect_ok and in_time else "FAIL"
     if verdict == "FAIL":
         FAILS.append(label)
-    print(f"[{verdict}] {label:<58} -> {got}")
+    timing = f" in {took:.2f}s" if (max_s or min_s) else ""
+    print(f"[{verdict}] {label:<58} -> {got}{timing}")
 
 
 def main() -> int:
@@ -155,6 +187,25 @@ def main() -> int:
         _call(out, HARD_PORT, "delta", False, "hard: delta (OCSP unknown)")
         _call(out, SOFT_PORT, "gamma", False, "soft: gamma (REVOKED always denies)")
         _call(out, SOFT_PORT, "delta", True, "soft: delta (unknown → allow + warn)")
+
+        relay = ThreadingHTTPServer(("127.0.0.1", SLOW_PORT), _SlowRelay)
+        threading.Thread(target=relay.serve_forever, daemon=True).start()
+        slow_srv = _serve(out, "hard", SLOW_SERVER_PORT, responder_url=SLOW_URL)
+        print(f"\n[slow] relay {SLOW_URL} delays every openssl-ocsp answer by {SLOW_DELAY:.0f}s; "
+              f"hard server :{SLOW_SERVER_PORT} uses it")
+        _call(out, SLOW_SERVER_PORT, "beta", True, "slow: beta first contact (waits on OCSP)",
+              min_s=SLOW_DELAY - 0.1)
+        pending = threading.Thread(target=_call, args=(
+            out, SLOW_SERVER_PORT, "epsilon", True,
+            "slow: epsilon uncached (concurrent, waits on OCSP)"), kwargs={"min_s": SLOW_DELAY - 0.1})
+        pending.start()
+        time.sleep(0.3)        # epsilon's OCSP fetch is now in flight on the slow responder
+        _call(out, SLOW_SERVER_PORT, "beta", True, "slow: beta cached, DURING epsilon's fetch",
+              max_s=0.75)
+        pending.join()
+        _call(out, SLOW_SERVER_PORT, "gamma", False, "slow: gamma REVOKED via slow responder")
+        relay.shutdown()
+        slow_srv.should_exit = True
 
         responder.terminate()
         responder.wait(10)

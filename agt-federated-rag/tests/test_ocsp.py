@@ -9,7 +9,11 @@ a real ``openssl ocsp`` responder is examples/mtls-ocsp/prove_ocsp_live.py.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
+import socket
+import threading
+import time
 
 import pytest
 from cryptography import x509
@@ -310,3 +314,201 @@ def test_invalid_ocsp_mode_fails_loud(pki, monkeypatch):
     monkeypatch.setenv("TLS_OCSP_MODE", "hrad")
     with pytest.raises(ValueError):
         mtls.tls_serving_kwargs(_S(pki))
+
+
+def test_serving_kwargs_pair_deferred_context_with_gate(pki, monkeypatch):
+    # The deferring handshake (cache-only) is only ever handed out WITH the async gate.
+    monkeypatch.setattr(mtls, "CRL_FILE", "")
+    monkeypatch.setenv("TLS_OCSP_MODE", "soft")
+    kw = mtls.tls_serving_kwargs(_S(pki))
+    ctx = kw["ssl_context_factory"](None, None)
+    assert ctx.ocsp_deferred is True
+    assert kw["http"].ocsp_checker is ctx.ocsp_checker
+
+
+# ── non-blocking: single-flight, refresh-ahead, deferred handshake, live event loop ─────────────
+
+class _SlowResponder(_Responder):
+    """Thread-safe fake responder that sleeps ``delay`` before answering (a slow OCSP server)."""
+
+    def __init__(self, pki, delay, **kw):
+        super().__init__(pki, **kw)
+        self.delay, self._mu = delay, threading.Lock()
+
+    def __call__(self, url, body, timeout):
+        with self._mu:
+            self.calls.append(url)
+        time.sleep(self.delay)
+        if self.down:
+            raise ConnectionRefusedError("responder down")
+        nonce = xocsp.load_der_ocsp_request(body).extensions.get_extension_for_class(
+            x509.OCSPNonce).value.nonce
+        return _response(self.pki, self.status, nonce=nonce, **self.kw)
+
+
+def test_single_flight_threads_one_fetch(pki):
+    r = _SlowResponder(pki, 0.3)
+    c = _checker(pki, "hard", r)
+    out = []
+    ts = [threading.Thread(target=lambda: out.append(c.decide(pki["leaf"]))) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert [a for a, _ in out] == [True] * 8
+    assert c.fetches == 1 and len(r.calls) == 1
+
+
+def test_single_flight_async_one_fetch(pki):
+    r = _SlowResponder(pki, 0.3)
+    c = _checker(pki, "hard", r)
+
+    async def go():
+        return await asyncio.gather(*(c.adecide(pki["leaf"]) for _ in range(20)))
+
+    res = asyncio.run(go())
+    assert all(a for a, _ in res) and c.fetches == 1 and len(r.calls) == 1
+
+
+def test_refresh_ahead_in_background(pki):
+    t = [NOW]
+    r = _SlowResponder(pki, 0.0, next_=NOW + H)
+    c = ocsp.OCSPChecker([pki["ca_cert"]], "hard", fetch=r, clock=lambda: t[0],
+                         refresh_before=120)
+
+    async def go():
+        assert (await c.adecide(pki["leaf"]))[0] and c.fetches == 1
+        t[0] = NOW + H - datetime.timedelta(seconds=60)      # inside the refresh window
+        # 1) a failed early refresh keeps the still-valid cached GOOD (not downgraded to error)
+        r.down = True
+        assert (await c.adecide(pki["leaf"]))[1].status == "good"   # answered from cache at once
+        await asyncio.sleep(0.2)
+        assert c.fetches == 2 and c.cached(pki["leaf"]).status == "good"
+        # 2) an authenticated REVOKED from a refresh replaces it immediately
+        r.down, r.status = False, xocsp.OCSPCertStatus.REVOKED
+        r.kw = {"this": t[0], "next_": t[0] + H}
+        await c.adecide(pki["leaf"])
+        await asyncio.sleep(0.2)
+        assert c.fetches == 3
+        return await c.adecide(pki["leaf"])
+
+    allow, res = asyncio.run(go())
+    assert (allow, res.status) == (False, "revoked")
+
+
+def test_deferred_handshake_never_fetches_but_refuses_cached_revoked(pki):
+    r = _SlowResponder(pki, 2.0)
+    c = _checker(pki, "hard", r)
+    ctx = mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"], ocsp_checker=c,
+                              ocsp_defer=True)
+    t0 = time.monotonic()
+    assert _handshake_ok(ctx, mtls.client_context(pki["ca"], pki["c_crt"], pki["c_key"])) is True
+    assert time.monotonic() - t0 < 1.0 and r.calls == []       # miss: no I/O in the handshake
+    rev = _checker(pki, "soft", _Responder(pki, xocsp.OCSPCertStatus.REVOKED))
+    rev.check(pki["leaf"])                                       # cached REVOKED
+    rctx = mtls.server_context(pki["s_crt"], pki["s_key"], pki["ca"], ocsp_checker=rev,
+                               ocsp_defer=True)
+    assert _handshake_ok(rctx, mtls.client_context(pki["ca"], pki["c_crt"], pki["c_key"])) is False
+
+
+def _free_port() -> int:
+    for port in range(20900, 21000):
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError("no free port in 20900-20999")
+
+
+class _PerCertResponder:
+    """Answers per serial: ``plan[serial] = (delay, status, cert)``."""
+
+    def __init__(self, pki, plan):
+        self.pki, self.plan, self.calls = pki, plan, []
+
+    def __call__(self, url, body, timeout):
+        req = xocsp.load_der_ocsp_request(body)
+        delay, status, cert = self.plan[req.serial_number]
+        self.calls.append(req.serial_number)
+        time.sleep(delay)
+        nonce = req.extensions.get_extension_for_class(x509.OCSPNonce).value.nonce
+        return _response(self.pki, status, nonce=nonce, leaf=cert)
+
+
+@pytest.mark.parametrize("deferred", [True, False])
+def test_slow_responder_does_not_block_event_loop(pki, tmp_path, deferred):
+    """Real uvicorn mTLS server: peer A's OCSP fetch takes 2s; a concurrent request from peer B
+    (answer cached) must complete promptly. ``deferred=False`` is the old in-handshake check —
+    the control proving this test detects a blocked loop. A slow REVOKED peer never hits the app."""
+    import httpx
+    import uvicorn
+
+    certs = {}
+    for div in ("gamma", "epsilon"):
+        pair = mtls.issue_division_cert(pki["ca_key"], pki["ca_cert"], div,
+                                        ocsp_url="http://127.0.0.1:1/")
+        certs[div] = (pair.cert, *pair.write(tmp_path, div))
+    good, revoked = xocsp.OCSPCertStatus.GOOD, xocsp.OCSPCertStatus.REVOKED
+    fetch = _PerCertResponder(pki, {
+        pki["leaf"].serial_number: (2.0, good, pki["leaf"]),
+        certs["gamma"][0].serial_number: (0.0, good, certs["gamma"][0]),
+        certs["epsilon"][0].serial_number: (1.0, revoked, certs["epsilon"][0])})
+    checker = _checker(pki, "hard", fetch)
+    checker.check(certs["gamma"][0])                              # B's answer is cached
+    hits = []
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        hits.append(scope["client"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    port = _free_port()
+    kw = {"ssl_context_factory": lambda _c, _d: mtls.server_context(
+        pki["s_crt"], pki["s_key"], pki["ca"], ocsp_checker=checker, ocsp_defer=deferred)}
+    if deferred:
+        kw["http"] = ocsp.gated_http_protocol(checker)
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", **kw)
+    # Another test may have imported api.main (truststore.inject_into_ssl rebinds ssl.SSLContext,
+    # failing uvicorn's isinstance check on our genuine context) — load the config without it.
+    with mtls._genuine_ssl():
+        config.load()
+    server = uvicorn.Server(config)
+    th = threading.Thread(target=server.run, daemon=True)
+    th.start()
+    try:
+        for _ in range(200):
+            if server.started:
+                break
+            time.sleep(0.05)
+        results = {}
+
+        def call(name, crt, key):
+            t0 = time.monotonic()
+            try:
+                with httpx.Client(verify=mtls.client_context(pki["ca"], crt, key),
+                                  trust_env=False, timeout=10) as cl:
+                    results[name] = (cl.get(f"https://localhost:{port}/").status_code,
+                                     time.monotonic() - t0)
+            except httpx.HTTPError as exc:
+                results[name] = (type(exc).__name__, time.monotonic() - t0)
+
+        slow = threading.Thread(target=call, args=("A", pki["c_crt"], pki["c_key"]))
+        slow.start()
+        time.sleep(0.3)                                   # A is now waiting on its OCSP fetch
+        call("B", certs["gamma"][1], certs["gamma"][2])
+        slow.join()
+        if deferred:
+            assert results["B"][0] == 200 and results["B"][1] < 0.75, results
+            assert results["A"][0] == 200 and results["A"][1] >= 1.9, results
+            n = len(hits)
+            call("R", certs["epsilon"][1], certs["epsilon"][2])          # slow + REVOKED
+            assert results["R"][0] != 200 and len(hits) == n, results    # never reached the app
+        else:
+            assert results["B"][1] >= 1.4, results        # old path: B stalled behind A's fetch
+    finally:
+        server.should_exit = True
+        th.join(10)
