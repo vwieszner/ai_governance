@@ -337,6 +337,12 @@ class Settings(BaseSettings):
     # user's HR and Finance releases across pods; unreachable → the guard fails closed
     # (escalates). "memory" = in-process per replica — tests / single-process dev only.
     mosaic_ledger_backend: Literal["redis", "memory"] = "redis"
+    # A clearance approved WHILE the ledger was unreachable ("release history unavailable")
+    # only vouches for that moment. It is ALWAYS written time-bound (OpenFGA conditional
+    # tuple), even when approval_grant_ttl_seconds == 0 (permanent grants); a shorter global
+    # TTL still wins. Never 0: a permanent outage clearance would become a standing bypass
+    # of the mosaic guard during every later outage.
+    mosaic_outage_clearance_ttl_seconds: int = Field(default=900, gt=0)
 
     # ── Graph-level kill-switch (AgentMesh govern_action gate) ───────────────
     # Operator emergency off-switch. When true, the graph-level govern_action

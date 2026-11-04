@@ -137,3 +137,41 @@ def test_reask_reenters_approval():
 
     decision = asyncio.run(auth.decide("user:alice", "chunk:q4"))
     assert decision == ofga.AuthzDecision.NEEDS_APPROVAL
+
+
+def test_mosaic_outage_clearance_is_never_permanent(monkeypatch):
+    # A clearance approved while the mosaic ledger was unreachable vouches only for that
+    # moment: with permanent grants configured (ttl == 0) it is STILL time-bound
+    # (mosaic_outage_clearance_ttl_seconds), while an ordinary chunk stays permanent.
+    from agent.context_guard import ledger_unavailable_clearance_id
+    from config import settings
+    from workflow.activities import (OUTAGE_CLEARANCE_PREFIX, GrantAccessInput,
+                                     grant_access_in_openfga)
+
+    outage_id = ledger_unavailable_clearance_id(["financial", "hr"])
+    assert outage_id.startswith(OUTAGE_CLEARANCE_PREFIX)   # pins the two modules together
+    fga = _patch_singleton_and_ttl(monkeypatch, 0)
+    monkeypatch.setattr(settings, "mosaic_outage_clearance_ttl_seconds", 900)
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(grant_access_in_openfga(
+        GrantAccessInput(user_id="user:alice", chunk_ids=["c1", outage_id, "mosaic-hr-finance"])))
+
+    assert fga.viewer == [("user:alice", "c1"), ("user:alice", "mosaic-hr-finance")]
+    assert [(u, c) for (u, c, _e) in fga.viewer_until] == [("user:alice", outage_id)]
+    delta = (datetime.fromisoformat(fga.viewer_until[0][2]) - before).total_seconds()
+    assert 895 <= delta <= 960
+
+
+def test_mosaic_outage_clearance_takes_shorter_global_ttl(monkeypatch):
+    from agent.context_guard import ledger_unavailable_clearance_id
+    from config import settings
+    from workflow.activities import GrantAccessInput, grant_access_in_openfga
+
+    outage_id = ledger_unavailable_clearance_id(["hr"])
+    fga = _patch_singleton_and_ttl(monkeypatch, 300)       # global TTL shorter than 900
+    monkeypatch.setattr(settings, "mosaic_outage_clearance_ttl_seconds", 900)
+    before = datetime.now(timezone.utc)
+    asyncio.run(grant_access_in_openfga(GrantAccessInput(user_id="u", chunk_ids=[outage_id])))
+    delta = (datetime.fromisoformat(fga.viewer_until[0][2]) - before).total_seconds()
+    assert 295 <= delta <= 360
