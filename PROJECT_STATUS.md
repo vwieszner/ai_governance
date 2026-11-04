@@ -12,6 +12,72 @@ comments, or prior handoff notes. Full backend suite (current): **252 passed, 2 
 (254 collected)**. The skips are live-infra integration tests (cross-store isolation,
 admin-lifecycle) plus one honest abstention (discovery lookup is not bounded — see NFR-6).
 
+### Update log — 2026-11-04 (governance gaps closed, one startup bug fixed)
+- **Mosaic-effect guard** (`agent/context_guard.py`, AGT 5.0 context accumulation): evaluates the
+  *combination* of what a user receives against deterministic YAML rules
+  (`agent/policies/aggregation/`). HR + Finance escalates into the existing approval workflow
+  (clearance object `mosaic-<rule>`); deny withholds; fails closed if the policy is missing.
+  **Covers federated answers:** peers return the label names of the chunks they used inside the
+  signed `/a2a/query` response; a per-user release ledger (15-min window, in the division's
+  Redis — shared by every replica, so an HPA can't split HR and Finance across pods; TTL = window;
+  Redis unreachable → labelled releases escalate, never "no history") checks each release
+  against what came from other origins. Unlabeled/unverified peer answers
+  count as an `unlabeled-peer` label. Approval requests now name the contributing sources.
+- **FR-2.2 user lifecycle — DONE:** `POST /admin/users`, `PUT …/roles`, `POST …/disable`,
+  `POST …/enable` (division-admin only, cross-division isolated, audited). Disable cascades
+  (Redis denylist → Keycloak disable + logout → OpenFGA grants removed, owner kept → own approval
+  requests withdrawn → inbox purged). Re-enable restores role memberships from Keycloak but not
+  the removed grants, and **never revives a pre-disable token** (`iat <= disable time` refused —
+  the same-second boundary was found by a live Keycloak run and fixed). Existing divisions must
+  re-run onboarding (the agent's service account gets user-management roles in its own realm).
+- **FR-3 multi-peer routing — DONE:** discovered delegation goes to the selected peer; the
+  destination URL and key come only from the local `peer_trust_map`, never from the broker.
+- **NFR-3 OCSP — DONE, non-blocking** (see M7 below).
+- **LLM gateway:** residency=local divisions get an in-boundary embedding model
+  (`local/nv-embedqa-e5-v5`, no external fallback); onboarding now writes the containerized
+  agent's `.env.<id>.agent` (gitignored) and the template's container paths were fixed.
+- **Fixed — agent could not start with `require_mtls` + CRL/OCSP** (pre-existing): truststore's
+  `ssl.SSLContext` rebind made uvicorn reject the genuine serving context (TypeError). Proven
+  live: `api.main.run()` with mTLS + CRL starts, cert → 200, no cert → refused.
+- **Closed later the same day:**
+  - **Absent-field gap:** `agent/nodes._enforce` now refuses an action whose `REQUIRED_CONTEXT`
+    is missing (fail closed); an AST test pins that every call site sends those fields.
+  - **SSRF `localhost`:** loopback is refused by name as well as IP (`rag/egress_guard.py`);
+    the agent reaches the LLM gateway as `llm-gateway.internal`.
+  - **Mosaic ledger shared across replicas:** Redis-backed, fails closed (escalate) when Redis
+    is unreachable; outage clearances are always time-bound.
+  - **CI:** UI job on Node 22 (Node 18 broke `npm test` on main since June); supply-chain
+    `trivy-action` pinned by SHA to v0.36.0 (0.28.0 vanished in the March 2026 Trivy compromise).
+- **Inert deny rules (found by the call-site inventory; need the value wired, not a flag):**
+  `block-code-execution` + `block-filesystem-writes` (`tool_category`, never sent on
+  `mcp.call`), `block-low-trust-agents` (`agent_trust_score`), `cap-chunk-retrieval`
+  (`requested_chunk_count`). No call site computes these fields today.
+- **Still open:** live stacks/k8s/real NIM on the host; why GitHub Actions did not run on PR #1.
+
+### Update log — 2026-11-03 (AGT 5.0, supply chain, LLM gateway)
+- **AGT 3.7 → 5.0.** The six per-component packages became `agent-governance-toolkit-core` +
+  `-cli` 5.0.0 (import names unchanged; they now emit `DeprecationWarning`). Capped `<6.0`:
+  AGT `main` removes `agent_os.policies.PolicyEvaluator` (`agent/nodes.py`) for the ACS
+  `AgentControl` runtime. Suite identical on 3.7 and 5.0.
+- **Installable wheel.** `pip install .` works (explicit hatch file list). Fixed a latent bug
+  found that way: `policy_dir` defaulted to a CWD-relative path, so an installed app loaded
+  **0 rules** and default-denied everything; the default is now anchored to the code.
+- **Supply chain.** `requirements.lock.txt` is sha256 hash-pinned (pip enforces it on every
+  install path); Dependabot watches AGT releases (`.github/dependabot.yml`).
+- **Policy decision matrix** (`tests/test_governance.py`): 27 rows pin allow/deny + deciding rule
+  for every rule at its boundaries — the parity check for the AgentControl migration.
+- **LLM gateway prototype** (`examples/llm-gateway/`, LiteLLM pinned by digest): per-division
+  keys, residency via key allowlist + alias, NIM fallback, rpm + budget limits;
+  `prove_gateway.py` 11/11 live, now a blocking CI job. Wired into the division deployments as
+  an opt-in (Compose manifest `llm_gateway: true`; k8s `bootstrap_k8s.py --llm-gateway`). Gateway
+  part proven live on a rendered division stack against stubs; no full cluster run yet.
+- **Open, needs a decision:** (both resolved 2026-11-04 — see the entry above)
+  - ~~Absent-field gap~~ — required governance context enforced in `_enforce`.
+  - ~~SSRF guard refuses `127.0.0.1` but not `localhost`~~ — loopback refused by name too.
+- **Blocked upstream:** the AgentControl migration and AGT policy at the gateway wait on ACS 0.4
+  reaching PyPI (`agt migrate` does not convert this repo's rule YAMLs).
+- **Not re-verified in this pass:** live division stacks, `prove_live.py`, k8s, the UI.
+
 ### Update log — 2026-06-17 (post-audit fixes)
 - **New feature — pluggable multi-retriever + retrieval-as-a-service.** N retrievers (Qdrant,
   Neo4j seam, any number of external RaaS endpoints) fan out and are RRF-fused; every returned
@@ -29,7 +95,7 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
   far-side), discovery wiring (discover→negotiate→delegate + graceful fallback + observable FR-3.4),
   and bounded `registry.find` (NFR-6).
 - **Wave 4 (closed):** CRL certificate-revocation now enforced at the mTLS handshake (refresh +
-  distribution point); OCSP deferred (needs a responder). **All six selected gaps are now addressed.**
+  distribution point); OCSP checking since added (see NFR-3 below). **All six selected gaps are now addressed.**
 - **Wave 5 (independent red-team + fixes, closed):** a 4-agent adversarial pass (each finding
   demonstrated, default-DEFENDED) found **3 VULNERABLE** + several hardening items — **all fixed with
   regression tests.** Every confidentiality control held. See the Security review section below.
@@ -39,8 +105,8 @@ admin-lifecycle) plus one honest abstention (discovery lookup is not bounded —
     legacy `--strict` findings ratcheted for new code, not faked).
   - **Governance hardened:** **HMAC-keyed audit chain** — tamper-EVIDENT → tamper-PROOF when keyed
     with off-host key custody (backward-compatible; `tests/test_audit_hmac.py`); **OCSP readiness**
-    (AIA responder URL in issued certs + a validated stapling hook — enforcement still needs a
-    responder); **MCP** executor proven to never forward a raw user token (`_assert_no_user_credential`).
+    (AIA responder URL in issued certs + a validated stapling hook) — now **enforced** inbound by
+    `transport/ocsp.py` (see NFR-3 below); **MCP** executor proven to never forward a raw user token (`_assert_no_user_credential`).
   - **Real Kubernetes deployment** (`k8s/` kustomize, alongside Compose) — **deployed LIVE on a local
     kind cluster**: the full division (6 stateful services + agent + worker) reaches Running; agent
     `GET /health` → **200** with its DID. Fixed two real manifest bugs en route (the distroless
@@ -110,18 +176,21 @@ engine, trust gate, and DLP genuinely fail closed.
 3. ✅ **Dynamic discovery + negotiated delegation (FR-3.1/3.2) — DONE (2026-06-17).** The agent now
    discovers a capable peer via the broker, negotiates, and delegates (graceful fallback to the
    configured peer); `registry.find()` is bounded (capability index — closes the NFR-6 skip);
-   MonitorPanel renders discover→delegate events (FR-3.4). **Residual:** the signed transport still
-   routes bytes to the *configured* peer — true multi-peer byte-routing needs the transport to accept
-   a discovered target (single-peer demo confirms+observes but doesn't reroute).
+   MonitorPanel renders discover→delegate events (FR-3.4). ✅ **Multi-peer routing — DONE
+   (2026-11-03):** the signed transport now routes to the *discovered* peer (`call_peer_agent(target_did=)`;
+   `/a2a/tool` likewise) with URL + verification key taken from the local `peer_trust` anchor, never the
+   broker; untrusted DID refused → configured fallback; `aud` = actual target; per-peer breaker
+   (`tests/test_multipeer_routing.py`, 9 tests; live 4-process localhost demo: broker + beta + gamma +
+   rogue — kubernetes→gamma, hr→beta, rogue URL never dialled).
 4. 🟡 **3-division end-to-end test — AUTHORED (2026-06-17), not yet run.**
    `e2e/test_full_federation.py` maps SC-1…SC-12 (14 tests) + skips cleanly; the real assertions
    execute only against ≥3 live stacks (`RUN_E2E=1` + reachability probe).
 
 Smaller gaps — **now closed:** grant expiry ✅, `GET /audit` ✅, runtime kill-switch ✅,
-division-native UI ✅ (FR-2.4), bounded discovery lookups ✅ (NFR-6), CRL revocation ✅ (NFR-3),
-proving-test debt largely ✅. **Remaining residuals:** OCSP (needs a responder — infra), the
-3-division e2e run (needs live stacks), and true multi-peer transport reroute (discovery
-confirms+observes today). Plus pre-existing items: admin user-lifecycle API (FR-2.2), HA stores,
+division-native UI ✅ (FR-2.4), admin user-lifecycle API ✅ (FR-2.2), bounded discovery lookups ✅
+(NFR-6), CRL revocation ✅ (NFR-3), proving-test debt largely ✅, OCSP checking ✅ (NFR-3; an HA
+production responder is deploy-time infra), multi-peer transport reroute ✅ (2026-11-03).
+**Remaining residuals:** the 3-division e2e run (needs live stacks). Plus pre-existing items: HA stores,
 **independent external pen-test** (the red-team below was an internal adversarial pass, not a
 third-party engagement) — see the Security review section.
 
@@ -145,7 +214,8 @@ tests; every confidentiality control held.**
 **Residuals that need deployment, not code:** the audit hash-chain is keyless with a local anchor
 (forgeable only by a host-compromise attacker) → set `AUDIT_ANCHOR_URL` to a remote append-only sink;
 `require_mtls` without `TLS_CRL_FILE` serves no revocation gate → set it. Both now **warn at startup**.
-Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + write-ups:
+OCSP is now checked inbound (opt-in `TLS_OCSP_MODE=soft|hard`; `soft` also warns at startup).
+Still open: a true third-party pen-test. Probes + write-ups:
 `redteam/REDTEAM_*.md` + `redteam/probe_*.py`.
 
 ---
@@ -166,13 +236,13 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
 | Milestone | Requirements | Status | One-line verdict |
 |---|---|---|---|
 | **M0** Tenancy + onboarding | FR-1, NFR-2, NFR-8 | ✅ DONE | Physical per-division stacks + manifest-driven onboarding (`--dry-run/--force/--teardown`); `division_id` threaded + signed. Kill-B/cross-store proof exists but skips without live stacks. |
-| **M1** Per-division identity | FR-2 | ✅ DONE | Backend rejects foreign-division tokens (issuer+audience+key, tested); **UI now division-native** — N-division model via `VITE_DIVISIONS`, FR-2.4. Residual: admin user lifecycle is script-driven, no self-service API (FR-2.2). |
+| **M1** Per-division identity | FR-2 | ✅ DONE | Backend rejects foreign-division tokens (issuer+audience+key, tested); **UI now division-native** — N-division model via `VITE_DIVISIONS`, FR-2.4. **FR-2.2 admin user-lifecycle API** — `POST /admin/users`, `PUT /admin/users/{u}/roles`, `POST /admin/users/{u}/disable`, `POST /admin/users/{u}/enable` (division-admin of THIS division only; Keycloak role ↔ OpenFGA `group:role-<r>` mirror; disable cascades denylist→Keycloak disable+logout→OpenFGA access tuples (owner kept)→own pending requests denied→inbox purged; enable = Keycloak re-enable → OpenFGA role mirror rebuilt from CURRENT Keycloak roles (viewer/editor/pending grants NOT restored — re-request via approvals) → denylist cleared last; audited). Hermetic `tests/test_user_lifecycle.py` + live-proven vs real Keycloak 26/OpenFGA/Redis/Temporal. |
 | **M2** Verifiable X-division identity | FR-3.6, FR-3.7 | ✅ DONE | FR-3.7 (authorized→immediate vs needs-approval) works; **FR-3.6 now hardened** — recipient-bound (`aud`=target DID), 300s-expiry, `jti` signed assertion validated far-side (recipient+expiry+signer) then re-authorized (`test_assertion.py`). |
-| **M3** Discovery + negotiation | FR-3.1–3.5 | ✅ DONE | FR-3.3 signed/replay-protected agent identity ✅; **discovery now wired** — discover→negotiate→delegate with graceful fallback, bounded `registry.find()`, observable FR-3.4 markers in MonitorPanel. Residual: signed transport still routes to the configured peer (true multi-peer reroute is a transport follow-up). |
+| **M3** Discovery + negotiation | FR-3.1–3.5 | ✅ DONE | FR-3.3 signed/replay-protected agent identity ✅; **discovery now wired** — discover→negotiate→delegate with graceful fallback, bounded `registry.find()`, observable FR-3.4 markers in MonitorPanel. **Multi-peer routing ✅** — signed transport routes to the discovered peer (trust-anchor URL/key, fail-closed on untrusted DID, `aud`=target, per-peer breaker; `tests/test_multipeer_routing.py`). |
 | **M4** Offline delivery | FR-5, FR-6 | ✅ DONE | FR-5 durable approval + authenticated owner inbox; **FR-6 now done** — durable per-user inbox seeded at park, `GET /inbox` regenerate-at-delivery, cross-division callback delivery, in-app badge (`outcome_store.py`, `test_offline.py`). |
 | **M5** Access lifecycle | FR-7 | ✅ DONE | Revoke (FR-7.2) owner-gated; **expiry (FR-7.1) now wired** — approvals honor `approval_grant_ttl_seconds` via `grant_viewer_until`; re-ask re-enters approval on both revoke and expiry (`test_lifecycle.py`). |
 | **M6** Data residency | NFR-1 | ✅ DONE | Egress guard wired into **both** the answer LLM and the intent LLM; fail-closed. Self-hosted backend is operator-supplied (config-driven), not bundled — acceptable per plan. |
-| **M7** Transport + IaC + secrets | NFR-3,4,5,8,10 | ✅ MOSTLY DONE | mTLS serving + outbound peer certs ✅; rotation ✅; secrets ✅; **CRL revocation enforced** at the handshake (+ OCSP AIA/staple readiness). **Real Kubernetes deployment** (`k8s/` kustomize, per-namespace NetworkPolicy isolation) — **deployed + verified Running on a local kind cluster** (agent `/health`→200); Compose path retained. Remaining: OCSP responder, HA stores, a NetworkPolicy-enforcing CNI in prod. |
+| **M7** Transport + IaC + secrets | NFR-3,4,5,8,10 | ✅ MOSTLY DONE | mTLS serving + outbound peer certs ✅; rotation ✅; secrets ✅; **CRL revocation enforced** at the handshake + **OCSP checking** of inbound peers (opt-in soft/hard; proven live vs `openssl ocsp`). **Real Kubernetes deployment** (`k8s/` kustomize, per-namespace NetworkPolicy isolation) — **deployed + verified Running on a local kind cluster** (agent `/health`→200); Compose path retained. Remaining: an HA production OCSP responder (infra), HA stores, a NetworkPolicy-enforcing CNI in prod. |
 | **M8** Audit & accountability | FR-8, NFR-9 | ✅ DONE | Tamper-evident hash chain + anchor, now **optionally HMAC-keyed → tamper-PROOF** with off-host key custody (`test_audit_hmac.py`); admin-gated division-scoped **`GET /audit`** export + CLI `verify_audit.py`. |
 | **M-GOV** Governance | FR-4, NFR-6, NFR-7 | 🟡 MOSTLY DONE | Per-node `_enforce` ✅, trust gate ✅, output DLP ✅, needs-approval-from-ReBAC ✅, injection containment ✅ — now with named proving tests (`test_governance_controls.py`, `test_mesh.py`). **Kill-switch is now a runtime lever** (`POST /admin/kill-switch`, FR-4.3). NFR-6: inbox lookup is O(1) (`test_scaling.py`) **and discovery `registry.find()` is now bounded** (capability index, `test_discovery_wiring.py`). NFR-7 is measure-and-log, not a budget gate. |
 
@@ -199,8 +269,13 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
 - ✅ **FR-3.1 / FR-3.2 — Discovery + negotiation — DONE (2026-06-17).** `mesh/discovery.py`
   (discover→negotiate→delegate, lazy self-register, trust gated by `peer_trust` not broker membership)
   wired into `agent/nodes.py` delegation with graceful fallback to the configured peer.
-  **Residual:** the signed transport still routes bytes to the configured peer (true multi-peer
-  reroute is a transport follow-up); discovery confirms+observes the peer today.
+  ✅ **Multi-peer routing (2026-11-03):** the signed transport now sends to the DISCOVERED peer —
+  `call_peer_agent(target_did=)` / `call_peer_tool` resolve the destination URL from the local
+  `peer_trust` anchor (broker-advertised URL ignored; tool URL ≠ anchor → refused), refuse an
+  untrusted DID (fail closed → configured fallback), bind `aud` to the actual target, verify the
+  response against THAT peer's key, and use a per-peer circuit breaker. Legacy PEER_AGENT_* path
+  unchanged. `tests/test_multipeer_routing.py` (9, real Ed25519 + real httpx client over a
+  per-peer MockTransport) + a live localhost run (real discovery broker + 2 peer processes).
 
 - 🟡 **e2e — `e2e/test_full_federation.py` — AUTHORED (2026-06-17), runs only with live stacks.**
   Maps SC-1…SC-12 (14 tests) incl. browser-closed offline delivery + kill-B isolation; collects
@@ -217,8 +292,19 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
   flag honored per request on `/query` (and `/a2a/query`), no restart; `tests/test_killswitch.py`.
 - ✅ **NFR-3 — CRL revocation — DONE (2026-06-17).** Enforced at the inbound mTLS handshake
   (`VERIFY_CRL_CHECK_LEAF`, mtime-cached CRL refresh, `CRLDistributionPoints` in issued certs,
-  `--revoke` to republish); `test_transport.py`. **OCSP** not done — needs a live responder
-  (infra follow-up); the **nginx-edge** mode needs `ssl_crl` wired separately.
+  `--revoke` to republish); `test_transport.py`. **OCSP — DONE (2026-11-03):** `transport/ocsp.py`
+  checks the authenticated peer leaf right after the handshake verifies it (an `sslobject_class`
+  hook on the server context — the stdlib has no in-handshake OCSP callback), POSTing a nonce'd
+  request to the cert's AIA URL (or `TLS_OCSP_RESPONDER_URL`), verifying signer (CA or CA-delegated
+  `OCSPSigning`), CertID, nonce and thisUpdate/nextUpdate, caching per serial until nextUpdate.
+  `TLS_OCSP_MODE=off` (default) | `soft` (outage/unknown → allow + warn) | `hard` (fail closed);
+  REVOKED always refused. Issuer: `issue_division_certs.py --ocsp-url`. Hermetic `tests/test_ocsp.py`
+  (30) + **live proof** `examples/mtls-ocsp/prove_ocsp_live.py` (real `openssl ocsp` responder +
+  uvicorn via `tls_serving_kwargs`: good accepted, revoked/unknown refused, hard vs soft on outage).
+  **Non-blocking since 2026-11-04:** the handshake only reads the cache; a miss is decided by an
+  async connection gate (`gated_http_protocol`) that holds the connection's bytes until the answer
+  (single-flight per serial, background refresh before nextUpdate), so a slow responder delays only
+  that peer, never the server. Caveats: server-side stapling still needs a TLS front-end; the **nginx-edge** mode needs `ssl_crl`/`ssl_ocsp` wired separately.
 - ✅ **NFR-6 — Bounded lookups — DONE (2026-06-17).** Inbox is O(1); `discovery/registry.py::find()`
   now uses a capability→DIDs index (point read, not O(N) scan); `test_discovery_wiring.py` proves the
   lookup touches only matching entries regardless of registry size.
@@ -243,7 +329,8 @@ Still open: OCSP (needs a responder), and a true third-party pen-test. Probes + 
 
 ## Test reality
 
-- Full backend suite: **343 passed, 1 skipped** (as of 2026-06-19, post Wave-7 cross-agent tool
+- Full backend suite: **546 passed, 8 skipped** (2026-11-04, all merged work; UI `npm test` 14 passed + build). Before that: **404 passed, 8 skipped** (2026-11-03, on AGT 5.0, Python 3.11 and 3.12 —
+  incl. the new 27-row policy decision matrix). Earlier: **343 passed, 1 skipped** (as of 2026-06-19, post Wave-7 cross-agent tool
   delegation + its F2 security-review fix; was **252 passed, 2 skipped** at the 2026-06-17 audit,
   itself up from 138/2 at first audit — the growth is this session's retriever feature + gap-fix +
   red-team + hardening + Wave-7 governed-tool-delegation regression tests).

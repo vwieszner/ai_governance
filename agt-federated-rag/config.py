@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from typing import Literal
 
 from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -316,10 +318,31 @@ class Settings(BaseSettings):
     peer_tool_map: str = ""
 
     # ── AGT Policy Engine (Agent OS) ─────────────────────────────────────────
-    # Path to YAML policy directory (loaded at startup).
-    policy_dir: str = "agent/policies"
+    # Path to YAML policy directory (loaded at startup). The default is anchored to
+    # this file, not the CWD, so an installed wheel (or any launch dir) finds the
+    # shipped policies instead of loading zero rules and denying every action.
+    policy_dir: str = str(Path(__file__).resolve().parent / "agent" / "policies")
     # Whether to run in audit-only mode (log violations but don't block).
     policy_audit_only: bool = False
+    # Mosaic-effect guard (agent/context_guard.py): YAML rules over the COMBINATION of
+    # authorized chunks, evaluated after check_auth's per-chunk authz and before
+    # llm.generate. Default anchored like policy_dir; a relative override resolves to the
+    # package root. Missing/invalid file → fail-closed (answer withheld). Empty string
+    # disables the guard explicitly.
+    context_aggregation_policy: str = str(
+        Path(__file__).resolve().parent / "agent" / "policies" / "aggregation"
+        / "context-aggregation.yaml")
+    # Where the mosaic guard's per-user release ledger lives. "redis" (default) = this
+    # division's Redis (redis_url), shared by every replica, so an HPA can't split a
+    # user's HR and Finance releases across pods; unreachable → the guard fails closed
+    # (escalates). "memory" = in-process per replica — tests / single-process dev only.
+    mosaic_ledger_backend: Literal["redis", "memory"] = "redis"
+    # A clearance approved WHILE the ledger was unreachable ("release history unavailable")
+    # only vouches for that moment. It is ALWAYS written time-bound (OpenFGA conditional
+    # tuple), even when approval_grant_ttl_seconds == 0 (permanent grants); a shorter global
+    # TTL still wins. Never 0: a permanent outage clearance would become a standing bypass
+    # of the mosaic guard during every later outage.
+    mosaic_outage_clearance_ttl_seconds: int = Field(default=900, gt=0)
 
     # ── Graph-level kill-switch (AgentMesh govern_action gate) ───────────────
     # Operator emergency off-switch. When true, the graph-level govern_action

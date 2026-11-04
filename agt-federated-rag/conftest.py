@@ -49,6 +49,24 @@ if not _ENV_FILE.exists():
         os.environ.setdefault(_field.upper(), _val)
 
 
+@pytest.fixture(autouse=True)
+def _reset_mosaic_release_ledger(monkeypatch):
+    """The mosaic guard's per-user release ledger is process-global; isolate every test.
+
+    Production default is the shared Redis ledger; the hermetic suite has no Redis, so tests
+    use the in-process one (tests that exercise the Redis ledger construct it explicitly)."""
+    import config
+
+    monkeypatch.setattr(config.settings, "mosaic_ledger_backend", "memory")
+    mod = sys.modules.get("agent.context_guard")
+    if mod is not None:
+        mod.LEDGER.clear()
+    yield
+    mod = sys.modules.get("agent.context_guard")
+    if mod is not None:
+        mod.LEDGER.clear()
+
+
 @pytest.fixture
 def make_settings():
     """Return a factory that builds a hermetic Settings (no env file, no infra).

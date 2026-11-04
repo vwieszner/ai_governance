@@ -1,0 +1,158 @@
+# The division's LLM gateway (LiteLLM Proxy). Mirrors the Compose `llm-gateway` service in
+# infra/division-stack.template.yml. Agents reach it ONLY by the in-boundary FQDN
+# http://llm-gateway.<namespace>.svc.cluster.local:4000/v1 (residency rule 3).
+#
+# Upstream endpoints (non-secret). Production: CHAT_PRIMARY_BASE = NVIDIA NIM; LOCAL_LLM_BASE
+# = your in-cluster vLLM/NIM Service, LOCAL_EMBED_BASE = your in-cluster embeddings Service
+# (patch them per overlay, or set them in the division manifest for bootstrap_k8s.py). Never leave LOCAL_LLM_BASE
+# empty: LiteLLM would send the "local" model to the public OpenAI API. The .invalid
+# default never resolves, so the in-boundary model fails closed until it is set.
+# NOTE (TLS interception hosts, k8s/README.md): the pod's egress to NIM needs the same CA
+# bundle mount as the agent when a proxy re-signs TLS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-gateway-env
+  labels:
+    app: llm-gateway
+    app.kubernetes.io/part-of: agt-federated-rag
+data:
+  CHAT_PRIMARY_BASE: "https://integrate.api.nvidia.com/v1"
+  LOCAL_LLM_BASE: "http://local-llm.invalid/v1"
+  # In-boundary embeddings (self-hosted NIM/TEI/vLLM /embeddings, must emit 1024 dims) —
+  # what a residency=local division's key aliases EMBEDDING_MODEL onto. Same fail-closed
+  # default. bootstrap_k8s.py patches both from the manifest's llm_gateway_local_base /
+  # llm_gateway_local_embed_base.
+  LOCAL_EMBED_BASE: "http://local-embed.invalid/v1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-gateway
+  labels:
+    app: llm-gateway
+    app.kubernetes.io/part-of: agt-federated-rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-gateway
+  template:
+    metadata:
+      labels:
+        app: llm-gateway
+        app.kubernetes.io/part-of: agt-federated-rag
+    spec:
+      automountServiceAccountToken: false
+      initContainers:
+        # Create the gateway's own `litellm` database + role in the division's EXISTING
+        # Postgres (idempotent; same script as the Compose llm-gateway-db-init service).
+        - name: init-db
+          image: postgres:16-alpine   # same image as the division Postgres (base)
+          command: ["sh", "/scripts/init-db.sh"]
+          env:
+            - name: PGHOST
+              value: postgres
+            - name: PGDATABASE
+              value: openfga
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef: {name: agent-secrets, key: POSTGRES_USER}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: {name: agent-secrets, key: POSTGRES_PASSWORD}
+            - name: LITELLM_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: llm-gateway-secrets, key: LITELLM_DB_PASSWORD}
+          volumeMounts:
+            - name: config
+              mountPath: /scripts/init-db.sh
+              subPath: init-db.sh
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70             # postgres uid in the alpine image
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: litellm
+          # Pinned by DIGEST (= official ghcr.io/berriai/litellm:v1.106.6); never pip-install litellm.
+          image: litellm/litellm@sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06
+          args: ["--config", "/app/config.yaml", "--port", "4000"]
+          ports:
+            - name: http
+              containerPort: 4000
+          envFrom:
+            - configMapRef:
+                name: llm-gateway-env
+          env:
+            - name: LITELLM_MASTER_KEY       # admin only — never given to the agent
+              valueFrom:
+                secretKeyRef: {name: llm-gateway-secrets, key: LITELLM_MASTER_KEY}
+            - name: LITELLM_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: llm-gateway-secrets, key: LITELLM_DB_PASSWORD}
+            - name: DATABASE_URL             # $(VAR) expands the entry above (hex: URL-safe)
+              value: postgresql://litellm:$(LITELLM_DB_PASSWORD)@postgres:5432/litellm
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef: {name: llm-gateway-secrets, key: NVIDIA_API_KEY}
+            - name: LOCAL_LLM_KEY
+              valueFrom:
+                secretKeyRef: {name: llm-gateway-secrets, key: LOCAL_LLM_KEY, optional: true}
+            - name: LOCAL_EMBED_KEY
+              valueFrom:
+                secretKeyRef: {name: llm-gateway-secrets, key: LOCAL_EMBED_KEY, optional: true}
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+          # The image runs as root and applies its Prisma migrations at start-up (writes
+          # inside the image), so root FS stays writable; privilege escalation + caps are off.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+      volumes:
+        - name: config
+          configMap:
+            name: llm-gateway-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-gateway
+  labels:
+    app: llm-gateway
+    app.kubernetes.io/part-of: agt-federated-rag
+spec:
+  selector:
+    app: llm-gateway
+  ports:
+    - name: http
+      port: 4000
+      targetPort: 4000

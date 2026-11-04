@@ -165,13 +165,40 @@ async def _get_evaluator() -> PolicyEvaluator:
     return _evaluator
 
 
+# Governance context each action MUST carry. The AGT PolicyEvaluator treats a deny rule whose
+# field is ABSENT as "no match", so the action's allow rule would win — a call site that
+# forgot e.g. peer_did_verified would silently skip require-peer-did-verified. Every listed
+# field is sent by EVERY current call site of its action (pinned by
+# tests/test_governance.py::test_required_context_matches_every_call_site), so this changes no
+# real flow; it makes a future omission FAIL CLOSED instead of failing open.
+# Deliberately NOT listed (see PROJECT_STATUS): peer.receive_callback (the post-verification
+# node passes no peer_* fields; the API layer enforces them with full context), and fields no
+# call site computes today — tool_category (mcp.call), agent_trust_score,
+# requested_chunk_count — whose deny rules are therefore inert until those values are wired.
+REQUIRED_CONTEXT: dict[str, tuple[str, ...]] = {
+    "rag.retrieve": ("query_length", "qdrant_collection"),
+    "llm.generate": ("context_char_count",),
+    "agent.output_check": ("llm_output",),
+    "peer.send_message": ("peer_did_verified", "transport_encrypted", "peer_trust_score",
+                          "peer_execution_ring", "peer_circuit_state"),
+}
+
+
 async def _enforce(action: str, context: dict[str, Any]) -> None:
     """Raise PermissionError if the AGT policy engine denies the action.
 
     This is the primary governance gate.  Every node calls this before doing
     any work.  The evaluator runs all YAML policies in settings.policy_dir in
-    priority order; the highest-priority matching rule wins.
+    priority order; the highest-priority matching rule wins. Context fields an
+    action's deny rules depend on (REQUIRED_CONTEXT) must be present — a missing
+    one is a deny, never a silent pass.
     """
+    missing = [f for f in REQUIRED_CONTEXT.get(action, ()) if context.get(f) is None]
+    if missing:
+        log.warning("agt_policy_denied", action=action, reason="missing_governance_context",
+                    missing=missing, agt_audit=True)
+        raise PermissionError(
+            f"Policy denied action '{action}': missing governance context {missing}")
     evaluator = await _get_evaluator()
     result = evaluator.evaluate({"action": action, **context})
     if not result.allowed:
@@ -637,6 +664,23 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         )
     pruned_chunks = reconciled
 
+    # Mosaic-effect guard: per-chunk authz is done; now gate the COMBINATION of the
+    # authorized, trusted context before it can reach llm.generate. Only LOCAL_ALLOWED
+    # routes to generation (a pending chunk already routes to approval).
+    approval_sources: list[str] = []
+    if flow == FlowDecision.LOCAL_ALLOWED:
+        guard = await _guard_context_combination(state, auth, allowed, pruned_chunks)
+        if guard is not None:
+            flow = guard["flow"]
+            pending = pending + guard.get("add_pending", [])
+            approval_sources = guard.get("approval_sources", [])
+            if flow == FlowDecision.LOCAL_DENIED:
+                # Withhold: nothing reaches the LLM, and the text leaves state (Finding #6).
+                denied = denied + allowed
+                allowed = []
+                pruned_chunks = []
+                status_message = guard["status_message"]
+
     result: dict[str, Any] = {
         "flow": flow,
         "fused_chunks": pruned_chunks,
@@ -645,10 +689,161 @@ async def check_auth(state: AgentState) -> dict[str, Any]:
         "allowed_chunk_ids": allowed,
         "pending_chunk_ids": pending,
         "denied_chunk_ids": denied,
+        "approval_sources": approval_sources,
     }
     if status_message is not None:
         result["status_message"] = status_message
     return result
+
+
+# ── Mosaic-effect guard (context accumulation) ────────────────────────────────
+
+_MOSAIC_DENIED_MESSAGE = (
+    "This answer would combine information from sources that policy does not allow to be "
+    "released together, so it was withheld. Ask about one subject at a time, or contact "
+    "the data owners."
+)
+
+
+async def _guard_context_combination(
+    state: AgentState, auth: OpenFGAAuth | None, allowed: list[str],
+    served: list[dict[str, Any]], *, peer: Any = None,
+) -> dict[str, Any] | None:
+    """Evaluate the COMBINATION of authorized context (agent/context_guard.py).
+
+    The union evaluated is: this query's authorized local chunks + the verified peer
+    contribution (``peer``: a ``context_guard.Contribution``, for a federated answer) + the
+    labels released to this user from OTHER origins within the policy window (ledger).
+
+    Returns None to proceed (the release is then recorded in the ledger), or a dict with the
+    new ``flow`` (+ ``add_pending`` clearance ids and ``approval_sources`` for an escalation,
+    or ``status_message`` for a deny). ESCALATE reuses the existing approval path: the
+    uncleared ``mosaic-<rule>`` clearance objects become pending ids, so start_approval
+    writes the OpenFGA pending tuples and starts the Temporal workflow; once approved
+    (viewer on the clearance) the same combination passes.
+    """
+    from agent import context_guard as cg
+
+    allowed_set = set(allowed)
+    context_chunks = [c for c in served if c.get("chunk_id") in allowed_set]
+    if not context_chunks and peer is None:
+        return None
+    policy = settings.context_aggregation_policy
+    if not policy:
+        return None                      # explicitly disabled (the only way to turn it off)
+    origin = peer.origin if peer is not None else cg.LOCAL_ORIGIN
+    cfg: Any = None
+    contributions: list[Any] = [peer] if peer is not None else []
+    # Shared across replicas (division Redis) by default; window_seconds 0 → never touched.
+    ledger = cg.active_ledger(settings.mosaic_ledger_backend, settings.redis_url,
+                              settings.division_id)
+    ledger_state = "ok"
+    try:
+        cfg = cg.load_config(policy)
+    except cg.ContextAggregationConfigError as exc:
+        decision = cg.GuardDecision(cg.Outcome.DENY, f"config_error: {exc}"[:300])
+    else:
+        try:
+            contributions += await ledger.aothers(state["user_id"], origin,
+                                                  cfg.window_seconds)
+        except cg.LedgerUnavailableError as exc:
+            # FAIL CLOSED: unknown history is not "no history" — escalate labelled releases.
+            ledger_state = "unavailable"
+            log.error("mosaic_ledger_unavailable", user_id=state["user_id"], origin=origin,
+                      error=str(exc), fail_closed="escalate", agt_audit=True)
+        decision = cg.evaluate_combined(context_chunks, contributions, cfg,
+                                        workflow_id=str(state.get("task_id") or ""),
+                                        local_division=settings.division_id)
+        if ledger_state == "unavailable":
+            decision = cg.fail_closed_ledger_unavailable(decision)
+    audit = dict(
+        user_id=state["user_id"],
+        action="context.aggregate",
+        reason=decision.reason,
+        labels=sorted(decision.labels),
+        sensitivity=decision.sensitivity.name.lower(),
+        rules=list(decision.rules_applied),
+        count=len(context_chunks),
+        origin=origin,
+        ledger=ledger_state,
+        # Which labels came from peers: label names + peer DID only (never content).
+        peer_labels=[
+            {"peer_did": c.origin,
+             "labels": (sorted(c.effective_labels()) if c.effective_labels() is not None
+                        else "unlabeled")}
+            for c in contributions if c.origin != cg.LOCAL_ORIGIN],
+        agt_audit=True,
+    )
+
+    async def _record_release() -> None:
+        entry = (peer if peer is not None
+                 else cg.local_release(context_chunks, cfg, settings.division_id))
+        if entry is not None:
+            # Never raises: a store outage is logged loudly (mosaic_ledger_record_failed).
+            await ledger.arecord(state["user_id"], entry, cfg.window_seconds)
+
+    if decision.outcome == cg.Outcome.ALLOW:
+        log.info("context_aggregation_decision", decision="allow", **audit)
+        if cfg is not None:
+            await _record_release()
+        return None
+
+    if decision.outcome == cg.Outcome.DENY:
+        log.warning("context_aggregation_decision", decision="deny", **audit)
+        return {"flow": FlowDecision.LOCAL_DENIED, "status_message": _MOSAIC_DENIED_MESSAGE}
+
+    # ESCALATE: has this user already been cleared for this combination (approved before,
+    # or an admin group grant)? Clearance is an ordinary OpenFGA viewer check.
+    if auth is None:
+        auth = await _get_openfga()
+    clearance = await auth.batch_decide(
+        state["user_id"], list(decision.clearance_ids), groups=state.get("user_groups") or [])
+    uncleared = [cid for cid in decision.clearance_ids
+                 if clearance.get(cid) != AuthzDecision.ALLOWED]
+    if not uncleared:
+        log.info("context_aggregation_decision", decision="cleared", **audit)
+        await _record_release()
+        return None
+    log.warning("context_aggregation_decision", decision="escalate",
+                pending=len(uncleared), sources=list(decision.sources), **audit)
+    return {"flow": FlowDecision.LOCAL_NEEDS_APPROVAL, "add_pending": uncleared,
+            "approval_sources": list(decision.sources)}
+
+
+async def _guard_peer_answer(state: AgentState) -> dict[str, Any] | None:
+    """Mosaic guard for a FEDERATED answer, before it is released to the user.
+
+    Only labels carried in the peer's signature-verified /a2a/query response count
+    (``peer_labels_verified``, set by call_peer_agent from mesh.peer_client); absent,
+    malformed or unverified labels are UNLABELED and follow the policy's
+    ``federation.unlabeled_peer`` fail mode. Returns None to release, else the state update
+    that withholds the peer answer (deny) or routes to start_approval (escalate).
+    """
+    from agent import context_guard as cg
+
+    verified = bool(state.get("peer_labels_verified"))
+    labels = cg.validate_peer_labels(state.get("peer_data_labels")) if verified else None
+    if verified and labels is None:
+        log.warning("peer_labels_invalid_or_absent", peer_did=state.get("peer_did"),
+                    agt_audit=True)
+    contrib = cg.Contribution(
+        origin=str(state.get("peer_did") or "unknown-peer"),
+        division=str(state.get("peer_division") or ""),
+        labels=labels, verified=labels is not None)
+    guard = await _guard_context_combination(
+        state, None, list(state.get("allowed_chunk_ids") or []),
+        list(state.get("fused_chunks") or []), peer=contrib)
+    if guard is None:
+        return None
+    # The peer answer never leaves this agent on a deny / pending clearance.
+    if guard["flow"] == FlowDecision.LOCAL_DENIED:
+        return {"flow": FlowDecision.REMOTE_DENIED, "status_message": guard["status_message"],
+                "answer": None, "peer_answer": None}
+    return {"flow": FlowDecision.LOCAL_NEEDS_APPROVAL,
+            "pending_chunk_ids": list(state.get("pending_chunk_ids") or [])
+            + guard["add_pending"],
+            "approval_sources": guard["approval_sources"],
+            "answer": None, "peer_answer": None}
 
 
 # ── Citation / grounding gate (deterministic, auditable) ──────────────────────
@@ -838,6 +1033,18 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
 
     approval_request_id = str(uuid.uuid4())
 
+    # Source names only (never chunk text) — what the APPROVER is shown, and the hint used
+    # in the requester-facing message below. Ordinary pending chunks resolve to their
+    # metadata source; a mosaic clearance (synthetic ``mosaic-<rule>`` id, no metadata)
+    # carries the contributing provenance computed by the guard (local source names +
+    # labels, and peer division/DID + labels) so the approver is never approving blind.
+    sources = sorted({
+        c.get("metadata", {}).get("source", "")
+        for c in state.get("fused_chunks", [])
+        if c.get("chunk_id") in set(chunk_ids)
+    } - {""})
+    sources += [s for s in (state.get("approval_sources") or []) if s not in sources]
+
     # Write pending_approval tuples to OpenFGA
     for chunk_id in chunk_ids:
         await auth.set_pending_approval(user_id, chunk_id)
@@ -878,6 +1085,7 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
                 originating_task_id=state.get("originating_task_id"),
                 # Snapshot timeout at start — deterministic for Temporal replay
                 timeout_seconds=settings.approval_timeout_seconds,
+                sources=sources,
             ),
             id=f"approval-{approval_request_id}",
             task_queue=settings.temporal_task_queue,
@@ -898,15 +1106,11 @@ async def start_approval(state: AgentState) -> dict[str, Any]:
     # /approvals/pending is a fast, consistent point read (not a laggy Temporal
     # visibility scan). Best-effort: a failure here never blocks the approval.
     import approval_index
-    await approval_index.record(approver_id, approval_request_id, user_id, state["query"])
+    await approval_index.record(approver_id, approval_request_id, user_id, state["query"],
+                                sources=sources)
 
     # LLM generates a contextual message. Only source names from metadata are
     # passed — never chunk text — so the security boundary is preserved.
-    sources = sorted({
-        c.get("metadata", {}).get("source", "")
-        for c in state.get("fused_chunks", [])
-        if c.get("chunk_id") in set(chunk_ids)
-    } - {""})
     source_hint = f" (relevant document: {', '.join(sources)})" if sources else ""
     try:
         llm = await _get_llm()
@@ -953,39 +1157,48 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     query's capability and negotiate before committing (mesh/discovery.py).
     GRACEFUL DEGRADATION: if the broker is unreachable / returns nothing / the
     discovered peer isn't a configured trust partner, fall back to the configured
-    peer so existing single-peer federation never regresses. The signed transport
-    (mesh/peer_client.call_peer_agent) is unchanged — it sends to the configured
-    peer; we delegate through it only when the discovered target resolves to that
-    peer (the demo's single trusted partner). The discovered target is recorded in
-    ``discovery_summary`` for the observable inter-agent conversation (FR-3.4).
+    peer so existing single-peer federation never regresses. A discovered target is
+    delegated to THAT peer: the signed transport (mesh/peer_client.call_peer_agent,
+    ``target_did=``) resolves its URL + verification key from the local peer_trust
+    anchor — never from the broker. The target is recorded in ``discovery_summary``
+    for the observable inter-agent conversation (FR-3.4).
 
     Security: user_token is read from _user_token_ctx, never from state.
     The peer_client layer handles DID verification, trust-score gating,
     IATP encryption, and circuit-breaker management.
     """
-    if not settings.peer_agent_url:
-        return {
-            "error": "No peer agent configured.",
-            "flow": FlowDecision.REMOTE_DENIED,
-            "status_message": "No remote cluster available.",
-        }
+    no_peer = {
+        "error": "No peer agent configured.",
+        "flow": FlowDecision.REMOTE_DENIED,
+        "status_message": "No remote cluster available.",
+    }
+    # Multi-peer: a deployment may federate via the peer_trust map + discovery alone
+    # (no legacy PEER_AGENT_URL). With neither, there is nobody to delegate to.
+    if not settings.peer_agent_url and not settings.peer_trust:
+        return no_peer
 
     # ── FR-3.1/3.2: discover → negotiate → resolve the delegation target ──────
     # Never raises (graceful degradation to the configured peer inside the helper).
     from mesh.discovery import resolve_delegation_target
     target = await resolve_delegation_target(state["query"])
 
-    # HONESTY GUARD: the signed transport (_mesh_call_peer) sends to the configured
-    # peer. If discovery selected a peer that is NOT the configured one (possible only
-    # in a future multi-peer mesh, never in the single-peer demo), we cannot route
-    # there through this transport — so we report it as a configured-fallback for THIS
-    # send rather than claim a hop that didn't happen. The discovered division is kept
-    # in the marker for observability of WHAT WAS DISCOVERED.
+    # MULTI-PEER ROUTING: a DISCOVERED target is delegated to THAT peer — we hand only its
+    # DID to the signed transport, which resolves the destination URL + verification key
+    # from OUR trust anchor (never the broker entry), binds the assertion aud to it, and
+    # uses that peer's own circuit breaker. A discovered target without an anchor URL
+    # (defence-in-depth — resolve_delegation_target already skips those) degrades to the
+    # configured peer. configured-fallback keeps the legacy single-peer path unchanged.
     source = target.source
-    if source == "discovered" and not target.is_configured_peer():
-        log.warning("discovered_peer_not_configured_transport_fallback",
-                    discovered_url=target.agent_url, discovered_did=target.agent_did)
-        source = "configured-fallback"
+    route_did: str | None = None
+    if source == "discovered":
+        if target.agent_did and target.agent_url:
+            route_did = target.agent_did
+        else:
+            log.warning("discovered_peer_unroutable_configured_fallback",
+                        discovered_did=target.agent_did)
+            source = "configured-fallback"
+    if route_did is None and not settings.peer_agent_url:
+        return no_peer
 
     # Structured marker the UI MonitorPanel parses into discovered/negotiated/
     # delegated rows (FR-3.4) — explicit signal, not inferred from arbitrary prose.
@@ -1007,13 +1220,16 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
     )
 
     # Include circuit breaker state in policy context (ASI-08, peer-comms-policy)
-    circuit_state = await get_peer_circuit_state(str(settings.peer_agent_url))
+    # ...for the ACTUAL target (the discovered peer's own breaker, or the configured one).
+    circuit_state = await get_peer_circuit_state(
+        target.agent_url if route_did else str(settings.peer_agent_url))
 
     # Finding #4: feed the policy engine the REAL verification results, not
     # hardcoded "all verified" constants. With the old hardcoded values the
     # peer-comms-policy DENY rules on peer_did_verified / peer_trust_score
-    # could never fire — the policy layer was decorative.
-    peer_did = settings.peer_agent_did or ""
+    # could never fire — the policy layer was decorative. (Verified for the
+    # ACTUAL target DID, not the legacy configured one.)
+    peer_did = route_did or settings.peer_agent_did or ""
     if peer_did:
         peer_verified, peer_trust = await verify_peer_identity(peer_did)
     else:
@@ -1043,8 +1259,12 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
         # fail the receiver's SSRF prefix check and silently drop the callback — M4).
         callback_url = f"{str(settings.agent_url).rstrip('/')}/tasks/{task_id}/callback"
 
+    # Route to the discovered peer only when one was selected; otherwise call exactly as
+    # before (no target_did kwarg) so the legacy single-peer path is byte-for-byte unchanged.
+    route_kwargs: dict[str, Any] = {"target_did": route_did} if route_did else {}
     try:
         peer_response = await _mesh_call_peer(
+            **route_kwargs,
             query=state["query"],
             user_id=state["user_id"],
             context_id=state.get("context_id", ""),
@@ -1080,6 +1300,12 @@ async def call_peer_agent(state: AgentState) -> dict[str, Any]:
         "peer_status": peer_response.status,
         "peer_answer": peer_response.answer,
         "discovery_summary": discovery_summary,
+        # Mosaic guard inputs: label NAMES from the peer's signed envelope (None = the peer
+        # sent none) + whether they came from a signature-verified response.
+        "peer_did": peer_response.peer_did,
+        "peer_division": target.division_id or "",
+        "peer_data_labels": peer_response.data_labels,
+        "peer_labels_verified": peer_response.labels_verified,
     }
 
 
@@ -1107,6 +1333,12 @@ async def handle_peer_result(state: AgentState) -> dict[str, Any]:
     log.info("node_handle_peer_result", peer_status=peer_status)
 
     if peer_status == "completed":
+        # Mosaic guard on the FEDERATED answer: the peer's verified labels + this user's
+        # releases from other origins are evaluated together BEFORE anything is released
+        # (also on the approval-poll path, so a cleared combination is then delivered).
+        withheld = await _guard_peer_answer(state)
+        if withheld is not None:
+            return withheld
         raw_answer = state.get("peer_answer") or ""
         if state.get("check_only"):
             # Approval-outcome poll: the peer already GENERATED a full answer. Deliver it

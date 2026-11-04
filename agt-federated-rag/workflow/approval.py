@@ -36,7 +36,7 @@ workflow.logger inside workflow code (L-1)
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from temporalio import workflow
@@ -86,6 +86,10 @@ class ApprovalInput:
 
     # Snapshot timeout from settings at workflow-start time (Q-7)
     timeout_seconds: int = 86400   # default 24 h; caller overrides from settings
+
+    # Contributing source names / labels shown to the approver (never content). Defaulted
+    # so workflow histories started before this field existed still deserialize on replay.
+    sources: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -186,6 +190,7 @@ class ApprovalWorkflow:
                 approver_id=inp.approver_id,
                 approver_slack_id=inp.approver_slack_id,
                 approver_email=inp.approver_email,
+                sources=list(inp.sources),
             ),
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RETRY_3,

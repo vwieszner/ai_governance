@@ -68,6 +68,11 @@ export function ApprovalInbox({ division, token }: Props) {
             <span className="approval-query">
               {p.query ? `"${p.query}"` : '(query text unavailable)'}
             </span>
+            {p.sources.length > 0 && (
+              <span className="approval-sources">
+                Sources combined: {p.sources.join('; ')}
+              </span>
+            )}
           </div>
           <div className="approval-actions">
             <button

@@ -1,0 +1,29 @@
+# Weekly check for new Microsoft Agent Governance Toolkit releases.
+#
+# Why: AGT 4.0 renamed its distributions and the old names silently stopped at
+# 3.7.0, so the pins sat on a stale line (missing security fixes) with nothing
+# flagging it. Scoped to AGT only (no general dependency churn). core + cli are
+# grouped so they always move together. Dependabot regenerates the sha256 hashes
+# in requirements.lock.txt; CI (ruff + pytest) gates the PR.
+#
+# A 6.x PR is expected to FAIL CI until agent/nodes.py migrates off
+# agent_os.policies.PolicyEvaluator (removed on AGT main) — that failure is the
+# signal to do the AgentControl migration, not a reason to merge around it.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /agt-federated-rag
+    schedule:
+      interval: weekly
+      day: monday
+    allow:
+      - dependency-name: "agent-governance-toolkit-*"
+    groups:
+      agent-governance-toolkit:
+        patterns:
+          - "agent-governance-toolkit-*"
+    commit-message:
+      prefix: "build(deps)"
+    labels:
+      - dependencies
+    open-pull-requests-limit: 2

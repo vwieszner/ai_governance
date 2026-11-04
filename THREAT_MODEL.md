@@ -46,6 +46,12 @@ without reverse-engineering the code.
 | Browser token theft (XSS) | BFF: no token in the browser, only an `HttpOnly` session cookie; server-side refresh; login-CSRF state binding | `api/bff.py`, `test_bff.py`, `ui/e2e/bff.spec.ts` |
 | Transport interception (peer) | Route-based **mTLS** at the nginx edge (federation-CA client cert required on peer routes) | `infra/nginx/`, `test_transport.py` |
 | Revoked peer certificate | **CRL checked at the mTLS handshake** (`VERIFY_CRL_CHECK_LEAF` + mtime-cached CRL refresh) when `require_mtls` + a CRL are configured; fail-closed; issued certs carry `CRLDistributionPoints` | `transport/mtls.py`, `test_transport.py` |
+| Revoked peer certificate (no CRL yet) | **OCSP** checked per peer cert (`TLS_OCSP_MODE=soft\|hard`; REVOKED always refused), off the event loop | `transport/ocsp.py`, `test_ocsp.py`, `examples/mtls-ocsp/prove_ocsp_live.py` |
+| Mosaic effect (combining individually-allowed data) | Deterministic aggregation rules over the labels a user receives, incl. **signed peer labels** for federated answers; escalate to approval / deny; fail closed | `agent/context_guard.py`, `test_context_accumulation.py` |
+| Departed / compromised user | Admin disable cascade (denylist, IdP disable + logout, ReBAC grants removed); re-enable never revives a pre-disable token | `api/main.py` `/admin/users/*`, `test_user_lifecycle.py` |
+| Broker-steered delegation (SSRF/redirect) | Discovered peer's URL + key taken only from the local trust map; untrusted DID refused before signing | `mesh/peer_client.py`, `test_multipeer_routing.py` |
+| LLM egress breaking residency | Per-division gateway key allowlist + alias; no in-boundary → external fallback (proven by a negative control) | `k8s/llm-gateway/`, `examples/llm-gateway/prove_gateway.py` |
+| Supply-chain tampering (Python deps) | sha256 hash-pinned lock enforced on every install; Dependabot on AGT | `agt-federated-rag/requirements.lock.txt` |
 | Audit tamper (offline) | Hash-chained log + external head anchor (truncation/deletion detected) | `audit_log.py`, `test_audit.py` |
 | Operator emergency stop | Kill-switch denies the whole query path | `agent/graph.py`, `test_governance.py` |
 | Worker-startup regression | AST guard: no sandbox-hostile import in a workflow module | `test_worker_sandbox.py` |
@@ -58,8 +64,9 @@ These are real production requirements the template supports but cannot self-sat
   proven, but server-cert pinning is broken locally by AV/corporate MITM (e.g. Norton re-signs
   the cert). Enable `require_mtls`/the edge in prod on a clean host. **CRL revocation is now
   enforced at the in-process mTLS handshake** (`transport/mtls.py`); two follow-ups remain — wire
-  `ssl_crl` into the nginx peer-route for edge-terminated TLS, and add **OCSP** (needs a responder
-  + AIA URL + stapling; not faked here).
+  `ssl_crl`/`ssl_ocsp` into the nginx peer-route for edge-terminated TLS, and run an HA OCSP
+  responder (in-process OCSP checking is built — `TLS_OCSP_MODE`; server-side stapling still needs
+  a TLS front-end).
 - **HA stores.** Keycloak + Temporal run in `start-dev`/single-replica here. Production needs
   real HA Temporal (also removes the inbox visibility lag the Redis index works around) and
   clustered Keycloak with persistent storage.

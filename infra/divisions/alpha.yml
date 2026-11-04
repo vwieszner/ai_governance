@@ -12,3 +12,6 @@ residency_mode: external
 # owner's (bob's) approval. Onboarding ingests docs_dir then seeds OpenFGA tuples.
 seed_viewer: data_retention_policy
 seed_approval: hr_compensation_data
+# Optional per-division LLM gateway (LiteLLM; examples/llm-gateway/README.md). Off unless set:
+#   llm_gateway: true                                   # gateway on port_base+7; agent gets a virtual key
+#   llm_gateway_local_base: http://vllm.internal:8000/v1  # in-boundary model upstream (residency=local)

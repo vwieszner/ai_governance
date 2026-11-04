@@ -237,3 +237,18 @@ async def read_badge(principal_id: str) -> int:
     except Exception as exc:
         log.warning("outcome_badge_read_failed", principal=principal_id, error=str(exc))
         return 0
+
+
+async def purge(principal_id: str) -> int:
+    """FR-2.2 disable cascade: drop a disabled user's whole outcome inbox + badge.
+
+    Records hold no answer text (FR-6.2 — answers are regenerated at delivery), so nothing
+    of evidentiary value is lost: the decisions themselves live in the audit chain. Returns
+    the number of records removed. Raises on a store error so the admin cascade reports it."""
+    r = await _get_redis()
+    key = _key(principal_id)
+    n = int(await r.hlen(key))
+    await r.delete(key, _badge_key(principal_id))
+    log.info("outcome_inbox_purged", principal=principal_id, count=n,
+             division_id=settings.division_id, agt_audit=True)
+    return n

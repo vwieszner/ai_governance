@@ -9,17 +9,16 @@ description = "Fully governed federated cross-cluster RAG using Microsoft Agent 
 requires-python = ">=3.11"
 dependencies = [
     # ── Microsoft Agent Governance Toolkit ───────────────────────────────────
-    # Agent OS: policy engine, capability model, MCP security gateway, audit log
-    "agent-os-kernel>=3.5.0",
-    # AgentMesh: DID-based zero-trust agent identity, IATP encrypted comms,
-    #            trust scoring, A2A/MCP bridges, agent lifecycle management
-    "agentmesh-platform>=3.5.0",
-    # Agent Runtime: execution rings, saga orchestration, kill switch
-    "agentmesh-runtime>=3.5.0",
-    # Agent SRE: SLOs, error budgets, circuit breakers, chaos engineering
-    "agent-sre>=3.5.0",
-    # Agent Compliance: OWASP verification, policy linting, integrity checks
-    "agent-governance-toolkit>=3.5.0",
+    # AGT 4.0 consolidated the per-component distributions; import names are unchanged.
+    # core = Agent OS (agent_os: policy engine, MCP gateway, circuit breaker) +
+    #        AgentMesh (agentmesh: DID identity, IATP, trust, lifecycle) +
+    #        runtime/hypervisor. Replaces agent-os-kernel, agentmesh-platform,
+    #        agentmesh-runtime, agent-hypervisor.
+    # <6.0: AGT main removes agent_os.policies.PolicyEvaluator (agent/nodes.py) in
+    #       favour of the ACS AgentControl runtime — migrate before lifting the cap.
+    "agent-governance-toolkit-core>=5.0.0,<6.0",
+    # cli = Agent SRE (agent_sre: SLOs, error budgets) + sandbox. Replaces agent-sre.
+    "agent-governance-toolkit-cli>=5.0.0,<6.0",
 
     # ── Agent framework ───────────────────────────────────────────────────────
     "langgraph>=0.2.0",
@@ -89,6 +88,17 @@ dev = [
 agent   = "api.main:run"
 worker  = "workflow.worker:run"
 ingest  = "rag.ingest:cli"
+
+[tool.hatch.build.targets.wheel]
+# Flat layout (packages + top-level modules at the project root), which hatchling's
+# default file selection cannot infer. Package data (agent/policies/*.yaml) ships
+# with its package. tests/, conftest.py and _repro_div.py are dev-only.
+only-include = [
+    "agent", "api", "auth", "bench", "connectors", "discovery", "mesh", "rag",
+    "tools", "transport", "workflow",
+    "approval_index.py", "artifact_store.py", "audit_log.py", "config.py",
+    "outcome_store.py", "residency.py", "secrets_backend.py", "sre.py",
+]
 
 [tool.ruff]
 line-length = 100

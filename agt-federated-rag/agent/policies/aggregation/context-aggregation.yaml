@@ -1,0 +1,75 @@
+# Context-aggregation (mosaic-effect) policy — evaluated by agent/context_guard.py.
+#
+# Lives in a SUBDIRECTORY on purpose: the AGT PolicyEvaluator loads every *.yaml directly
+# in agent/policies/ as a PolicyDocument; this file has a different schema.
+#
+# Per-chunk authorization (OpenFGA) decides whether a user may see each chunk. This policy
+# decides whether the user may see the COMBINATION of authorized chunks in one answer.
+# It runs in check_auth after authorization and before generate_answer (llm.generate).
+#
+# Deterministic + auditable: chunks are labelled by glob rules over their existing (trusted,
+# store-of-record) metadata — `source` is matched against both the full value and its
+# basename, case-insensitive. A chunk may also carry explicit `data_labels` / `classification`
+# metadata, which is honoured. No LLM classifies anything here.
+#
+# Outcomes:
+#   escalate — routed to the EXISTING approval workflow (start_approval → OpenFGA pending →
+#              Temporal). The combination is a synthetic object `chunk:mosaic-<rule-name>`;
+#              approving grants the user `viewer` on it (TTL honoured), after which the same
+#              combination passes. An admin may pre-grant it to a group (group#member viewer)
+#              or set its `owner` (= the approver; default approver is `admin`).
+#   deny     — hard stop, answer withheld; not clearable.
+# Fail-closed: if this file is missing or invalid, every answer with authorized context is
+# withheld. Set CONTEXT_AGGREGATION_POLICY="" to disable the guard explicitly.
+version: "1.0"
+name: context-aggregation
+enabled: true
+default_classification: internal
+
+classifiers:
+  - name: hr
+    match:
+      source: ["hr_*", "*compensation*", "*salary*", "*salaries*", "*payroll*", "*employee*"]
+    labels: [hr]
+    classification: confidential
+  - name: finance
+    match:
+      source: ["*financ*", "*revenue*", "*budget*", "*forecast*", "*earnings*"]
+    labels: [financial]
+    classification: confidential
+  - name: legal
+    match:
+      source: ["*legal*", "*contract*", "*litigation*", "*retention*"]
+    labels: [legal]
+    classification: internal
+
+rules:
+  - name: hr-finance
+    description: >-
+      Individual compensation joined with company financials enables inference of
+      unreleased people-cost / per-person figures — neither owner releases them together.
+    all_labels: [hr, financial]
+    sets_sensitivity: restricted
+    adds_restrictions: [no_external_export]
+    outcome: escalate
+
+# AGT monotone backstop: a context that accumulates >= N distinct labels with no rule
+# governing the combination escalates for review instead of passing silently.
+backstop:
+  n_category_threshold: 3
+  outcome: escalate
+
+# Federated answers. A peer division returns the LABEL NAMES of the chunks behind its answer
+# inside its DID-signed /a2a/query response; only labels from a signature-verified response
+# count. Every release (local or peer) is evaluated on its own labels + the labels released to
+# the same user from OTHER origins (local / other peers) within `window_seconds` — so local HR
+# then federated Finance (or the reverse) hits the hr-finance rule. 0 = no cross-query memory.
+#   unlabeled_peer — a peer answer WITHOUT verified labels (old envelope, peer guard off,
+#                    malformed, unverified):
+#     unknown  (default) adds the synthetic label `unlabeled-peer` (counts toward rules and
+#              the backstop — never treated as "no labels");
+#     escalate requires the `chunk:mosaic-unlabeled-peer` clearance (approval workflow);
+#     deny     withholds the peer answer.
+federation:
+  unlabeled_peer: unknown
+  window_seconds: 900

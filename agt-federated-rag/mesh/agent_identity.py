@@ -1,6 +1,6 @@
 """
 AgentMesh identity — DID-based zero-trust agent identity, built on the
-Microsoft Agent Governance Toolkit (``agentmesh-platform``).
+Microsoft Agent Governance Toolkit (``agent-governance-toolkit-core``).
 
 Real toolkit APIs used here:
   - ``agentmesh.AgentIdentity``   — this agent's DID + Ed25519 credentials;

@@ -250,6 +250,18 @@ async def test_api_mode_refuses_cloud_metadata_ip_in_external_mode(monkeypatch):
         await E.embed_dense(["x"])
 
 
+async def test_api_mode_refuses_loopback_by_name(monkeypatch):
+    """`localhost` is the same loopback target `127.0.0.1` is refused for — refused too
+    (previously a bypass of the SSRF denylist by spelling the host as a name)."""
+    monkeypatch.setattr(settings, "embedding_provider", "api")
+    monkeypatch.setattr(settings, "residency_mode", "external")
+    monkeypatch.setattr(httpx, "AsyncClient", _fake_client({}, {"data": []}))
+    for base in ("http://localhost:4000/v1", "http://127.0.0.1:4000/v1"):
+        monkeypatch.setattr(settings, "embedding_api_base", base)
+        with pytest.raises(RuntimeError, match="SSRF"):
+            await E.embed_dense(["x"])
+
+
 # ── local mode (FastEmbed singleton monkeypatched — no model download) ─────────
 
 class _FakeVec:

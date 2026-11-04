@@ -15,6 +15,18 @@ Usage (from repo root, project venv; NVIDIA_API_KEY in ./.env):
 
 Port layout (derived from manifest port_base so divisions never clash):
     agent=base+0  openfga=base+1  keycloak=base+2  temporal=base+3  temporal_ui=base+4  qdrant=base+5  redis=base+6
+    llm_gateway=base+7 (only when the manifest opts in with `llm_gateway: true`)
+
+Optional LLM gateway (manifest `llm_gateway: true`): adds the LiteLLM Proxy services
+(compose profile `llm-gateway`) to the division stack, mints its master key into
+secrets.json, issues the agent's per-division virtual key (allowlist by residency_mode)
+and points the agent env at the gateway. Off by default — nothing changes without it.
+A residency=local division also gets the in-boundary EMBEDDING model on its key (manifest
+`llm_gateway_local_embed_base`), so API-mode embeddings stay in-boundary too.
+
+Containerized agent (compose profile `containerized`): onboarding also writes
+infra/generated/<id>/.env.<id>.agent — the same values as the host agent env, with the
+infra endpoints rewritten to their in-network compose names/ports.
 """
 from __future__ import annotations
 
@@ -42,6 +54,25 @@ PORT_OFFSETS = {
     "agent": 0, "openfga": 1, "keycloak": 2,
     "temporal": 3, "temporal_ui": 4, "qdrant": 5, "redis": 6,
 }
+
+# ── Optional per-division LLM gateway (LiteLLM Proxy; manifest `llm_gateway: true`) ──
+# Proven prototype + rules: examples/llm-gateway/README.md. The model ids below are the
+# gateway's model groups (k8s/llm-gateway/litellm-config.yaml — the single config shared by
+# compose + k8s); tests/test_onboarding.py pins that they exist there.
+GATEWAY_PROFILE = "llm-gateway"          # compose profile in division-stack.template.yml
+GATEWAY_PORT_OFFSET = 7                  # host port = port_base + 7 (loopback only)
+GATEWAY_CONFIG = ROOT / "k8s" / "llm-gateway" / "litellm-config.yaml"
+GATEWAY_LOCAL_CHAT = "local/llama-3.1-8b-instruct"            # in-boundary (self-hosted)
+GATEWAY_EXTERNAL_CHAT = ("meta/llama-3.3-70b-instruct",       # LLM_MODEL of the deployments
+                         "meta/llama-3.1-8b-instruct")        # app default + intent model
+GATEWAY_EXTERNAL_EMBED = ("nvidia/nv-embedqa-e5-v5",)
+GATEWAY_LOCAL_EMBED = "local/nv-embedqa-e5-v5"               # in-boundary embeddings
+GATEWAY_IN_NETWORK_BASE = "http://llm-gateway.internal:4000/v1"  # compose network alias
+NIM_BASE = "https://integrate.api.nvidia.com/v1"
+# Never leave the in-boundary upstream empty (LiteLLM would default it to the public
+# OpenAI API). `.invalid` never resolves (RFC 2606), so the local model fails closed.
+LOCAL_LLM_UNSET = "http://local-llm.invalid/v1"
+LOCAL_EMBED_UNSET = "http://local-embed.invalid/v1"   # same fail-closed default, embeddings
 
 REALM = "rag"  # one realm per division (each division has its OWN Keycloak host)
 # Seed-user (alice/bob) password is per-division random (see make_division_secrets);
@@ -85,6 +116,16 @@ class Manifest:
     # peer division) a relation on one of THIS division's docs, applied by
     # scripts/federate_divisions.py. Each item: {user_email, home_division, relation, doc}.
     cross_grants: list[dict] = field(default_factory=list)
+    # OPT-IN per-division LLM gateway (LiteLLM Proxy). False (default) = the agent talks
+    # to the provider directly, exactly as before. llm_gateway_local_base = the
+    # in-boundary (self-hosted vLLM/NIM) OpenAI-compatible base the gateway's local model
+    # forwards to; required for a useful residency_mode=local division.
+    # llm_gateway_local_embed_base = the in-boundary OpenAI-compatible /embeddings base
+    # (self-hosted NIM/TEI/vLLM serving nv-embedqa-e5-v5 at qdrant_dense_size=1024 dims);
+    # required for a residency_mode=local division that embeds via the API (k8s).
+    llm_gateway: bool = False
+    llm_gateway_local_base: str = ""
+    llm_gateway_local_embed_base: str = ""
 
 
 def _parse_manifest_text(text: str) -> dict:
@@ -139,6 +180,12 @@ def load_manifest(path: str | Path) -> Manifest:
         local_tools = [t.strip() for t in lt_raw.split(",") if t.strip()]
     else:
         local_tools = [str(t).strip() for t in lt_raw if str(t).strip()]
+    gw_raw = data.get("llm_gateway", False)
+    llm_gateway = (gw_raw.strip().lower() in ("1", "true", "yes", "on")
+                   if isinstance(gw_raw, str) else bool(gw_raw))
+    if llm_gateway and gateway_port(port_base) in RESERVED_PORTS:
+        raise ValueError(f"{path}: llm_gateway port {gateway_port(port_base)} collides with "
+                         f"the co-resident project's reserved ports; choose another port_base")
     return Manifest(
         division_id=div,
         display_name=str(data.get("display_name", div)),
@@ -150,11 +197,20 @@ def load_manifest(path: str | Path) -> Manifest:
         seed_approval=str(data.get("seed_approval", "")),
         local_tools=local_tools,
         cross_grants=[g for g in (data.get("cross_grants") or []) if isinstance(g, dict)],
+        llm_gateway=llm_gateway,
+        llm_gateway_local_base=str(data.get("llm_gateway_local_base", "") or "").strip(),
+        llm_gateway_local_embed_base=str(
+            data.get("llm_gateway_local_embed_base", "") or "").strip(),
     )
 
 
 def derive_ports(port_base: int) -> dict[str, int]:
     return {name: port_base + off for name, off in PORT_OFFSETS.items()}
+
+
+def gateway_port(port_base: int) -> int:
+    """Host (loopback) port of the division's optional LLM gateway."""
+    return port_base + GATEWAY_PORT_OFFSET
 
 
 # ── Co-resident project's reserved ports ────────────────────────────────────────
@@ -207,6 +263,9 @@ def render_stack_env(manifest: Manifest, ports: dict[str, int], secretz: dict[st
     """The --env-file passed to `docker compose` for this division's stack template."""
     return (
         f"DIV_ID={manifest.division_id}\n"
+        # Only the `containerized` profile publishes the agent port (else the host agent
+        # owns it); without this the profile would publish it on a random host port.
+        f"DIV_AGENT_PORT={ports['agent']}\n"
         f"DIV_OPENFGA_PORT={ports['openfga']}\n"
         f"DIV_KEYCLOAK_PORT={ports['keycloak']}\n"
         f"DIV_TEMPORAL_PORT={ports['temporal']}\n"
@@ -223,10 +282,16 @@ def render_stack_env(manifest: Manifest, ports: dict[str, int], secretz: dict[st
 
 def render_agent_env(
     manifest: Manifest, ports: dict[str, int], secretz: dict[str, str],
-    store_id: str, model_id: str, nvidia_key: str,
+    store_id: str, model_id: str, nvidia_key: str, llm_gateway_key: str | None = None,
 ) -> str:
     """The per-division agent process env (config.Settings). Points every dependency
-    at THIS division's own stack ports + store — that is the physical isolation."""
+    at THIS division's own stack ports + store — that is the physical isolation.
+
+    llm_gateway_key: when the division opted into the LLM gateway, the agent's LLM (and
+    API-mode embedding, via the openai_* fallback) traffic goes to the gateway on
+    loopback with that per-division virtual key instead of straight to NIM. `localhost`
+    is in-boundary for the residency guard and is not a literal loopback IP, so the
+    embedding SSRF guard accepts it too."""
     kc = f"http://localhost:{ports['keycloak']}/realms/{REALM}"
     peers = ",".join(manifest.trusted_peers)
     # Governed local tools (compose parity with the k8s base ConfigMap). Only emit the
@@ -238,6 +303,11 @@ def render_agent_env(
         "" if manifest.local_tools is None
         else f"AGT_LOCAL_TOOLS={','.join(manifest.local_tools)}\n"
     )
+    if llm_gateway_key:
+        llm_base = f"http://localhost:{gateway_port(manifest.port_base)}/v1"
+        llm_key = llm_gateway_key
+    else:
+        llm_base, llm_key = NIM_BASE, nvidia_key
     return (
         f"CLUSTER_ID={manifest.division_id}\n"
         f"DIVISION_ID={manifest.division_id}\n"
@@ -245,8 +315,8 @@ def render_agent_env(
         f"RESIDENCY_MODE={manifest.residency_mode}\n"
         f"AGENT_NAME=AGT RAG - {manifest.display_name}\n"
         f"AGENT_URL=http://localhost:{ports['agent']}\nPORT={ports['agent']}\nHOST=127.0.0.1\n"
-        f"OPENAI_API_BASE=https://integrate.api.nvidia.com/v1\n"
-        f"OPENAI_API_KEY={nvidia_key}\n"
+        f"OPENAI_API_BASE={llm_base}\n"
+        f"OPENAI_API_KEY={llm_key}\n"
         f"LLM_MODEL=meta/llama-3.3-70b-instruct\nEMBEDDING_MODEL=nvidia/nv-embedqa-e5-v5\n"
         f"QDRANT_URL=http://localhost:{ports['qdrant']}\n"
         f"QDRANT_COLLECTION=knowledge_base\n"
@@ -273,6 +343,100 @@ def render_agent_env(
         f"CORS_ORIGINS=http://localhost:5173\n"
         f"{local_tools_line}"
     )
+
+
+# Containerized agent (compose profile `containerized`): the infra services by their
+# compose DNS name on INTERNAL ports, instead of the host-mapped loopback ports.
+_IN_NETWORK = {
+    "QDRANT_URL": "http://qdrant:6333",
+    "REDIS_URL": "redis://redis:6379/0",
+    "OPENFGA_API_URL": "http://openfga:8080",
+    "TEMPORAL_ADDRESS": "temporal:7233",
+    "OIDC_JWKS_URI": f"http://keycloak:8080/realms/{REALM}/protocol/openid-connect/certs",
+    "OIDC_TOKEN_ENDPOINT": f"http://keycloak:8080/realms/{REALM}/protocol/openid-connect/token",
+    "HOST": "0.0.0.0",
+    "PORT": "8000",
+}
+
+
+def container_agent_env_path(division_id: str) -> Path:
+    """Where the `containerized` profile's agent + worker read their env_file
+    (division-stack.template.yml: ./generated/<id>/.env.<id>.agent, i.e. under the
+    gitignored infra/generated/<id>/)."""
+    return generated_dir(division_id) / f".env.{division_id}.agent"
+
+
+def render_container_agent_env(
+    manifest: Manifest, ports: dict[str, int], secretz: dict[str, str],
+    store_id: str, model_id: str, nvidia_key: str, llm_gateway_key: str | None = None,
+) -> str:
+    """The env_file of the containerized agent/worker: the SAME values as the host agent
+    env (render_agent_env), with the infra endpoints rewritten to in-network names.
+
+    Kept as the host value (template caveat a): OIDC_ISSUER — browser tokens carry the
+    host issuer. AGENT_URL / APPROVAL_UI_BASE_URL stay the host-mapped agent URL. With the
+    LLM gateway the agent talks to it by its `.internal` network alias (in-boundary for
+    residency=local; a bare `llm-gateway` would count as external)."""
+    env = dict(line.split("=", 1) for line in render_agent_env(
+        manifest, ports, secretz, store_id, model_id, nvidia_key,
+        llm_gateway_key=llm_gateway_key).splitlines() if "=" in line)
+    env.update(_IN_NETWORK)
+    if manifest.llm_gateway:
+        env["OPENAI_API_BASE"] = GATEWAY_IN_NETWORK_BASE
+        env["OPENAI_API_KEY"] = llm_gateway_key or ""
+    return "".join(f"{k}={v}\n" for k, v in env.items())
+
+
+def write_container_agent_env(manifest: Manifest, body: str) -> Path:
+    """Write the containerized agent env owner-only; logs the path + key count only."""
+    path = container_agent_env_path(manifest.division_id)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_secret(path, body)
+    n = sum(1 for line in body.splitlines() if "=" in line)
+    log(f"wrote {path.relative_to(ROOT)} (containerized agent env, {n} keys; values not shown)")
+    return path
+
+
+def gateway_key_spec(manifest: Manifest) -> dict:
+    """The /key/generate body for this division's agent virtual key.
+
+    residency_mode=external: the external chat + embedding models, plus the in-boundary
+    model (the gateway falls back external -> local, never the reverse).
+    Anything else (residency_mode=local; unknown values fail closed the same way): ONLY
+    the in-boundary chat + embedding models, with the app's unchanged model names
+    (LLM_MODEL, the intent model, EMBEDDING_MODEL) ALIASED onto them by the key — so
+    neither a prompt nor a chunk/query to embed can reach an external upstream whatever
+    model the agent asks for. Never pair this with a local -> external fallback
+    (allowlists don't constrain fallbacks; README rule 1)."""
+    meta = {"division": manifest.division_id, "residency": manifest.residency_mode,
+            "issued_by": "onboard_division"}
+    if manifest.residency_mode == "external":
+        return {"models": [*GATEWAY_EXTERNAL_CHAT, GATEWAY_LOCAL_CHAT, *GATEWAY_EXTERNAL_EMBED],
+                "metadata": meta}
+    return {"models": [GATEWAY_LOCAL_CHAT, GATEWAY_LOCAL_EMBED],
+            "aliases": {**{m: GATEWAY_LOCAL_CHAT for m in GATEWAY_EXTERNAL_CHAT},
+                        **{m: GATEWAY_LOCAL_EMBED for m in GATEWAY_EXTERNAL_EMBED}},
+            "metadata": meta}
+
+
+def render_gateway_stack_env(manifest: Manifest, secretz: dict[str, str], nvidia_key: str) -> str:
+    """Extra --env-file lines for the `llm-gateway` compose profile (only when opted in)."""
+    return (
+        f"DIV_LLM_GATEWAY_PORT={gateway_port(manifest.port_base)}\n"
+        f"LITELLM_MASTER_KEY={secretz['litellm_master_key']}\n"
+        f"LITELLM_DB_PASSWORD={secretz['litellm_db_password']}\n"
+        f"CHAT_PRIMARY_BASE={NIM_BASE}\n"
+        f"NVIDIA_API_KEY={nvidia_key}\n"
+        f"LOCAL_LLM_BASE={manifest.llm_gateway_local_base or LOCAL_LLM_UNSET}\n"
+        f"LOCAL_EMBED_BASE={manifest.llm_gateway_local_embed_base or LOCAL_EMBED_UNSET}\n"
+    )
+
+
+def make_gateway_secrets() -> dict[str, str]:
+    """Gateway admin secrets — minted only for divisions that opt in. The master key is
+    admin-only (it issues keys) and never reaches the agent; LiteLLM requires `sk-`."""
+    return {"litellm_master_key": "sk-" + secrets.token_hex(24),
+            "litellm_db_password": secrets.token_hex(16)}  # hex: safe inside DATABASE_URL
 
 
 def make_division_secrets() -> dict[str, str]:
@@ -328,6 +492,88 @@ def _load_or_make_secrets(division_id: str, force: bool = False) -> dict[str, st
     return sec
 
 
+def _ensure_gateway_secrets(division_id: str) -> dict[str, str]:
+    """Backfill the gateway secrets into secrets.json (never rotating existing ones —
+    the litellm role password lives in the durable Postgres volume)."""
+    sp = generated_dir(division_id) / "secrets.json"
+    existing = json.loads(sp.read_text(encoding="utf-8"))
+    missing = {k: v for k, v in make_gateway_secrets().items() if k not in existing}
+    if missing:
+        existing.update(missing)
+        _write_secret(sp, json.dumps(existing))
+    return existing
+
+
+def _gw_http(method: str, url: str, master_key: str, body: dict | None = None) -> tuple[int, dict]:
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        url, method=method, data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {master_key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+
+
+def wait_gateway(base_url: str, tries: int = 60, delay: float = 3.0) -> None:
+    """Block until the gateway answers /health/liveliness (it migrates its DB first)."""
+    import urllib.request
+    for _ in range(tries):
+        try:
+            with urllib.request.urlopen(f"{base_url}/health/liveliness", timeout=3):
+                log(f"LLM gateway healthy at {base_url}")
+                return
+        except OSError:
+            time.sleep(delay)
+    raise RuntimeError(f"LLM gateway not healthy ({base_url})")
+
+
+def ensure_gateway_key(base_url: str, master_key: str, spec: dict,
+                       existing: str | None) -> tuple[str, str]:
+    """Return (virtual_key, action) for the division's agent. Reuses the stored key while
+    its allowlist/aliases still match the spec; otherwise DELETES it (e.g. the division
+    switched to residency=local — a broader key must not survive) and issues a new one.
+    Shared by onboard_division (compose) and bootstrap_k8s (k8s)."""
+    if existing:
+        code, info = _gw_http("GET", f"{base_url}/key/info?key={existing}", master_key)
+        cur = (info.get("info") or {}) if code == 200 else {}
+        # /key/info still answers 200 for a DELETED key (status="deleted"), so check it.
+        live = bool(cur) and not (cur.get("deleted_at") or cur.get("status") == "deleted"
+                                  or cur.get("blocked"))
+        if (live and sorted(cur.get("models") or []) == sorted(spec["models"])
+                and (cur.get("aliases") or {}) == spec.get("aliases", {})):
+            return existing, "reused"
+        if live:
+            _gw_http("POST", f"{base_url}/key/delete", master_key, {"keys": [existing]})
+    code, out = _gw_http("POST", f"{base_url}/key/generate", master_key, spec)
+    if code != 200 or "key" not in out:
+        raise RuntimeError(f"LLM gateway /key/generate failed: {code} {str(out)[:200]}")
+    return out["key"], ("rotated" if existing else "created")
+
+
+def provision_gateway_key(manifest: Manifest, secretz: dict[str, str], base_url: str) -> str:
+    """Wait for the division's gateway, then issue/reuse the agent's virtual key and
+    persist it (owner-only) in secrets.json."""
+    wait_gateway(base_url)
+    spec = gateway_key_spec(manifest)
+    key, action = ensure_gateway_key(base_url, secretz["litellm_master_key"], spec,
+                                     secretz.get("llm_gateway_key"))
+    if key != secretz.get("llm_gateway_key"):
+        secretz["llm_gateway_key"] = key
+        sp = generated_dir(manifest.division_id) / "secrets.json"
+        stored = json.loads(sp.read_text(encoding="utf-8"))
+        stored["llm_gateway_key"] = key
+        _write_secret(sp, json.dumps(stored))
+    log(f"LLM gateway virtual key {action} for '{manifest.division_id}' "
+        f"(residency={manifest.residency_mode}, models={spec['models']})")
+    return key
+
+
 def _state_path(division_id: str) -> Path:
     return generated_dir(division_id) / "state.json"
 
@@ -346,9 +592,10 @@ def _save_state(division_id: str, **kv) -> None:
 # ── Live orchestration (docker + network) ────────────────────────────────────
 
 
-def compose_up(env_file: Path, project: str) -> None:
+def compose_up(env_file: Path, project: str, profiles: tuple[str, ...] = ()) -> None:
+    prof = [a for p in profiles for a in ("--profile", p)]
     subprocess.run(
-        ["docker", "compose", "-p", project, "--env-file", str(env_file),
+        ["docker", "compose", "-p", project, "--env-file", str(env_file), *prof,
          "-f", str(TEMPLATE), "up", "-d"],
         check=True, cwd=str(ROOT),
     )
@@ -380,7 +627,8 @@ async def _wait_tcp(host: str, port: int, name: str) -> None:
 
 
 async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str, str],
-                    no_neo4j: bool, force: bool = False) -> None:
+                    no_neo4j: bool, force: bool = False,
+                    llm_gateway_key: str | None = None) -> None:
     import httpx
     nvidia_key = (load_root_env(ROOT).get("NVIDIA_API_KEY") or os.environ.get("NVIDIA_API_KEY", ""))
     if not nvidia_key:
@@ -448,6 +696,9 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
         # access to data they own; division-admin manages the division (revoke/audit,
         # enforced in M5/M8); member is a regular querying user.
         await _kc_setup_roles(c, kc, h, {"alice": ["member"], "bob": ["data-owner", "division-admin"]})
+        # FR-2.2: the agent's own service account may manage users in THIS realm only
+        # (realm-management manage/view/query-users), backing the /admin/users API.
+        await _kc().grant_user_admin_to_service_account(c, kc, REALM, h, f"agent-{manifest.division_id}")
         log("Keycloak realm + clients + users + roles ready")
 
     # DID identity (per division) + agent .env.
@@ -455,9 +706,13 @@ async def provision(manifest: Manifest, ports: dict[str, int], secretz: dict[str
                           f"rag-agent-{manifest.division_id}", manifest.division_id)
     gdir = generated_dir(manifest.division_id)
     gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    agent_env = render_agent_env(manifest, ports, secretz, store_id, model_id, nvidia_key)
+    agent_env = render_agent_env(manifest, ports, secretz, store_id, model_id, nvidia_key,
+                                 llm_gateway_key=llm_gateway_key)
     env_path = AGT / f".env.{manifest.division_id}"
     _write_secret(env_path, agent_env)                         # holds NVIDIA key + secrets
+    write_container_agent_env(manifest, render_container_agent_env(
+        manifest, ports, secretz, store_id, model_id, nvidia_key,
+        llm_gateway_key=llm_gateway_key))
     _write_secret(gdir / "did.json", json.dumps(did))          # DID + public JWK (kept owner-only for uniformity)
     log(f"wrote {env_path.relative_to(ROOT)} + DID {did['did']}")
 
@@ -519,46 +774,28 @@ async def _kc_add_ui_audience(c, kc: str, h: dict, agent_client_id: str) -> None
                  headers=h)
 
 
+def _kc():
+    """The shared Keycloak admin helpers (agt-federated-rag/auth/keycloak_admin.py) — the
+    ONE Keycloak admin client, also used by the agent's FR-2.2 user-lifecycle API."""
+    if str(AGT) not in sys.path:
+        sys.path.insert(0, str(AGT))
+    from auth import keycloak_admin  # type: ignore[import]
+    return keycloak_admin
+
+
 async def _kc_setup_roles(c, kc: str, h: dict, assignments: dict[str, list[str]]) -> None:
     """Create the division RBAC realm roles and assign them to seeded users (FR-2.3).
     Idempotent: role create 409s are fine; assignment is additive."""
-    roles = {"member", "data-owner", "division-admin"}
-    for role in sorted(roles):
-        await c.post(f"{kc}/admin/realms/{REALM}/roles", json={"name": role}, headers=h)  # 201 or 409
-    for username, want in assignments.items():
-        lk = await c.get(f"{kc}/admin/realms/{REALM}/users",
-                         params={"username": username, "exact": "true"}, headers=h)
-        users = lk.json() if lk.status_code == 200 else []
-        if not users:
-            continue
-        uid = users[0]["id"]
-        reps = []
-        for rn in want:
-            rr = await c.get(f"{kc}/admin/realms/{REALM}/roles/{rn}", headers=h)
-            if rr.status_code == 200:
-                reps.append(rr.json())
-        if reps:
-            await c.post(f"{kc}/admin/realms/{REALM}/users/{uid}/role-mappings/realm",
-                         json=reps, headers=h)
+    ka = _kc()
+    await ka.ensure_realm_roles(c, kc, REALM, h, ka.DIVISION_ROLES)
+    await ka.assign_realm_roles_by_username(c, kc, REALM, h, assignments)
 
 
 async def _kc_ensure_user(c, kc: str, h: dict, username: str, email: str, password: str) -> None:
     """Create a realm user and RELIABLY set its password (create + lookup + force
     reset + clear required actions), so the direct-access-grant login works — a
     bare create can leave a required-action that 400s the password grant."""
-    body = {"username": username, "enabled": True, "email": email, "emailVerified": True,
-            "firstName": username.capitalize(), "lastName": "User", "requiredActions": [],
-            "credentials": [{"type": "password", "value": password, "temporary": False}]}
-    await c.post(f"{kc}/admin/realms/{REALM}/users", json=body, headers=h)  # 201 or 409
-    lk = await c.get(f"{kc}/admin/realms/{REALM}/users",
-                     params={"username": username, "exact": "true"}, headers=h)
-    users = lk.json() if lk.status_code == 200 else []
-    if users:
-        uid = users[0]["id"]
-        await c.put(f"{kc}/admin/realms/{REALM}/users/{uid}",
-                    json={"enabled": True, "emailVerified": True, "requiredActions": []}, headers=h)
-        await c.put(f"{kc}/admin/realms/{REALM}/users/{uid}/reset-password",
-                    json={"type": "password", "value": password, "temporary": False}, headers=h)
+    await _kc().ensure_user(c, kc, REALM, h, username, email, password)
 
 
 def _seed_principal(email: str, issuer: str) -> str:
@@ -637,16 +874,56 @@ def onboard(manifest_path: str | Path, no_neo4j: bool = False, dry_run: bool = F
     gdir = generated_dir(manifest.division_id)
     gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     stack_env = render_stack_env(manifest, ports, secretz)
+    profiles: tuple[str, ...] = ()
+    gw_plan = None
+    if manifest.llm_gateway:
+        secretz = _ensure_gateway_secrets(manifest.division_id)
+        nvidia_key = (load_root_env(ROOT).get("NVIDIA_API_KEY")
+                      or os.environ.get("NVIDIA_API_KEY", ""))
+        stack_env += render_gateway_stack_env(manifest, secretz, nvidia_key)
+        profiles = (GATEWAY_PROFILE,)
+        gw_port = gateway_port(manifest.port_base)
+        gw_plan = {"profile": GATEWAY_PROFILE, "port": gw_port,
+                   "agent_base": f"http://localhost:{gw_port}/v1",
+                   "in_network_base": GATEWAY_IN_NETWORK_BASE,
+                   "local_llm_base": manifest.llm_gateway_local_base or LOCAL_LLM_UNSET,
+                   "local_embed_base": (manifest.llm_gateway_local_embed_base
+                                        or LOCAL_EMBED_UNSET),
+                   "key_spec": gateway_key_spec(manifest)}
     stack_env_path = gdir / f"div-{manifest.division_id}.env"
     _write_secret(stack_env_path, stack_env)   # Postgres/OpenFGA/Keycloak secrets — owner-only
     plan = {"division_id": manifest.division_id, "project": compose_project(manifest.division_id),
-            "ports": ports, "stack_env": str(stack_env_path), "generated_dir": str(gdir)}
+            "ports": ports, "stack_env": str(stack_env_path), "generated_dir": str(gdir),
+            "profiles": list(profiles), "llm_gateway": gw_plan,
+            "container_agent_env": str(container_agent_env_path(manifest.division_id))}
     if dry_run:
+        # Render the containerized agent env too, from what is known without docker: the
+        # persisted store/model ids (empty before the first real run) and the stored
+        # gateway key, if any. A real run rewrites it with the provisioned values.
+        st = _load_state(manifest.division_id)
+        nv = load_root_env(ROOT).get("NVIDIA_API_KEY") or os.environ.get("NVIDIA_API_KEY", "")
+        write_container_agent_env(manifest, render_container_agent_env(
+            manifest, ports, secretz, st.get("store_id", ""), st.get("model_id", ""), nv,
+            llm_gateway_key=secretz.get("llm_gateway_key")))
         log(f"[dry-run] rendered stack env for '{manifest.division_id}' -> {stack_env_path.relative_to(ROOT)}")
+        if gw_plan:
+            spec = gw_plan["key_spec"]
+            log(f"[dry-run] llm_gateway: compose profile '{GATEWAY_PROFILE}', gateway "
+                f"127.0.0.1:{gw_plan['port']} (in-network {gw_plan['in_network_base']}), "
+                f"agent OPENAI_API_BASE={gw_plan['agent_base']}")
+            log(f"[dry-run] llm_gateway: virtual key for residency={manifest.residency_mode}: "
+                f"models={spec['models']} aliases={spec.get('aliases', {})}; "
+                f"local upstream={gw_plan['local_llm_base']} "
+                f"local embeddings={gw_plan['local_embed_base']}")
+        else:
+            log("[dry-run] llm_gateway: off (agent talks to the provider directly)")
         return plan
     log(f"=== onboarding division '{manifest.division_id}' (ports {ports['agent']}..{ports['redis']}) ===")
-    compose_up(stack_env_path, compose_project(manifest.division_id))
-    asyncio.run(provision(manifest, ports, secretz, no_neo4j, force=force))
+    compose_up(stack_env_path, compose_project(manifest.division_id), profiles)
+    gw_key = (provision_gateway_key(manifest, secretz,
+                                    f"http://localhost:{gateway_port(manifest.port_base)}")
+              if manifest.llm_gateway else None)
+    asyncio.run(provision(manifest, ports, secretz, no_neo4j, force=force, llm_gateway_key=gw_key))
     return plan
 
 
@@ -661,6 +938,8 @@ def teardown(manifest_path: str | Path) -> None:
     senv = generated_dir(manifest.division_id) / f"div-{manifest.division_id}.env"
     if senv.exists():
         cmd += ["--env-file", str(senv)]   # satisfy ${VAR:?} substitution during down
+    if manifest.llm_gateway:
+        cmd += ["--profile", GATEWAY_PROFILE]   # include the gateway services in `down`
     cmd += ["-f", str(TEMPLATE), "down", "-v"]
     subprocess.run(cmd, cwd=str(ROOT), check=False)
     shutil.rmtree(generated_dir(manifest.division_id), ignore_errors=True)

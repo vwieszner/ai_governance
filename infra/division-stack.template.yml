@@ -123,7 +123,9 @@ services:
   # (scripts/clusters.ps1) is unaffected by default. Both use the same image; they
   # reach the infra services by compose DNS name on INTERNAL ports (not the host-mapped
   # ones). The agent env is supplied via env_file = the generated .env.<id>.agent
-  # (in-network values), written by onboard_division alongside the host .env.<id>.
+  # (in-network values), written by onboard_division alongside the host .env.<id>, at
+  # infra/generated/<id>/.env.<id>.agent (gitignored; relative paths in this file resolve
+  # against infra/, the compose project directory).
   #
   # CAVEATS (documented): (a) OIDC_ISSUER must stay the host value baked into browser
   # tokens (e.g. http://localhost:<kc>/realms/rag) while OIDC_JWKS_URI points at the
@@ -133,10 +135,10 @@ services:
   # works as-is.
   agent:
     profiles: ["containerized"]
-    build: { context: ../../agt-federated-rag }
+    build: { context: ../agt-federated-rag }
     image: agt-federated-rag:latest
     container_name: div-${DIV_ID}-agent
-    env_file: [ "../generated/${DIV_ID}/.env.${DIV_ID}.agent" ]
+    env_file: [ "./generated/${DIV_ID}/.env.${DIV_ID}.agent" ]
     environment:
       HOST: "0.0.0.0"
       PORT: "8000"
@@ -158,7 +160,7 @@ services:
     image: agt-federated-rag:latest
     container_name: div-${DIV_ID}-worker
     command: ["python", "-m", "workflow.worker"]
-    env_file: [ "../generated/${DIV_ID}/.env.${DIV_ID}.agent" ]
+    env_file: [ "./generated/${DIV_ID}/.env.${DIV_ID}.agent" ]
     volumes:
       - div-fastembed-cache:/cache/fastembed
     depends_on:
@@ -184,14 +186,92 @@ services:
       AGENT_UPSTREAM: "agent:8000"
       DIV_ID: ${DIV_ID}
     volumes:
-      - ../nginx/division-edge.conf.template:/etc/nginx/templates/division-edge.conf.template:ro
-      - ../generated/_certs/${DIV_ID}.crt:/certs/server.crt:ro
-      - ../generated/_certs/${DIV_ID}.key:/certs/server.key:ro
-      - ../generated/_certs/federation-ca.crt:/certs/federation-ca.crt:ro
+      - ./nginx/division-edge.conf.template:/etc/nginx/templates/division-edge.conf.template:ro
+      - ./generated/_certs/${DIV_ID}.crt:/certs/server.crt:ro
+      - ./generated/_certs/${DIV_ID}.key:/certs/server.key:ro
+      - ./generated/_certs/federation-ca.crt:/certs/federation-ca.crt:ro
     ports:
       - "127.0.0.1:${DIV_EDGE_PORT:-8443}:8443"
     depends_on:
       - agent
+    restart: unless-stopped
+
+  # ── Per-division LLM gateway (LiteLLM Proxy; OPT-IN) ───────────────────────────
+  # Enabled only with `--profile llm-gateway`, which onboard_division adds when the
+  # manifest sets `llm_gateway: true`; without it these services do not exist. Proven
+  # prototype + rules: examples/llm-gateway/README.md. The gateway gets its OWN `litellm`
+  # database + unprivileged role in this division's EXISTING Postgres (no second
+  # Postgres). onboard_division mints the master key into infra/generated/<id>/secrets.json,
+  # issues the agent's per-division virtual key (model allowlist by residency_mode), and
+  # points the agent at it:
+  #   host-process agent  OPENAI_API_BASE=http://localhost:${DIV_LLM_GATEWAY_PORT}/v1
+  #   in-network clients  http://llm-gateway.internal:4000/v1  (a `.internal` alias: a bare
+  #                       service name counts as EXTERNAL to residency=local)
+  # The variables below use `:-` (not `:?`) on purpose: compose interpolates disabled
+  # profiles too, and `:?` would break every division that does not opt in. The gateway
+  # instead refuses to start without a valid master key (entrypoint guard).
+  llm-gateway-db-init:
+    profiles: ["llm-gateway"]
+    image: postgres:16-alpine
+    container_name: div-${DIV_ID}-llm-gateway-db-init
+    command: ["sh", "/init-db.sh"]
+    environment:
+      PGHOST: postgres
+      PGDATABASE: openfga
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      LITELLM_DB_PASSWORD: ${LITELLM_DB_PASSWORD:-}
+    volumes:
+      - ../k8s/llm-gateway/init-db.sh:/init-db.sh:ro   # shared with the k8s component
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  llm-gateway:
+    profiles: ["llm-gateway"]
+    # Pinned by DIGEST (= official ghcr.io/berriai/litellm:v1.106.6); never pip-install litellm.
+    image: litellm/litellm@sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06
+    container_name: div-${DIV_ID}-llm-gateway
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        case "$$LITELLM_MASTER_KEY" in
+          sk-?*) exec docker/prod_entrypoint.sh "$$@" ;;
+          *) echo "LITELLM_MASTER_KEY unset/invalid: refusing to start an unauthenticated gateway" >&2; exit 1 ;;
+        esac
+      - llm-gateway
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
+      DATABASE_URL: postgresql://litellm:${LITELLM_DB_PASSWORD:-}@postgres:5432/litellm
+      CHAT_PRIMARY_BASE: ${CHAT_PRIMARY_BASE:-https://integrate.api.nvidia.com/v1}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      # In-boundary model upstream (self-hosted vLLM/NIM). The default never resolves, so
+      # the local model fails closed until set (an EMPTY value would make LiteLLM fall
+      # back to the public OpenAI API).
+      LOCAL_LLM_BASE: ${LOCAL_LLM_BASE:-http://local-llm.invalid/v1}
+      LOCAL_LLM_KEY: ${LOCAL_LLM_KEY:-none}
+      # In-boundary EMBEDDINGS upstream (self-hosted NIM/TEI/vLLM /embeddings; 1024 dims).
+      # Same fail-closed default; residency=local keys alias EMBEDDING_MODEL onto it.
+      LOCAL_EMBED_BASE: ${LOCAL_EMBED_BASE:-http://local-embed.invalid/v1}
+      LOCAL_EMBED_KEY: ${LOCAL_EMBED_KEY:-none}
+    volumes:
+      - ../k8s/llm-gateway/litellm-config.yaml:/app/config.yaml:ro   # single source (compose + k8s)
+    ports:
+      - "127.0.0.1:${DIV_LLM_GATEWAY_PORT:-0}:4000"
+    networks:
+      default:
+        aliases: [llm-gateway.internal]
+    depends_on:
+      llm-gateway-db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     restart: unless-stopped
 
 volumes:

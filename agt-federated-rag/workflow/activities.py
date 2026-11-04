@@ -42,7 +42,7 @@ from __future__ import annotations
 import hashlib
 import hmac as hmac_lib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -77,6 +77,8 @@ class NotifyApproverInput:
     approver_slack_id: str | None
     approver_email: str | None
     # callback_url is generated inside the activity with HMAC signing, never passed in
+    # Contributing source names / labels (never content) — see ApprovalInput.sources.
+    sources: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -223,6 +225,8 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
 
     chunk_preview = ", ".join(inp.chunk_ids[:5])
     extra = f" (+{len(inp.chunk_ids) - 5} more)" if len(inp.chunk_ids) > 5 else ""
+    sources_line = (f"\nContributing sources: {'; '.join(inp.sources[:10])}"
+                    if inp.sources else "")
 
     blocks = [
         {
@@ -233,6 +237,7 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
                     f"*Access request from user `{inp.user_id}`*\n"
                     f"Query: _{display_query}_\n"
                     f"Chunks requested: `{chunk_preview}`{extra}"
+                    f"{sources_line}"
                 ),
             },
         },
@@ -274,6 +279,11 @@ async def _slack_notify(inp: NotifyApproverInput) -> None:
             )
 
 
+# Prefix of agent.context_guard.ledger_unavailable_clearance_id (literal here: this module
+# must not import the agent graph; tests/test_mosaic_ledger_redis.py pins the two together).
+OUTAGE_CLEARANCE_PREFIX = "mosaic-ledger-unavailable-"
+
+
 @activity.defn
 async def grant_access_in_openfga(inp: GrantAccessInput) -> None:
     """Grant viewer relation and revoke pending_approval for approved chunks.
@@ -293,6 +303,9 @@ async def grant_access_in_openfga(inp: GrantAccessInput) -> None:
     Emits AGT audit event.
     """
     ttl = settings.approval_grant_ttl_seconds
+    # Mosaic outage clearances (agent/context_guard.ledger_unavailable_clearance_id) are
+    # never permanent — see config.mosaic_outage_clearance_ttl_seconds.
+    outage_ttl = settings.mosaic_outage_clearance_ttl_seconds
     log.info(
         "activity_grant_access",
         user_id=inp.user_id,
@@ -304,13 +317,18 @@ async def grant_access_in_openfga(inp: GrantAccessInput) -> None:
 
     # Compute the expiry once (replay-safe — derived from a snapshotted setting and a
     # single now()), using the same ISO-8601 UTC format check() compares against.
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
     expiry_iso: str | None = None
     if ttl > 0:
-        from datetime import datetime, timedelta, timezone
-        expiry_iso = (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat()
+        expiry_iso = (now + timedelta(seconds=ttl)).isoformat()
+    outage_secs = min(ttl, outage_ttl) if ttl > 0 else outage_ttl
+    outage_expiry_iso = (now + timedelta(seconds=outage_secs)).isoformat()
 
     for chunk_id in inp.chunk_ids:
-        if expiry_iso is not None:
+        if chunk_id.startswith(OUTAGE_CLEARANCE_PREFIX):
+            await auth.grant_viewer_until(inp.user_id, chunk_id, outage_expiry_iso)
+        elif expiry_iso is not None:
             await auth.grant_viewer_until(inp.user_id, chunk_id, expiry_iso)
         else:
             await auth.grant_viewer(inp.user_id, chunk_id)

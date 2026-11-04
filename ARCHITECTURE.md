@@ -210,7 +210,8 @@ flowchart TD
 ```
 
 **Transport (not shown above):** internet-facing `/a2a/*` uses mutual TLS with **CRL revocation
-checked at the handshake** (OCSP responder is a deploy-time add). Browser auth uses the **BFF**
+checked at the handshake** and optional **OCSP** (`TLS_OCSP_MODE=soft|hard`, decided off the event
+loop before any request byte is parsed). Browser auth uses the **BFF**
 pattern — no token in the browser, only an `HttpOnly` cookie.
 
 ---

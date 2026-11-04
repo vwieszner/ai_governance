@@ -34,6 +34,18 @@ def test_record_then_list_for_approver(monkeypatch):
     assert items[0]["query"] == "what is q4 revenue?"
 
 
+def test_record_carries_contributing_sources(monkeypatch):
+    # A mosaic clearance has no chunk metadata: the inbox entry carries the contributing
+    # source names / labels so the approver isn't approving blind. Old callers → [].
+    ai = _patch(monkeypatch)
+    srcs = ["alpha: hr_compensation_data.txt [hr]", "peer beta (did:mesh:b): [financial]"]
+    asyncio.run(ai.record("bob@x|ns", "req-m", "alice@y|ns", "pay vs revenue?", sources=srcs))
+    asyncio.run(ai.record("bob@x|ns", "req-o", "alice@y|ns", "q"))
+    by_id = {i["request_id"]: i for i in asyncio.run(ai.list_for("bob@x|ns"))}
+    assert by_id["req-m"]["sources"] == srcs
+    assert by_id["req-o"]["sources"] == []
+
+
 def test_other_approver_sees_nothing(monkeypatch):
     ai = _patch(monkeypatch)
     asyncio.run(ai.record("bob@x|ns", "req-1", "alice@y|ns", "q"))
